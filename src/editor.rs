@@ -938,6 +938,7 @@ impl Editor {
                 },
                 None => self.set_status("Usage: :e <file>"),
             },
+            "fmt" | "format" => (commands::find("format_buffer").unwrap().func)(self),
             "bn" => (commands::find("next_buffer").unwrap().func)(self),
             "bp" => (commands::find("prev_buffer").unwrap().func)(self),
             "theme" => match arg {
@@ -1573,6 +1574,22 @@ impl Editor {
     /// themselves, retyping a closer steps over it, and identifier chars
     /// feed the intellisense popup.
     fn insert_typed(&mut self, c: char) {
+        // A closer typed on a whitespace-only line dedents it one level first.
+        if matches!(c, ')' | ']' | '}') && self.doc().extra.is_empty() {
+            let doc = self.doc();
+            let (line, col) = doc.cursor_line_col();
+            let slice = doc.line(line);
+            if col > 0 && (0..col).all(|i| matches!(slice.char(i), ' ' | '\t')) {
+                let take = if slice.char(col - 1) == '\t' {
+                    1
+                } else {
+                    crate::config::tab_width().min(col)
+                };
+                let to = doc.cursor;
+                self.doc_mut().delete_range(to - take, to);
+            }
+        }
+
         if crate::config::autoclose() {
             let doc = self.doc();
             let next = (doc.cursor < doc.text.len_chars()).then(|| doc.text.char(doc.cursor));
@@ -2483,5 +2500,51 @@ mod tests {
         press(&mut editor, "o");
         press(&mut editor, "x");
         assert_eq!(editor.doc().text.to_string(), "    hello\n    x");
+    }
+
+    #[test]
+    fn newline_after_opener_indents_and_places_the_closer() {
+        // Autoclose gives `{}`; Enter between them opens an indented block.
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "{");
+        press(&mut editor, "<enter>");
+        press(&mut editor, "x");
+        assert_eq!(editor.doc().text.to_string(), "{\n    x\n}");
+    }
+
+    #[test]
+    fn newline_after_opener_without_closer_just_indents() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "( <enter>");
+        // Autoclose put `)` after the cursor, so this is the block case…
+        assert_eq!(editor.doc().text.to_string(), "(\n    \n)");
+        // …and a tabbed file indents with a tab.
+        let mut editor = editor_with("\tif x {");
+        press(&mut editor, "A");
+        press(&mut editor, "<enter>");
+        press(&mut editor, "y");
+        assert_eq!(editor.doc().text.to_string(), "\tif x {\n\t\ty");
+    }
+
+    #[test]
+    fn closer_on_a_blank_line_dedents() {
+        let mut editor = editor_with("{\n        ");
+        press(&mut editor, "j $ a");
+        press(&mut editor, "}");
+        assert_eq!(editor.doc().text.to_string(), "{\n    }");
+    }
+
+    #[test]
+    fn tab_indents_with_the_line_style() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "<tab>");
+        assert_eq!(editor.doc().text.to_string(), "    ");
+        let mut editor = editor_with("\tx");
+        press(&mut editor, "A");
+        press(&mut editor, "<tab>");
+        assert_eq!(editor.doc().text.to_string(), "\tx\t");
     }
 }

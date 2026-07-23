@@ -71,7 +71,8 @@ const ST_NONE: u8 = 0;
 const ST_SEL: u8 = 1;
 const ST_CURSOR: u8 = 2;
 
-type Style = (u8, Option<Color>);
+/// (overlay, color, BOLD/ITALIC flags) for one cell.
+type Style = (u8, Option<Color>, u8);
 
 fn render_text(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     let (wins, seps) = editor.window_rects();
@@ -209,15 +210,22 @@ fn render_window(
             } else {
                 ST_NONE
             };
-            let fg = crate::syntax::color(crate::syntax::group_at(spans, p));
-            (overlay, fg)
+            let group = crate::syntax::group_at(spans, p);
+            let fg = crate::syntax::color(group);
+            (overlay, fg, crate::syntax::attrs(group))
         };
 
         let runs = styled_visible(doc.line(line_idx), line_len, view_col, width, style_of);
         let mut printed = 0usize;
-        for ((overlay, fg), s) in runs {
+        for ((overlay, fg, attrs), s) in runs {
             printed += display_width(&s);
             queue!(out, SetForegroundColor(fg.unwrap_or(base_fg)))?;
+            if attrs & crate::syntax::BOLD != 0 {
+                queue!(out, SetAttribute(Attribute::Bold))?;
+            }
+            if attrs & crate::syntax::ITALIC != 0 {
+                queue!(out, SetAttribute(Attribute::Italic))?;
+            }
             match overlay {
                 ST_SEL => queue!(out, SetBackgroundColor(theme.selection))?,
                 ST_CURSOR => queue!(out, SetAttribute(Attribute::Reverse))?,
@@ -228,6 +236,12 @@ fn render_window(
                 ST_SEL => queue!(out, SetBackgroundColor(base_bg))?,
                 ST_CURSOR => queue!(out, SetAttribute(Attribute::NoReverse))?,
                 _ => {}
+            }
+            if attrs & crate::syntax::BOLD != 0 {
+                queue!(out, SetAttribute(Attribute::NormalIntensity))?;
+            }
+            if attrs & crate::syntax::ITALIC != 0 {
+                queue!(out, SetAttribute(Attribute::NoItalic))?;
             }
         }
         // Pad to the window edge; UntilNewLine would bleed into a neighbour.
@@ -713,7 +727,7 @@ mod tests {
 
     fn plain(line: RopeSlice, view_col: usize, width: usize) -> String {
         let len = position::line_len_without_newline(line);
-        styled_visible(line, len, view_col, width, |_| (ST_NONE, None))
+        styled_visible(line, len, view_col, width, |_| (ST_NONE, None, 0))
             .into_iter()
             .map(|(_, s)| s)
             .collect()
@@ -751,17 +765,17 @@ mod tests {
         // Select chars 2..4.
         let runs = styled_visible(rope.line(0), 6, 0, 10, |i| {
             if (2..4).contains(&i) {
-                (ST_SEL, None)
+                (ST_SEL, None, 0)
             } else {
-                (ST_NONE, None)
+                (ST_NONE, None, 0)
             }
         });
         assert_eq!(
             runs,
             vec![
-                ((ST_NONE, None), "ab".to_string()),
-                ((ST_SEL, None), "cd".to_string()),
-                ((ST_NONE, None), "ef".to_string()),
+                ((ST_NONE, None, 0), "ab".to_string()),
+                ((ST_SEL, None, 0), "cd".to_string()),
+                ((ST_NONE, None, 0), "ef".to_string()),
             ]
         );
     }
@@ -770,7 +784,7 @@ mod tests {
     fn styled_newline_shows_as_one_column() {
         let rope = Rope::from_str("ab\ncd");
         // The whole line plus its newline is selected.
-        let runs = styled_visible(rope.line(0), 2, 0, 10, |_| (ST_SEL, None));
-        assert_eq!(runs, vec![((ST_SEL, None), "ab ".to_string())]);
+        let runs = styled_visible(rope.line(0), 2, 0, 10, |_| (ST_SEL, None, 0));
+        assert_eq!(runs, vec![((ST_SEL, None, 0), "ab ".to_string())]);
     }
 }

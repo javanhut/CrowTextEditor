@@ -1,6 +1,6 @@
 //! Tree-sitter parsing: syntax highlighting, and syntax nodes as selections.
 //!
-//! Rust only for now — each additional language is one grammar dependency and
+//! Each additional language is one grammar dependency, one `lang!` line, and
 //! one arm in `config_for`. Highlight groups are deliberately coarse: a
 //! handful of colors reads better in a terminal than a full theme.
 
@@ -17,6 +17,8 @@ pub struct Config {
     query: Query,
     /// Capture index -> highlight group, precomputed from capture names.
     groups: Vec<u8>,
+    /// Second grammar run over the block tree's `inline` nodes (markdown).
+    inline: Option<&'static Config>,
 }
 
 pub struct Syntax {
@@ -26,21 +28,51 @@ pub struct Syntax {
     pub spans: Vec<(usize, usize, u8)>,
 }
 
+/// A span's group byte is a color group id (low bits) plus attribute flags,
+/// so markdown emphasis can be bold/italic without eating a color slot.
+pub const BOLD: u8 = 0x40;
+pub const ITALIC: u8 = 0x80;
+const GROUP_MASK: u8 = 0x3f;
+
 /// Terminal color for a highlight group, from the active theme.
 pub fn color(group: u8) -> Option<Color> {
-    crate::theme::current().syntax[(group as usize).min(7)]
+    crate::theme::current().syntax[((group & GROUP_MASK) as usize).min(7)]
+}
+
+/// BOLD/ITALIC flags for a group byte: the span's own flags plus the active
+/// theme's per-group attribute bitmasks.
+pub fn attrs(group: u8) -> u8 {
+    let theme = crate::theme::current();
+    let bit = 1u8 << ((group & GROUP_MASK).min(7));
+    let mut a = group & (BOLD | ITALIC);
+    if theme.bold & bit != 0 {
+        a |= BOLD;
+    }
+    if theme.italic & bit != 0 {
+        a |= ITALIC;
+    }
+    a
 }
 
 fn group_of(capture_name: &str) -> u8 {
-    match capture_name.split('.').next().unwrap_or("") {
-        "comment" => 1,
-        "string" | "character" => 2,
-        "keyword" => 3,
-        "function" | "constructor" => 4,
-        "type" => 5,
-        "constant" | "number" | "escape" | "boolean" => 6,
-        "macro" | "attribute" => 7,
-        _ => 0,
+    // Markdown's block query names its captures @text.*; special-case the
+    // full names so headings/code/links don't all fall in one bucket.
+    match capture_name {
+        "text.title" => 3 | BOLD,
+        "text.strong" => BOLD,
+        "text.emphasis" => ITALIC,
+        "text.literal" => 2,
+        "text.uri" | "text.reference" => 6,
+        _ => match capture_name.split('.').next().unwrap_or("") {
+            "comment" => 1,
+            "string" | "character" => 2,
+            "keyword" => 3,
+            "function" | "constructor" => 4,
+            "type" | "tag" | "property" => 5,
+            "constant" | "number" | "escape" | "boolean" => 6,
+            "macro" | "attribute" => 7,
+            _ => 0,
+        },
     }
 }
 
@@ -48,6 +80,9 @@ fn group_of(capture_name: &str) -> u8 {
 /// compile (a broken grammar should degrade to plain text, not a panic).
 macro_rules! lang {
     ($fn_name:ident, $language:expr, $query:expr) => {
+        lang!($fn_name, $language, $query, None);
+    };
+    ($fn_name:ident, $language:expr, $query:expr, $inline:expr) => {
         fn $fn_name() -> Option<&'static Config> {
             static CELL: OnceLock<Option<Config>> = OnceLock::new();
             CELL.get_or_init(|| {
@@ -58,6 +93,7 @@ macro_rules! lang {
                     language,
                     query,
                     groups,
+                    inline: $inline,
                 })
             })
             .as_ref()
@@ -71,6 +107,28 @@ lang!(json, tree_sitter_json::LANGUAGE, tree_sitter_json::HIGHLIGHTS_QUERY);
 lang!(python, tree_sitter_python::LANGUAGE, tree_sitter_python::HIGHLIGHTS_QUERY);
 lang!(bash, tree_sitter_bash::LANGUAGE, tree_sitter_bash::HIGHLIGHT_QUERY);
 lang!(javascript, tree_sitter_javascript::LANGUAGE, tree_sitter_javascript::HIGHLIGHT_QUERY);
+// The typescript crate's query is only the TS additions; prepend JS's.
+lang!(typescript, tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+    &[tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_typescript::HIGHLIGHTS_QUERY].concat());
+lang!(tsx, tree_sitter_typescript::LANGUAGE_TSX,
+    &[tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_typescript::HIGHLIGHTS_QUERY].concat());
+lang!(html, tree_sitter_html::LANGUAGE, tree_sitter_html::HIGHLIGHTS_QUERY);
+lang!(css, tree_sitter_css::LANGUAGE, tree_sitter_css::HIGHLIGHTS_QUERY);
+lang!(c, tree_sitter_c::LANGUAGE, tree_sitter_c::HIGHLIGHT_QUERY);
+// Likewise cpp's query is only the additions on top of C's.
+lang!(cpp, tree_sitter_cpp::LANGUAGE,
+    &[tree_sitter_c::HIGHLIGHT_QUERY, tree_sitter_cpp::HIGHLIGHT_QUERY].concat());
+lang!(go, tree_sitter_go::LANGUAGE, tree_sitter_go::HIGHLIGHTS_QUERY);
+lang!(java, tree_sitter_java::LANGUAGE, tree_sitter_java::HIGHLIGHTS_QUERY);
+lang!(ruby, tree_sitter_ruby::LANGUAGE, tree_sitter_ruby::HIGHLIGHTS_QUERY);
+lang!(php, tree_sitter_php::LANGUAGE_PHP, tree_sitter_php::HIGHLIGHTS_QUERY);
+lang!(csharp, tree_sitter_c_sharp::LANGUAGE, tree_sitter_c_sharp::HIGHLIGHTS_QUERY);
+lang!(yaml, tree_sitter_yaml::LANGUAGE, tree_sitter_yaml::HIGHLIGHTS_QUERY);
+lang!(markdown_inline, tree_sitter_md::INLINE_LANGUAGE, tree_sitter_md::HIGHLIGHT_QUERY_INLINE);
+lang!(markdown, tree_sitter_md::LANGUAGE, tree_sitter_md::HIGHLIGHT_QUERY_BLOCK, markdown_inline());
+lang!(odin, tree_sitter_odin::LANGUAGE, tree_sitter_odin::HIGHLIGHTS_QUERY);
+lang!(zig, tree_sitter_zig::LANGUAGE, tree_sitter_zig::HIGHLIGHTS_QUERY);
+lang!(lua, tree_sitter_lua::LANGUAGE, tree_sitter_lua::HIGHLIGHTS_QUERY);
 
 pub fn config_for(path: Option<&Path>) -> Option<&'static Config> {
     match path?.extension()?.to_str()? {
@@ -79,7 +137,23 @@ pub fn config_for(path: Option<&Path>) -> Option<&'static Config> {
         "json" => json(),
         "py" => python(),
         "sh" | "bash" | "zsh" => bash(),
-        "js" | "jsx" | "mjs" => javascript(),
+        "js" | "jsx" | "mjs" | "cjs" => javascript(),
+        "ts" | "mts" => typescript(),
+        "tsx" => tsx(),
+        "html" | "htm" => html(),
+        "css" => css(),
+        "c" | "h" => c(),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => cpp(),
+        "go" => go(),
+        "java" => java(),
+        "rb" => ruby(),
+        "php" => php(),
+        "cs" => csharp(),
+        "yml" | "yaml" => yaml(),
+        "md" | "markdown" => markdown(),
+        "odin" => odin(),
+        "zig" => zig(),
+        "lua" => lua(),
         _ => None,
     }
 }
@@ -95,8 +169,49 @@ pub fn parse(config: &'static Config, text: &Rope) -> Option<Syntax> {
     let tree = parser.parse(&src, None)?;
 
     let mut spans = Vec::new();
+    collect_spans(config, tree.root_node(), &src, 0, text, &mut spans);
+
+    // Markdown: the block grammar leaves `inline` nodes unparsed; run the
+    // inline grammar over each for emphasis, code spans, and links.
+    if let Some(inline) = config.inline {
+        let mut ip = Parser::new();
+        if ip.set_language(&inline.language).is_ok() {
+            let mut stack = vec![tree.root_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "inline" {
+                    let range = node.byte_range();
+                    if let Some(itree) = ip.parse(&src[range.clone()], None) {
+                        collect_spans(inline, itree.root_node(), &src[range.clone()], range.start, text, &mut spans);
+                    }
+                } else {
+                    for i in 0..node.child_count() {
+                        stack.push(node.child(i).unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    spans.sort_unstable();
+    Some(Syntax {
+        config,
+        tree,
+        spans,
+    })
+}
+
+/// Run `config`'s query over `root` (parsed from `src`, which starts at
+/// `byte_off` in the buffer) and append the resulting spans.
+fn collect_spans(
+    config: &Config,
+    root: tree_sitter::Node,
+    src: &str,
+    byte_off: usize,
+    text: &Rope,
+    spans: &mut Vec<(usize, usize, u8)>,
+) {
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&config.query, tree.root_node(), src.as_bytes());
+    let mut matches = cursor.matches(&config.query, root, src.as_bytes());
     while let Some(m) = matches.next() {
         for cap in m.captures {
             let group = config.groups[cap.index as usize];
@@ -105,16 +220,14 @@ pub fn parse(config: &'static Config, text: &Rope) -> Option<Syntax> {
             }
             let r = cap.node.byte_range();
             if r.start < r.end {
-                spans.push((text.byte_to_char(r.start), text.byte_to_char(r.end), group));
+                spans.push((
+                    text.byte_to_char(byte_off + r.start),
+                    text.byte_to_char(byte_off + r.end),
+                    group,
+                ));
             }
         }
     }
-    spans.sort_unstable();
-    Some(Syntax {
-        config,
-        tree,
-        spans,
-    })
 }
 
 /// The innermost highlight group covering `pos`, or 0.
@@ -156,6 +269,22 @@ mod tests {
             ("x.py", "# note\ndef f():\n    pass\n", 0),
             ("x.sh", "# note\necho hi\n", 0),
             ("x.js", "// note\nlet x = 1;\n", 0),
+            ("x.ts", "// note\nlet x: number = 1;\n", 0),
+            ("x.tsx", "// note\nlet x = <a/>;\n", 0),
+            ("x.html", "<!-- note --><p>hi</p>\n", 0),
+            ("x.css", "/* note */ a { color: red; }\n", 0),
+            ("x.c", "// note\nint main() {}\n", 0),
+            ("x.cpp", "// note\nint main() {}\n", 0),
+            ("x.go", "// note\npackage main\n", 0),
+            ("x.java", "// note\nclass A {}\n", 0),
+            ("x.rb", "# note\ndef f; end\n", 0),
+            ("x.php", "<?php // note\n", 6),
+            ("x.cs", "// note\nclass A {}\n", 0),
+            ("x.yml", "# note\nkey: v\n", 0),
+            ("x.md", "# Title\n", 2),
+            ("x.odin", "// note\nmain :: proc() {}\n", 0),
+            ("x.zig", "// note\nconst x = 1;\n", 0),
+            ("x.lua", "-- note\nlocal x = 1\n", 0),
         ] {
             let config = config_for(Some(Path::new(file))).unwrap_or_else(|| {
                 panic!("grammar for {file} failed to load");
@@ -167,6 +296,21 @@ mod tests {
     }
 
     #[test]
+    fn markdown_inline_emphasis_is_highlighted() {
+        let text = Rope::from_str("plain *em* and **strong** and `code`\n");
+        let config = config_for(Some(Path::new("x.md"))).unwrap();
+        let syntax = parse(config, &text).unwrap();
+        let s = text.to_string();
+        assert_eq!(group_at(&syntax.spans, s.find("em").unwrap()), ITALIC);
+        assert_eq!(group_at(&syntax.spans, s.find("strong").unwrap()), BOLD);
+        assert_eq!(group_at(&syntax.spans, s.find("code").unwrap()), 2);
+        assert_eq!(group_at(&syntax.spans, s.find("plain").unwrap()), 0);
+        // Emphasis carries no color of its own, only the attribute.
+        assert_eq!(color(BOLD), None);
+        assert_eq!(attrs(BOLD) & BOLD, BOLD);
+    }
+
+    #[test]
     fn group_at_prefers_the_innermost_span() {
         let spans = vec![(0, 10, 2), (3, 5, 6)];
         assert_eq!(group_at(&spans, 1), 2);
@@ -175,3 +319,4 @@ mod tests {
         assert_eq!(group_at(&spans, 10), 0);
     }
 }
+

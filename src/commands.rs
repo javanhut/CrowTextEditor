@@ -91,6 +91,7 @@ commands! {
     delete_backward => "delete the character before the cursor",
     delete_forward => "delete the character under the cursor",
 
+    format_buffer => "run the file's formatter over the buffer (:fmt)",
     next_buffer => "switch to the next buffer",
     prev_buffer => "switch to the previous buffer",
     split_vertical => "split the window side by side",
@@ -902,6 +903,67 @@ fn join_lines(editor: &mut Editor) {
     doc.clamp_cursor(false);
 }
 
+/// Pipe the buffer through the extension's formatter (config `[fmt]` or the
+/// built-in table) and replace it with the output. `None` means no file or no
+/// formatter for it; `Some(Err)` carries the failure, buffer untouched.
+///
+/// ponytail: blocks the editor for the formatter's runtime; they're fast.
+fn run_formatter(editor: &mut Editor) -> Option<Result<&'static str, String>> {
+    use std::io::Write as _;
+    use std::process::{Command as Proc, Stdio};
+
+    let path = editor.doc().path.clone()?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let command = crate::config::formatter(ext)?;
+    let command = command.replace("{file}", &path.to_string_lossy());
+    let mut words = command.split_whitespace();
+    let program = words.next().unwrap_or("");
+
+    let src = editor.doc().text.to_string();
+    let spawned = Proc::new(program)
+        .args(words)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => return Some(Err(format!("{program}: {e}"))),
+    };
+    let _ = child.stdin.take().unwrap().write_all(src.as_bytes());
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return Some(Err(format!("{program}: {e}"))),
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("failed");
+        return Some(Err(format!("{program}: {first}")));
+    }
+
+    let new = String::from_utf8_lossy(&out.stdout).into_owned();
+    if new.is_empty() || new == src {
+        return Some(Ok("already formatted"));
+    }
+    let new_len = new.chars().count();
+    let doc = editor.doc_mut();
+    let cursor = doc.cursor;
+    let tx = Transaction::change(&doc.text, [(0, doc.text.len_chars(), Some(new))]);
+    doc.apply(tx, cursor.min(new_len));
+    doc.anchor = doc.cursor;
+    doc.extra.clear();
+    doc.clamp_cursor(false);
+    Some(Ok("formatted"))
+}
+
+fn format_buffer(editor: &mut Editor) {
+    match run_formatter(editor) {
+        Some(Ok(what)) => editor.set_status(what),
+        Some(Err(e)) => editor.set_status(e),
+        None => editor.set_status("no formatter for this buffer (see [fmt] in crow.toml)"),
+    }
+}
+
 fn undo(editor: &mut Editor) {
     if !editor.doc_mut().undo() {
         editor.set_status("Already at oldest change");
@@ -918,6 +980,16 @@ fn redo(editor: &mut Editor) {
 
 // ---- insert mode -----------------------------------------------------------
 
+/// One level of indentation, matching the style already on the line:
+/// tabs if the line's indent has tabs, else `tab_width` spaces.
+pub fn indent_unit(indent: &str) -> String {
+    if indent.contains('\t') {
+        "\t".to_string()
+    } else {
+        " ".repeat(tab_width())
+    }
+}
+
 fn insert_newline(editor: &mut Editor) {
     let doc = editor.doc_mut();
     let line = doc.cursor_line();
@@ -925,12 +997,39 @@ fn insert_newline(editor: &mut Editor) {
     // Don't carry indentation past the cursor if the cursor is inside it.
     let (_, col) = doc.cursor_line_col();
     let indent: String = indent.chars().take(col).collect();
-    let text = format!("\n{indent}");
-    doc.insert_at_cursor(&text);
+
+    let prev = (doc.cursor > 0).then(|| doc.text.char(doc.cursor - 1));
+    let next = (doc.cursor < doc.text.len_chars()).then(|| doc.text.char(doc.cursor));
+    let opener = matches!(prev, Some('{') | Some('(') | Some('['));
+    let closes = matches!(
+        (prev, next),
+        (Some('{'), Some('}')) | (Some('('), Some(')')) | (Some('['), Some(']'))
+    );
+
+    // ponytail: brace-aware indent only for the primary cursor; with extra
+    // cursors every cursor gets the plain newline+indent.
+    if opener && doc.extra.is_empty() {
+        let unit = indent_unit(&indent);
+        if closes {
+            // `{|}` + Enter -> the closer moves to its own line and the
+            // cursor lands on the indented one between.
+            let at = doc.cursor;
+            let text = format!("\n{indent}{unit}\n{indent}");
+            let tx = Transaction::insert(&doc.text, at, text);
+            doc.apply(tx, at + 1 + indent.chars().count() + unit.chars().count());
+        } else {
+            doc.insert_at_cursor(&format!("\n{indent}{unit}"));
+        }
+    } else {
+        doc.insert_at_cursor(&format!("\n{indent}"));
+    }
 }
 
 fn insert_tab(editor: &mut Editor) {
-    editor.doc_mut().insert_at_cursor("\t");
+    let doc = editor.doc_mut();
+    let indent = indent_of(doc, doc.cursor_line());
+    let unit = indent_unit(&indent);
+    doc.insert_at_cursor(&unit);
 }
 
 fn delete_backward(editor: &mut Editor) {
@@ -986,11 +1085,19 @@ fn next_window(editor: &mut Editor) {
 }
 
 fn save(editor: &mut Editor) {
+    // Format first; a broken formatter never blocks the write.
+    let fmt_err = match crate::config::format_on_save().then(|| run_formatter(editor)) {
+        Some(Some(Err(e))) => Some(e),
+        _ => None,
+    };
     match editor.doc_mut().save() {
         Ok(()) => {
             let name = editor.doc().name();
             let lines = editor.doc().line_count();
-            editor.set_status(format!("\"{name}\" {lines}L written"));
+            match fmt_err {
+                Some(e) => editor.set_status(format!("\"{name}\" {lines}L written ({e})")),
+                None => editor.set_status(format!("\"{name}\" {lines}L written")),
+            }
         }
         Err(e) => editor.set_status(format!("Error: {e}")),
     }

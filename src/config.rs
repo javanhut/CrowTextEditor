@@ -18,11 +18,15 @@ pub struct Config {
     pub scrolloff: usize,
     pub autoclose: bool,
     pub icons: bool,
+    pub format_on_save: bool,
     /// Extra bindings per mode: (key sequence, command name).
     pub keys_normal: Vec<(String, String)>,
     pub keys_insert: Vec<(String, String)>,
     /// Language servers: (file extension, server command line).
     pub lsp: Vec<(String, String)>,
+    /// Formatters: (file extension, command reading stdin, writing stdout).
+    /// Entries here override the built-in table.
+    pub fmt: Vec<(String, String)>,
 }
 
 impl Default for Config {
@@ -33,9 +37,11 @@ impl Default for Config {
             scrolloff: 3,
             autoclose: true,
             icons: true,
+            format_on_save: true,
             keys_normal: Vec::new(),
             keys_insert: Vec::new(),
             lsp: vec![("rs".into(), "rust-analyzer".into())],
+            fmt: Vec::new(),
         }
     }
 }
@@ -45,6 +51,7 @@ static TAB_WIDTH: AtomicUsize = AtomicUsize::new(4);
 static SCROLLOFF: AtomicUsize = AtomicUsize::new(3);
 static AUTOCLOSE: AtomicBool = AtomicBool::new(true);
 static ICONS: AtomicBool = AtomicBool::new(true);
+static FORMAT_ON_SAVE: AtomicBool = AtomicBool::new(true);
 
 pub fn tab_width() -> usize {
     TAB_WIDTH.load(Ordering::Relaxed)
@@ -62,13 +69,73 @@ pub fn icons() -> bool {
     ICONS.load(Ordering::Relaxed)
 }
 
+pub fn format_on_save() -> bool {
+    FORMAT_ON_SAVE.load(Ordering::Relaxed)
+}
+
 /// Install the config's options and theme as the live values.
 pub fn apply(config: &Config) {
     TAB_WIDTH.store(config.tab_width.clamp(1, 16), Ordering::Relaxed);
     SCROLLOFF.store(config.scrolloff.min(50), Ordering::Relaxed);
     AUTOCLOSE.store(config.autoclose, Ordering::Relaxed);
     ICONS.store(config.icons, Ordering::Relaxed);
+    FORMAT_ON_SAVE.store(config.format_on_save, Ordering::Relaxed);
     crate::theme::set(&config.theme);
+    let _ = FMT.set(config.fmt.clone());
+}
+
+static FMT: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+
+/// Built-in formatters, all reading the buffer on stdin and writing the
+/// result to stdout. `{file}` becomes the buffer's path (for tools that
+/// pick style/parser from the filename).
+const BUILTIN_FMT: &[(&str, &str)] = &[
+    ("rs", "rustfmt --edition 2021"),
+    ("go", "gofmt"),
+    ("py", "black -q -"),
+    ("sh", "shfmt"),
+    ("bash", "shfmt"),
+    ("zig", "zig fmt --stdin"),
+    ("lua", "stylua -"),
+    ("toml", "taplo fmt -"),
+    ("odin", "odinfmt -stdin"),
+    ("c", "clang-format --assume-filename={file}"),
+    ("h", "clang-format --assume-filename={file}"),
+    ("cpp", "clang-format --assume-filename={file}"),
+    ("hpp", "clang-format --assume-filename={file}"),
+    ("cc", "clang-format --assume-filename={file}"),
+    ("cxx", "clang-format --assume-filename={file}"),
+    ("hh", "clang-format --assume-filename={file}"),
+    ("java", "clang-format --assume-filename={file}"),
+    ("js", "prettier --stdin-filepath {file}"),
+    ("jsx", "prettier --stdin-filepath {file}"),
+    ("mjs", "prettier --stdin-filepath {file}"),
+    ("cjs", "prettier --stdin-filepath {file}"),
+    ("ts", "prettier --stdin-filepath {file}"),
+    ("mts", "prettier --stdin-filepath {file}"),
+    ("tsx", "prettier --stdin-filepath {file}"),
+    ("json", "prettier --stdin-filepath {file}"),
+    ("css", "prettier --stdin-filepath {file}"),
+    ("html", "prettier --stdin-filepath {file}"),
+    ("htm", "prettier --stdin-filepath {file}"),
+    ("md", "prettier --stdin-filepath {file}"),
+    ("markdown", "prettier --stdin-filepath {file}"),
+    ("yml", "prettier --stdin-filepath {file}"),
+    ("yaml", "prettier --stdin-filepath {file}"),
+];
+
+/// The formatter command line for a file extension: config entries first,
+/// then the built-in table.
+pub fn formatter(ext: &str) -> Option<String> {
+    if let Some(user) = FMT.get() {
+        if let Some((_, command)) = user.iter().find(|(e, _)| e == ext) {
+            return Some(command.clone());
+        }
+    }
+    BUILTIN_FMT
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, command)| command.to_string())
 }
 
 pub fn path() -> PathBuf {
@@ -89,6 +156,7 @@ tab_width = 4
 scrolloff = 3
 autoclose = true         # type ( [ { " ' and the closer appears
 icons = true             # Nerd Font file icons in the tree (needs a Nerd Font)
+format_on_save = true    # pipe the buffer through its [fmt] formatter on :w
 
 # Language servers: file extension = server command. crow starts the first
 # server whose extension matches an open file.
@@ -104,6 +172,12 @@ rs = "rust-analyzer"
 # "C-p" = "search"
 
 [keys.insert]
+
+# Formatters for :fmt — file extension = command reading stdin, writing
+# stdout ({file} becomes the buffer's path). Common tools (rustfmt, gofmt,
+# black, prettier, clang-format...) are built in; entries here override.
+[fmt]
+# py = "ruff format -"
 "#;
 
 /// Read the config, creating a commented template on first run.
@@ -155,11 +229,15 @@ fn parse(text: &str) -> Config {
                 "scrolloff" => config.scrolloff = value.parse().unwrap_or(config.scrolloff),
                 "autoclose" => config.autoclose = value.parse().unwrap_or(config.autoclose),
                 "icons" => config.icons = value.parse().unwrap_or(config.icons),
+                "format_on_save" => {
+                    config.format_on_save = value.parse().unwrap_or(config.format_on_save)
+                }
                 _ => {}
             },
             "keys.normal" => config.keys_normal.push((key, value)),
             "keys.insert" => config.keys_insert.push((key, value)),
             "lsp" => config.lsp.push((key, value)),
+            "fmt" => config.fmt.push((key, value)),
             _ => {}
         }
     }
@@ -269,6 +347,18 @@ py = "pyright-langserver --stdio"
     fn comments_and_junk_are_ignored() {
         let config = parse("# hello\ntheme = \"x # not a comment\"\nnoise without equals\n");
         assert_eq!(config.theme, "x # not a comment");
+    }
+
+    #[test]
+    fn formatter_lookup_falls_back_to_builtins() {
+        assert_eq!(formatter("go").as_deref(), Some("gofmt"));
+        assert!(formatter("xyz").is_none());
+    }
+
+    #[test]
+    fn a_fmt_section_is_parsed() {
+        let config = parse("[fmt]\npy = \"ruff format -\"\n");
+        assert_eq!(config.fmt, vec![("py".to_string(), "ruff format -".to_string())]);
     }
 
     #[test]

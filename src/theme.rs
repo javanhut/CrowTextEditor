@@ -12,6 +12,10 @@ pub struct Theme {
     /// Syntax colors indexed by highlight group id (see `syntax::group_of`);
     /// index 0 is unused (plain text).
     pub syntax: [Option<Color>; 8],
+    /// Bitmasks over the same group ids: bit N set = group N renders bold /
+    /// italic (on top of markdown's own strong/emphasis attributes).
+    pub bold: u8,
+    pub italic: u8,
     /// Editor background; `None` keeps the terminal's own.
     pub bg: Option<Color>,
     /// Default text color; `None` keeps the terminal's own.
@@ -45,6 +49,8 @@ pub static THEMES: &[Theme] = &[
             Some(Color::DarkYellow), // constant, number
             Some(Color::Blue),       // macro, attribute
         ],
+        bold: 0,
+        italic: 0,
         bg: None,
         fg: None,
         selection: Color::DarkGrey,
@@ -65,6 +71,8 @@ pub static THEMES: &[Theme] = &[
             Some(rgb(0xff, 0x9e, 0x64)), // constant, number
             Some(rgb(0xe0, 0xaf, 0x68)), // macro, attribute
         ],
+        bold: 0,
+        italic: 0b0000_0010, // comments
         bg: Some(rgb(0x1a, 0x1b, 0x26)),
         fg: Some(rgb(0xc0, 0xca, 0xf5)),
         selection: rgb(0x28, 0x34, 0x57),
@@ -85,6 +93,8 @@ pub static THEMES: &[Theme] = &[
             Some(rgb(0xd3, 0x86, 0x9b)), // constant
             Some(rgb(0x8e, 0xc0, 0x7c)), // macro
         ],
+        bold: 0,
+        italic: 0b0000_0010, // comments
         bg: Some(rgb(0x28, 0x28, 0x28)),
         fg: Some(rgb(0xeb, 0xdb, 0xb2)),
         selection: rgb(0x50, 0x49, 0x45),
@@ -96,6 +106,8 @@ pub static THEMES: &[Theme] = &[
     Theme {
         name: "mono",
         syntax: [None; 8],
+        bold: 0,
+        italic: 0,
         bg: None,
         fg: None,
         selection: Color::DarkGrey,
