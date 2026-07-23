@@ -34,11 +34,24 @@ impl FileTree {
         tree
     }
 
-    /// Re-flatten the visible rows from the filesystem.
+    /// Re-flatten the visible rows from the filesystem. Row 0 is always the
+    /// root itself — the header, and the way "add/paste at the root" gets a
+    /// selectable target.
     pub fn rebuild(&mut self) {
         let root = self.root.clone();
         self.rows.clear();
-        self.walk(&root, 0);
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        self.rows.push(Row {
+            path: root.clone(),
+            name,
+            depth: 0,
+            is_dir: true,
+            expanded: true,
+        });
+        self.walk(&root, 1);
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
 
@@ -97,7 +110,8 @@ impl FileTree {
         self.selected = (self.selected as isize + delta).clamp(0, n - 1) as usize;
     }
 
-    /// Expand or collapse the selected directory.
+    /// Expand or collapse the selected directory. The root row refreshes
+    /// instead — collapsing it would hide the whole tree.
     pub fn toggle_selected(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -105,11 +119,32 @@ impl FileTree {
         if !row.is_dir {
             return;
         }
+        if row.path == self.root {
+            self.rebuild();
+            return;
+        }
         let path = row.path.clone();
         if !self.expanded.remove(&path) {
             self.expanded.insert(path);
         }
         self.rebuild();
+    }
+
+    /// Expand every ancestor of `path` and put the selection on its row —
+    /// how a freshly created file becomes visible.
+    pub fn reveal(&mut self, path: &Path) {
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d == self.root || !d.starts_with(&self.root) {
+                break;
+            }
+            self.expanded.insert(d.to_path_buf());
+            dir = d.parent();
+        }
+        self.rebuild();
+        if let Some(i) = self.rows.iter().position(|r| r.path == path) {
+            self.selected = i;
+        }
     }
 
     /// Collapse the selected directory, or jump to the parent row.
@@ -136,6 +171,19 @@ impl FileTree {
     }
 }
 
+/// Copy a file, or a directory and everything under it.
+pub fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)?.flatten() {
+            copy_recursively(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,21 +200,31 @@ mod tests {
     }
 
     #[test]
-    fn dirs_first_then_files_sorted() {
+    fn root_row_first_then_dirs_then_files_sorted() {
         let (_dir, tree) = scratch_tree();
         let names: Vec<&str> = tree.rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["sub", "a.txt", "b.txt"]);
+        assert_eq!(names[1..], ["sub", "a.txt", "b.txt"]);
+        assert_eq!(tree.rows[0].path, tree.root);
+        assert!(tree.rows[0].is_dir);
     }
 
     #[test]
     fn expanding_inlines_children_and_collapsing_removes_them() {
         let (_dir, mut tree) = scratch_tree();
-        tree.selected = 0; // "sub"
+        tree.selected = 1; // "sub"
         tree.toggle_selected();
         let names: Vec<&str> = tree.rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["sub", "inner.txt", "a.txt", "b.txt"]);
-        assert_eq!(tree.rows[1].depth, 1);
+        assert_eq!(names[1..], ["sub", "inner.txt", "a.txt", "b.txt"]);
+        assert_eq!(tree.rows[2].depth, 2);
         tree.toggle_selected();
-        assert_eq!(tree.rows.len(), 3);
+        assert_eq!(tree.rows.len(), 4);
+    }
+
+    #[test]
+    fn toggling_the_root_row_never_collapses_the_tree() {
+        let (_dir, mut tree) = scratch_tree();
+        tree.selected = 0;
+        tree.toggle_selected();
+        assert_eq!(tree.rows.len(), 4); // still all visible
     }
 }

@@ -25,6 +25,7 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     render_status_line(editor, out)?;
     render_command_line(editor, out)?;
     render_prompt_popup(editor, out)?;
+    render_tree_prompt(editor, out)?;
     render_picker(editor, out)?;
     render_completion(editor, out)?;
 
@@ -387,14 +388,18 @@ fn render_tree(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
                 SetAttribute(Attribute::Reset)
             )?;
         } else {
-            let is_dir = tree.rows.get(start + row).is_some_and(|r| r.is_dir);
-            if is_dir {
+            // The root header gets the accent color; other dirs the gutter
+            // highlight.
+            if start + row == 0 {
+                queue!(out, SetForegroundColor(theme.border))?;
+            } else if tree.rows.get(start + row).is_some_and(|r| r.is_dir) {
                 queue!(out, SetForegroundColor(theme.gutter_cursor))?;
             }
             queue!(out, Print(format!("{line:<inner$}")), ResetColor)?;
         }
         queue!(
             out,
+            SetBackgroundColor(theme.bg.unwrap_or(Color::Reset)),
             SetForegroundColor(theme.gutter),
             Print("│"),
             ResetColor
@@ -556,23 +561,19 @@ fn render_command_line(editor: &Editor, out: &mut impl Write) -> std::io::Result
     )
 }
 
-/// The `:` and `/` prompts as a floating bordered popup, NvCrow-style: a
-/// rounded box near the top with the prompt kind in the border.
-fn render_prompt_popup(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
-    let title = match editor.mode {
-        Mode::Command => " Command ",
-        Mode::Search if editor.search_select => " Select ",
-        Mode::Search => " Search ",
-        _ => return Ok(()),
-    };
-    let (x, y, w) = editor.prompt_rect();
+/// A rounded, bordered one-line popup with its title in the top border —
+/// the NvCrow-style floating bar.
+fn draw_popup(
+    out: &mut impl Write,
+    x: u16,
+    y: u16,
+    w: u16,
+    title: &str,
+    content: &str,
+) -> std::io::Result<()> {
     let inner = (w as usize).saturating_sub(2);
     let theme = crate::theme::current();
-
-    let prefix = if editor.mode == Mode::Command { ':' } else { '/' };
-    let content = format!(" {prefix}{}", editor.command_line);
     let content: String = content.chars().take(inner).collect();
-
     queue!(
         out,
         cursor::MoveTo(x, y),
@@ -590,6 +591,65 @@ fn render_prompt_popup(editor: &Editor, out: &mut impl Write) -> std::io::Result
         Print(format!("╰{}╯", "─".repeat(inner))),
         ResetColor
     )
+}
+
+/// The `:` and `/` prompts as a floating popup.
+fn render_prompt_popup(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    let title = match editor.mode {
+        Mode::Command => " Command ",
+        Mode::Search if editor.search_select => " Select ",
+        Mode::Search => " Search ",
+        _ => return Ok(()),
+    };
+    let (x, y, w) = editor.prompt_rect();
+    let prefix = if editor.mode == Mode::Command { ':' } else { '/' };
+    draw_popup(out, x, y, w, title, &format!(" {prefix}{}", editor.command_line))
+}
+
+/// The tree's create/delete prompts, in the same popup style.
+fn render_tree_prompt(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    let Some(input) = &editor.tree_input else {
+        return Ok(());
+    };
+    let (x, y, w) = editor.prompt_rect();
+    match input {
+        crate::editor::TreeInput::Create { dir, name } => {
+            let where_ = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.to_string_lossy().into_owned());
+            draw_popup(
+                out,
+                x,
+                y,
+                w,
+                &format!(" New in {where_}/ "),
+                &format!(" {name}"),
+            )
+        }
+        crate::editor::TreeInput::Rename { name, .. } => {
+            draw_popup(out, x, y, w, " Rename ", &format!(" {name}"))
+        }
+        crate::editor::TreeInput::Delete { path } => {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let kind = if path.is_dir() {
+                "directory and contents"
+            } else {
+                "file"
+            };
+            draw_popup(
+                out,
+                x,
+                y,
+                w,
+                " Delete ",
+                &format!(" delete {kind} {name:?}? (y/n)"),
+            )
+        }
+    }
 }
 
 #[cfg(test)]

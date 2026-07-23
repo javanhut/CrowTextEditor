@@ -93,7 +93,7 @@ an emoji ZWJ sequence or a combining stack.
 | `gd` `K` | goto definition / hover (LSP) |
 | *(typing)* | intellisense pops itself from buffer words — Tab accepts, Enter stays Enter |
 | `C-space` (insert) | LSP completion menu — Tab/Enter accepts, type to narrow |
-| `space e` | file tree sidebar — same key focuses and closes; `j`/`k` move, Enter/`l` expand or open, `h` collapse, `Esc` back to editor, `q` close |
+| `space e` | file tree sidebar — same key focuses and closes; `j`/`k` move, Enter/`l` expand or open, `h` collapse, `a` add (trailing `/` = dir), `r` rename, `d` delete (y/n), `x`/`c`/`p` cut/copy/paste, `R` refresh, `Esc` back to editor, `q` close |
 | `space c` | command palette: fuzzy-run any command |
 | `space f` | fuzzy file finder |
 | `space d` | directory browser picker (Enter descends, Backspace goes up) |

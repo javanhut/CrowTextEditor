@@ -31,6 +31,17 @@ impl Mode {
     }
 }
 
+/// A pending file operation started from the tree sidebar.
+pub enum TreeInput {
+    /// Typing a name for a new entry inside `dir`; a trailing `/` makes a
+    /// directory.
+    Create { dir: PathBuf, name: String },
+    /// Waiting for y/n on deleting `path`.
+    Delete { path: PathBuf },
+    /// Editing a new name for `path`, prefilled with the current one.
+    Rename { path: PathBuf, name: String },
+}
+
 /// An active completion menu, shown while in insert mode.
 pub struct Completion {
     /// (label, insert text) pairs, already filtered to the typed prefix.
@@ -368,6 +379,10 @@ pub struct Editor {
     /// A `space` was pressed while the tree had focus; `e` completes the
     /// toggle sequence there too.
     tree_leader: bool,
+    /// An in-progress create/delete started from the tree.
+    pub tree_input: Option<TreeInput>,
+    /// The tree's clipboard: a path and whether the paste should move it.
+    pub tree_clipboard: Option<(PathBuf, bool)>,
     pub should_quit: bool,
     /// Terminal size as (columns, rows).
     pub size: (u16, u16),
@@ -445,6 +460,8 @@ impl Editor {
             tree: None,
             tree_focused: false,
             tree_leader: false,
+            tree_input: None,
+            tree_clipboard: None,
             should_quit: false,
             size,
             keymaps,
@@ -1109,6 +1126,10 @@ impl Editor {
     }
 
     fn handle_tree_key(&mut self, key: Key) {
+        if self.tree_input.is_some() {
+            self.handle_tree_input_key(key);
+            return;
+        }
         // The tree owns the keyboard while focused, so it must recognize the
         // `space e` toggle itself — otherwise the sidebar could never close.
         if self.tree_leader {
@@ -1135,7 +1156,63 @@ impl Editor {
             KeyCode::Up | KeyCode::Char('k') => tree.move_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => tree.move_selection(1),
             KeyCode::Char('h') | KeyCode::Left => tree.collapse_or_parent(),
-            KeyCode::Char('r') => tree.rebuild(),
+            KeyCode::Char('R') => tree.rebuild(),
+            KeyCode::Char('r') => {
+                if let Some(row) = tree.selected_row() {
+                    if row.path == tree.root {
+                        self.set_status("the root can't be renamed from here");
+                    } else {
+                        self.tree_input = Some(TreeInput::Rename {
+                            path: row.path.clone(),
+                            name: row.name.clone(),
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                // New entries go into the selected directory, or beside the
+                // selected file.
+                let dir = match tree.selected_row() {
+                    Some(row) if row.is_dir => row.path.clone(),
+                    Some(row) => row
+                        .path
+                        .parent()
+                        .unwrap_or(&tree.root)
+                        .to_path_buf(),
+                    None => tree.root.clone(),
+                };
+                self.tree_input = Some(TreeInput::Create {
+                    dir,
+                    name: String::new(),
+                });
+            }
+            KeyCode::Char('d') => {
+                if let Some(row) = tree.selected_row() {
+                    if row.path == tree.root {
+                        self.set_status("not deleting the project root");
+                    } else {
+                        self.tree_input = Some(TreeInput::Delete {
+                            path: row.path.clone(),
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char('c') => {
+                if let Some(row) = tree.selected_row() {
+                    if row.path == tree.root {
+                        self.set_status("the root can't be cut or copied");
+                        return;
+                    }
+                    let cut = key.code == KeyCode::Char('x');
+                    let name = row.name.clone();
+                    self.tree_clipboard = Some((row.path.clone(), cut));
+                    self.set_status(format!(
+                        "{} {name} — p pastes",
+                        if cut { "cut" } else { "copied" }
+                    ));
+                }
+            }
+            KeyCode::Char('p') => self.tree_paste(),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 let Some(row) = tree.selected_row() else {
                     return;
@@ -1149,6 +1226,192 @@ impl Editor {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Keys while a tree create/delete prompt is open. `take` + re-store
+    /// keeps the borrow checker out of the way.
+    fn handle_tree_input_key(&mut self, key: Key) {
+        let Some(input) = self.tree_input.take() else {
+            return;
+        };
+        match input {
+            TreeInput::Create { dir, mut name } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.tree_create(&dir, name.trim()),
+                KeyCode::Backspace => {
+                    name.pop();
+                    self.tree_input = Some(TreeInput::Create { dir, name });
+                }
+                KeyCode::Char(c) if !key.ctrl && !key.alt => {
+                    name.push(c);
+                    self.tree_input = Some(TreeInput::Create { dir, name });
+                }
+                _ => self.tree_input = Some(TreeInput::Create { dir, name }),
+            },
+            TreeInput::Delete { path } => {
+                if key.code == KeyCode::Char('y') {
+                    self.tree_delete(&path);
+                }
+            }
+            TreeInput::Rename { path, mut name } => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.tree_rename(&path, name.trim()),
+                KeyCode::Backspace => {
+                    name.pop();
+                    self.tree_input = Some(TreeInput::Rename { path, name });
+                }
+                KeyCode::Char(c) if !key.ctrl && !key.alt => {
+                    name.push(c);
+                    self.tree_input = Some(TreeInput::Rename { path, name });
+                }
+                _ => self.tree_input = Some(TreeInput::Rename { path, name }),
+            },
+        }
+    }
+
+    fn tree_create(&mut self, dir: &Path, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        let target = dir.join(name);
+        let result = if name.ends_with('/') {
+            std::fs::create_dir_all(&target)
+        } else {
+            // `a src/deep/new.rs` works: intermediate directories appear too.
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // create_new: never truncate something that already exists.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map(|_| ())
+        };
+        match result {
+            Ok(()) => {
+                if let Some(tree) = self.tree.as_mut() {
+                    tree.reveal(&target);
+                }
+                self.set_status(format!("created {name}"));
+            }
+            Err(e) => self.set_status(format!("Error: {e}")),
+        }
+    }
+
+    fn tree_rename(&mut self, path: &Path, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        let target = path.parent().unwrap_or(Path::new("")).join(name);
+        if target == path {
+            return;
+        }
+        if target.exists() {
+            self.set_status(format!("Error: {name:?} already exists"));
+            return;
+        }
+        // A name with slashes is a move; the intermediate directories appear.
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::rename(path, &target) {
+            Ok(()) => {
+                self.retarget_buffers(path, &target);
+                if let Some(tree) = self.tree.as_mut() {
+                    tree.reveal(&target);
+                }
+                self.set_status(format!("renamed to {name}"));
+            }
+            Err(e) => self.set_status(format!("Error: {e}")),
+        }
+    }
+
+    fn tree_paste(&mut self) {
+        let Some((src, cut)) = self.tree_clipboard.clone() else {
+            self.set_status("nothing cut or copied");
+            return;
+        };
+        let Some(tree) = self.tree.as_ref() else {
+            return;
+        };
+        // Same landing rule as `a`: the selected directory, or beside the
+        // selected file.
+        let dir = match tree.selected_row() {
+            Some(row) if row.is_dir => row.path.clone(),
+            Some(row) => row.path.parent().unwrap_or(&tree.root).to_path_buf(),
+            None => tree.root.clone(),
+        };
+        let Some(name) = src.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            return;
+        };
+        let target = dir.join(&name);
+        if target == src {
+            self.set_status("already there");
+            return;
+        }
+        if target.exists() {
+            self.set_status(format!("Error: {name:?} already exists here"));
+            return;
+        }
+        if src.is_dir() && dir.starts_with(&src) {
+            self.set_status("Error: can't paste a directory into itself");
+            return;
+        }
+
+        let result = if cut {
+            std::fs::rename(&src, &target)
+        } else {
+            crate::filetree::copy_recursively(&src, &target)
+        };
+        match result {
+            Ok(()) => {
+                if cut {
+                    // The move is done: open buffers follow, and a second
+                    // paste would be meaningless.
+                    self.retarget_buffers(&src, &target);
+                    self.tree_clipboard = None;
+                }
+                if let Some(tree) = self.tree.as_mut() {
+                    tree.reveal(&target);
+                }
+                self.set_status(format!("{} {name}", if cut { "moved" } else { "copied" }));
+            }
+            Err(e) => self.set_status(format!("Error: {e}")),
+        }
+    }
+
+    /// Point any open buffer at a file's new location after a move.
+    fn retarget_buffers(&mut self, old: &Path, new: &Path) {
+        for doc in &mut self.documents {
+            if doc.path.as_deref() == Some(old) {
+                doc.path = Some(new.to_path_buf());
+                doc.refresh_syntax();
+            }
+        }
+    }
+
+    fn tree_delete(&mut self, path: &Path) {
+        // ponytail: a real delete, not a trash can — the y/n prompt names
+        // exactly what goes.
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match result {
+            Ok(()) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if let Some(tree) = self.tree.as_mut() {
+                    tree.rebuild();
+                }
+                self.set_status(format!("deleted {name}"));
+            }
+            Err(e) => self.set_status(format!("Error: {e}")),
         }
     }
 
@@ -1474,6 +1737,13 @@ impl Editor {
 
     /// Cursor position on screen as (column, row), or `None` if off-screen.
     pub fn screen_cursor(&self) -> Option<(u16, u16)> {
+        if let Some(TreeInput::Create { name, .. } | TreeInput::Rename { name, .. }) =
+            &self.tree_input
+        {
+            let (x, y, w) = self.prompt_rect();
+            let col = 2 + name.chars().count();
+            return Some((x + (col as u16).min(w.saturating_sub(2)), y + 1));
+        }
         if self.tree_focused {
             return None; // the tree's reversed row is the focus indicator
         }
@@ -1968,6 +2238,114 @@ mod tests {
         assert!(editor.tree.is_some() && editor.tree_focused);
         press(&mut editor, "<space> e");
         assert!(editor.tree.is_none());
+    }
+
+    #[test]
+    fn tree_a_creates_and_d_deletes_files() {
+        let dir = std::env::temp_dir().join(format!("crow-tree-ops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut editor = editor_with("");
+        editor.tree = Some(crate::filetree::FileTree::new(dir.clone()));
+        editor.tree_focused = true;
+
+        // a, type a name, Enter -> the file exists and is selected.
+        press(&mut editor, "a");
+        assert!(editor.tree_input.is_some());
+        press(&mut editor, "notes.txt");
+        press(&mut editor, "<enter>");
+        assert!(dir.join("notes.txt").is_file());
+        let tree = editor.tree.as_ref().unwrap();
+        assert_eq!(tree.selected_row().unwrap().name, "notes.txt");
+
+        // Nested path: intermediate directories appear too.
+        press(&mut editor, "a");
+        press(&mut editor, "sub/deep.txt");
+        press(&mut editor, "<enter>");
+        assert!(dir.join("sub/deep.txt").is_file());
+
+        // r renames, prefilled with the old name; buffers follow.
+        editor.tree.as_mut().unwrap().reveal(&dir.join("notes.txt"));
+        press(&mut editor, "r");
+        assert!(matches!(
+            editor.tree_input,
+            Some(crate::editor::TreeInput::Rename { .. })
+        ));
+        press(&mut editor, "<bs> <bs> <bs>"); // "notes.txt" -> "notes."
+        press(&mut editor, "md");
+        press(&mut editor, "<enter>"); // -> "notes.md"
+        assert!(dir.join("notes.md").is_file());
+        assert!(!dir.join("notes.txt").exists());
+        std::fs::rename(dir.join("notes.md"), dir.join("notes.txt")).unwrap();
+        editor.tree.as_mut().unwrap().rebuild();
+
+        // d + n leaves the file alone; d + y removes it.
+        editor.tree.as_mut().unwrap().reveal(&dir.join("notes.txt"));
+        press(&mut editor, "d");
+        press(&mut editor, "n");
+        assert!(dir.join("notes.txt").is_file());
+        press(&mut editor, "d");
+        press(&mut editor, "y");
+        assert!(!dir.join("notes.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tree_cut_copy_paste_move_files() {
+        let dir = std::env::temp_dir().join(format!("crow-tree-clip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), "hi").unwrap();
+
+        let mut editor = editor_with("");
+        editor.tree = Some(crate::filetree::FileTree::new(dir.clone()));
+        editor.tree_focused = true;
+
+        // Copy a.txt into sub/: original stays.
+        editor.tree.as_mut().unwrap().reveal(&dir.join("a.txt"));
+        press(&mut editor, "c");
+        editor.tree.as_mut().unwrap().reveal(&dir.join("sub"));
+        press(&mut editor, "p");
+        assert!(dir.join("a.txt").is_file());
+        assert!(dir.join("sub/a.txt").is_file());
+        // Copy clipboard survives; pasting where it exists errors, not clobbers.
+        press(&mut editor, "p");
+        assert!(editor.status.contains("already exists"));
+
+        // Cut sub/a.txt back to the root as a move (pasting beside b.txt).
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        std::fs::write(dir.join("b.txt"), "").unwrap();
+        editor.tree.as_mut().unwrap().reveal(&dir.join("sub/a.txt"));
+        press(&mut editor, "x");
+        editor.tree.as_mut().unwrap().reveal(&dir.join("b.txt"));
+        press(&mut editor, "p");
+        assert!(dir.join("a.txt").is_file());
+        assert!(!dir.join("sub/a.txt").exists());
+        // Cut clipboard is spent.
+        press(&mut editor, "p");
+        assert!(editor.status.contains("nothing"));
+
+        // The root header row is a valid paste target.
+        std::fs::write(dir.join("sub/c.txt"), "").unwrap();
+        editor.tree.as_mut().unwrap().reveal(&dir.join("sub/c.txt"));
+        press(&mut editor, "x");
+        editor.tree.as_mut().unwrap().selected = 0; // the root row
+        press(&mut editor, "p");
+        assert!(dir.join("c.txt").is_file());
+        assert!(!dir.join("sub/c.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extend_mode_selects_across_lines() {
+        let mut editor = editor_with("abc\ndef\nghi");
+        press(&mut editor, "vjd"); // grow the selection down a line, delete
+        assert_eq!(editor.doc().text.to_string(), "def\nghi");
+        press(&mut editor, "vjd");
+        assert_eq!(editor.doc().text.to_string(), "ghi");
     }
 
     #[test]
