@@ -451,62 +451,34 @@ fn render_tree(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
 }
 
 /// The popup picker: a reversed title/query row, then the filtered list.
+/// Pickers share the prompt popup's bordered look: title in the top border,
+/// the query where the command line sits, then the list in the same walls.
 fn render_picker(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     let Some(picker) = &editor.picker else {
         return Ok(());
     };
     let (x, y, w, h) = editor.picker_rect();
-    let w = w as usize;
+    draw_popup(out, x, y, w, &format!(" {} ", picker.title), &format!(" ▸ {}", picker.query))?;
 
-    let title = format!(" {} ▸ {}", picker.title, picker.query);
-    let title: String = title.chars().take(w).collect();
-    queue!(
-        out,
-        cursor::MoveTo(x, y),
-        SetAttribute(Attribute::Reverse),
-        Print(format!("{title:<w$}")),
-        SetAttribute(Attribute::Reset)
-    )?;
-
-    let list_h = (h as usize).saturating_sub(1);
+    let list_h = (h as usize).saturating_sub(4).max(1);
     let start = picker
         .selected
         .saturating_sub(list_h.saturating_sub(1).min(picker.selected));
-    let start = start.min(picker.filtered.len().saturating_sub(list_h).max(0));
-    let popup_bg = crate::theme::current().popup_bg;
-
-    for row in 0..list_h {
-        queue!(out, cursor::MoveTo(x, y + 1 + row as u16))?;
-        let line = match picker.filtered.get(start + row) {
-            Some(&idx) => {
-                let item = &picker.items[idx];
-                let mut line = format!(" {}", item.label);
-                if !item.detail.is_empty() {
-                    line.push_str("  · ");
-                    line.push_str(&item.detail);
-                }
-                line
+    let start = start.min(picker.filtered.len().saturating_sub(list_h));
+    let end = (start + list_h).min(picker.filtered.len());
+    let rows: Vec<String> = picker.filtered[start..end]
+        .iter()
+        .map(|&idx| {
+            let item = &picker.items[idx];
+            if item.detail.is_empty() {
+                format!(" {}", item.label)
+            } else {
+                format!(" {}  · {}", item.label, item.detail)
             }
-            None => String::new(),
-        };
-        let line: String = line.chars().take(w).collect();
-        if start + row == picker.selected && !picker.filtered.is_empty() {
-            queue!(
-                out,
-                SetAttribute(Attribute::Reverse),
-                Print(format!("{line:<w$}")),
-                SetAttribute(Attribute::Reset)
-            )?;
-        } else {
-            queue!(
-                out,
-                SetBackgroundColor(popup_bg),
-                Print(format!("{line:<w$}")),
-                ResetColor
-            )?;
-        }
-    }
-    Ok(())
+        })
+        .collect();
+    let selected = (!picker.filtered.is_empty()).then(|| picker.selected - start);
+    draw_box_list(out, x, y + 2, w, &rows, selected)
 }
 
 /// The `:help` window: a scrollable command reference, picker-styled.
@@ -712,50 +684,67 @@ fn render_prompt_popup(editor: &Editor, out: &mut impl Write) -> std::io::Result
     if editor.mode == Mode::Command {
         let suggestions = editor.command_suggestions();
         if !suggestions.is_empty() {
-            let inner = (w as usize).saturating_sub(2);
-            let theme = crate::theme::current();
-            // The prompt's bottom border becomes a separator…
-            queue!(
-                out,
-                cursor::MoveTo(x, y + 2),
-                SetBackgroundColor(theme.popup_bg),
-                SetForegroundColor(theme.border),
-                Print(format!("├{}┤", "─".repeat(inner)))
-            )?;
-            // …the rows sit inside the same walls…
-            for (row, name) in suggestions.iter().enumerate() {
-                let doc = crate::commands::find(name).map(|c| c.doc).unwrap_or("");
-                let line: String = format!(" {name:<18} {doc}").chars().take(inner).collect();
-                queue!(
-                    out,
-                    cursor::MoveTo(x, y + 3 + row as u16),
-                    SetForegroundColor(theme.border),
-                    Print("│"),
-                    SetForegroundColor(theme.fg.unwrap_or(Color::Reset))
-                )?;
-                if editor.command_suggest == Some(row) {
-                    queue!(
-                        out,
-                        SetAttribute(Attribute::Reverse),
-                        Print(format!("{line:<inner$}")),
-                        SetAttribute(Attribute::Reset),
-                        SetBackgroundColor(theme.popup_bg)
-                    )?;
-                } else {
-                    queue!(out, Print(format!("{line:<inner$}")))?;
-                }
-                queue!(out, SetForegroundColor(theme.border), Print("│"))?;
-            }
-            // …and the box closes under the last row.
-            queue!(
-                out,
-                cursor::MoveTo(x, y + 3 + suggestions.len() as u16),
-                Print(format!("╰{}╯", "─".repeat(inner))),
-                ResetColor
-            )?;
+            let rows: Vec<String> = suggestions
+                .iter()
+                .map(|name| {
+                    let doc = crate::commands::find(name).map(|c| c.doc).unwrap_or("");
+                    format!(" {name:<18} {doc}")
+                })
+                .collect();
+            draw_box_list(out, x, y + 2, w, &rows, editor.command_suggest)?;
         }
     }
     Ok(())
+}
+
+/// Rows continuing an open `draw_popup` box: a `├─┤` separator (drawn over
+/// the popup's bottom border at `y`), walled rows with the selected one
+/// reversed, and the closing `╰─╯`.
+fn draw_box_list(
+    out: &mut impl Write,
+    x: u16,
+    y: u16,
+    w: u16,
+    rows: &[String],
+    selected: Option<usize>,
+) -> std::io::Result<()> {
+    let inner = (w as usize).saturating_sub(2);
+    let theme = crate::theme::current();
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        SetBackgroundColor(theme.popup_bg),
+        SetForegroundColor(theme.border),
+        Print(format!("├{}┤", "─".repeat(inner)))
+    )?;
+    for (i, row) in rows.iter().enumerate() {
+        let line: String = row.chars().take(inner).collect();
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 1 + i as u16),
+            SetForegroundColor(theme.border),
+            Print("│"),
+            SetForegroundColor(theme.fg.unwrap_or(Color::Reset))
+        )?;
+        if selected == Some(i) {
+            queue!(
+                out,
+                SetAttribute(Attribute::Reverse),
+                Print(format!("{line:<inner$}")),
+                SetAttribute(Attribute::Reset),
+                SetBackgroundColor(theme.popup_bg)
+            )?;
+        } else {
+            queue!(out, Print(format!("{line:<inner$}")))?;
+        }
+        queue!(out, SetForegroundColor(theme.border), Print("│"))?;
+    }
+    queue!(
+        out,
+        cursor::MoveTo(x, y + 1 + rows.len() as u16),
+        Print(format!("╰{}╯", "─".repeat(inner))),
+        ResetColor
+    )
 }
 
 /// The tree's create/delete prompts, in the same popup style.

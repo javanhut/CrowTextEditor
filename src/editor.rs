@@ -2039,8 +2039,8 @@ impl Editor {
         if self.mode == Mode::Picker {
             let picker = self.picker.as_ref()?;
             let (x, y, w, _) = self.picker_rect();
-            let col = 1 + picker.title.chars().count() + 3 + picker.query.chars().count();
-            return Some((x + (col as u16).min(w.saturating_sub(1)), y));
+            let col = 4 + picker.query.chars().count(); // after "│ ▸ "
+            return Some((x + (col as u16).min(w.saturating_sub(2)), y + 1));
         }
         if matches!(self.mode, Mode::Command | Mode::Search) {
             // Inside the floating prompt: after the border, space, and prefix.
