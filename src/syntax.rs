@@ -26,18 +26,9 @@ pub struct Syntax {
     pub spans: Vec<(usize, usize, u8)>,
 }
 
-/// Terminal color for a highlight group; `None` is the default foreground.
+/// Terminal color for a highlight group, from the active theme.
 pub fn color(group: u8) -> Option<Color> {
-    match group {
-        1 => Some(Color::DarkGrey),   // comment
-        2 => Some(Color::Green),      // string
-        3 => Some(Color::Magenta),    // keyword
-        4 => Some(Color::Cyan),       // function
-        5 => Some(Color::Yellow),     // type
-        6 => Some(Color::DarkYellow), // constant, number, escape
-        7 => Some(Color::Blue),       // macro, attribute
-        _ => None,
-    }
+    crate::theme::current().syntax[(group as usize).min(7)]
 }
 
 fn group_of(capture_name: &str) -> u8 {

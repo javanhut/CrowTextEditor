@@ -1,11 +1,15 @@
 mod commands;
+mod config;
 mod document;
 mod editor;
+mod filetree;
 mod keymap;
 mod lsp;
+mod picker;
 mod position;
 mod search;
 mod syntax;
+mod theme;
 mod transaction;
 mod ui;
 
@@ -39,11 +43,18 @@ KEYS (normal mode):
     0 ^ $        line ends       u  C-r        undo, redo
     gg G  42gg   file ends, jump to line       :w :q :wq  write, quit
     C-d C-u      half page       gn gp         next/prev buffer
-    gd K         goto definition, hover (needs rust-analyzer)
+    gd K         goto definition, hover        C-space  LSP complete (insert)
+    space e      file tree sidebar             (typing pops word completion)
+    space c/f/d/t  command palette, find file, browse dir, themes
 
     Motions select the text they cross; d/c/y act on the selection.
     Every motion, edit, and inserted keystroke applies at every cursor.
     A count may prefix most commands: 3x, 10d, 5C.
+
+CONFIG:
+    ~/.config/crow/crow.toml — theme, options, keybindings, language
+    servers. Created with comments on first run; :config opens it,
+    :theme <name> switches themes live.
 ";
 
 fn main() -> std::io::Result<()> {
@@ -54,8 +65,10 @@ fn main() -> std::io::Result<()> {
     }
 
     let paths: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
+    let cfg = config::load();
+    config::apply(&cfg);
     let size = crossterm::terminal::size()?;
-    let mut editor = Editor::new(paths, size)?;
+    let mut editor = Editor::new(paths, size, &cfg)?;
 
     install_panic_hook();
     setup_terminal()?;

@@ -7,7 +7,7 @@ use crate::commands;
 use crate::lsp;
 use crate::document::Document;
 use crate::keymap::{Key, KeyCode, KeyTrie, KeymapResult};
-use crate::position::TAB_WIDTH;
+
 use crate::search;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,7 @@ pub enum Mode {
     Insert,
     Command,
     Search,
+    Picker,
 }
 
 impl Mode {
@@ -25,8 +26,21 @@ impl Mode {
             Mode::Insert => "INS",
             Mode::Command => "CMD",
             Mode::Search => "FND",
+            Mode::Picker => "PCK",
         }
     }
+}
+
+/// An active completion menu, shown while in insert mode.
+pub struct Completion {
+    /// (label, insert text) pairs, already filtered to the typed prefix.
+    pub items: Vec<(String, String)>,
+    pub selected: usize,
+    /// The word before the cursor when the menu appeared.
+    pub prefix: String,
+    /// Popped up on its own while typing (buffer words). Auto menus accept
+    /// with Tab only — Enter stays a newline, so typing is never hijacked.
+    pub auto: bool,
 }
 
 /// A window's saved view state. The focused window's state lives in its
@@ -267,6 +281,13 @@ impl Default for Keymaps {
         normal.bind_str("gp", "prev_buffer");
         normal.bind_str("gd", "goto_definition");
         normal.bind_str("K", "hover");
+
+        // space leader: pickers
+        normal.bind_str("<space> c", "command_palette");
+        normal.bind_str("<space> f", "find_files");
+        normal.bind_str("<space> e", "tree_toggle");
+        normal.bind_str("<space> d", "file_explorer");
+        normal.bind_str("<space> t", "theme_picker");
         normal.bind_str("C-s", "save");
         normal.bind_str(":", "command_mode");
         normal.bind_str("<esc>", "normal_mode");
@@ -284,6 +305,8 @@ impl Default for Keymaps {
         insert.bind_str("<home>", "move_line_start");
         insert.bind_str("<end>", "move_line_end");
         insert.bind_str("C-s", "save");
+        insert.bind_str("C-<space>", "complete");
+        insert.bind_str("C-n", "complete");
 
         Keymaps { normal, insert }
     }
@@ -328,10 +351,23 @@ pub struct Editor {
     pub extend: bool,
     /// The language server, once one has started.
     pub lsp: Option<lsp::Client>,
+    /// From crow.toml: (file extension, server command).
+    lsp_table: Vec<(String, String)>,
     /// Set after a failed spawn so we don't retry every tick.
     lsp_failed: bool,
     /// Latest diagnostics per file (canonical paths, as the server sends them).
     pub diagnostics: HashMap<PathBuf, Vec<lsp::Diagnostic>>,
+    /// The active popup picker, if any (mode == Picker).
+    pub picker: Option<crate::picker::Picker>,
+    /// The active completion menu, if any (mode == Insert).
+    pub completion: Option<Completion>,
+    /// The file tree sidebar, when visible.
+    pub tree: Option<crate::filetree::FileTree>,
+    /// Keys go to the tree instead of the buffer.
+    pub tree_focused: bool,
+    /// A `space` was pressed while the tree had focus; `e` completes the
+    /// toggle sequence there too.
+    tree_leader: bool,
     pub should_quit: bool,
     /// Terminal size as (columns, rows).
     pub size: (u16, u16),
@@ -339,7 +375,11 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(paths: Vec<PathBuf>, size: (u16, u16)) -> std::io::Result<Self> {
+    pub fn new(
+        paths: Vec<PathBuf>,
+        size: (u16, u16),
+        config: &crate::config::Config,
+    ) -> std::io::Result<Self> {
         let mut documents = Vec::new();
         for path in paths {
             documents.push(Document::open(path)?);
@@ -347,6 +387,26 @@ impl Editor {
         if documents.is_empty() {
             documents.push(Document::empty());
         }
+
+        let mut keymaps = Keymaps::default();
+        let mut bad_binds = Vec::new();
+        for (mode_keys, trie) in [
+            (&config.keys_normal, &mut keymaps.normal),
+            (&config.keys_insert, &mut keymaps.insert),
+        ] {
+            for (seq, command) in mode_keys {
+                if commands::find(command).is_some() {
+                    trie.bind_str(seq, command);
+                } else {
+                    bad_binds.push(command.clone());
+                }
+            }
+        }
+        let status = if bad_binds.is_empty() {
+            String::new()
+        } else {
+            format!("crow.toml: unknown command(s): {}", bad_binds.join(", "))
+        };
 
         Ok(Editor {
             documents,
@@ -366,7 +426,7 @@ impl Editor {
             pending: Vec::new(),
             count: None,
             command_line: String::new(),
-            status: String::new(),
+            status,
             register: String::new(),
             registers: std::collections::HashMap::new(),
             active_register: None,
@@ -380,9 +440,15 @@ impl Editor {
             lsp: None,
             lsp_failed: false,
             diagnostics: HashMap::new(),
+            picker: None,
+            completion: None,
+            tree: None,
+            tree_focused: false,
+            tree_leader: false,
             should_quit: false,
             size,
-            keymaps: Keymaps::default(),
+            keymaps,
+            lsp_table: config.lsp.clone(),
         })
     }
 
@@ -404,10 +470,26 @@ impl Editor {
 
     // ---- windows -----------------------------------------------------------
 
+    /// Width of the file tree sidebar, 0 when hidden.
+    pub fn tree_width(&self) -> u16 {
+        if self.tree.is_some() {
+            30.min(self.size.0 / 3)
+        } else {
+            0
+        }
+    }
+
     /// Every window's rectangle plus the separators between them. The text
-    /// area is everything but the status and command lines.
+    /// area is everything but the status and command lines, minus the tree
+    /// sidebar when it is visible.
     pub fn window_rects(&self) -> (Vec<(usize, Rect)>, Vec<(Rect, bool)>) {
-        let area = (0, 0, self.size.0, self.size.1.saturating_sub(2));
+        let tree_w = self.tree_width();
+        let area = (
+            tree_w,
+            0,
+            self.size.0.saturating_sub(tree_w),
+            self.size.1.saturating_sub(2),
+        );
         let mut wins = Vec::new();
         let mut seps = Vec::new();
         self.layout.rects(area, &mut wins, &mut seps);
@@ -543,6 +625,18 @@ impl Editor {
             self.handle_search_key(key);
             return;
         }
+        if self.mode == Mode::Picker {
+            self.handle_picker_key(key);
+            return;
+        }
+        if self.tree_focused {
+            self.handle_tree_key(key);
+            return;
+        }
+        if self.mode == Mode::Insert && self.completion.is_some() && self.handle_completion_key(key)
+        {
+            return;
+        }
 
         // `"x` names the register for the next capture or paste.
         if self.mode == Mode::Normal && self.pending.is_empty() {
@@ -623,6 +717,9 @@ impl Editor {
                     if let KeyCode::Char(c) = key.code {
                         let s = c.to_string();
                         self.doc_mut().insert_at_cursor(&s);
+                        if c.is_alphanumeric() || c == '_' {
+                            self.maybe_autocomplete();
+                        }
                     }
                 }
                 self.pending.clear();
@@ -830,6 +927,27 @@ impl Editor {
             },
             "bn" => (commands::find("next_buffer").unwrap().func)(self),
             "bp" => (commands::find("prev_buffer").unwrap().func)(self),
+            "theme" => match arg {
+                Some(name) => {
+                    if crate::theme::set(name) {
+                        self.set_status(format!("theme: {name}"));
+                    } else {
+                        self.set_status(format!(
+                            "Unknown theme {name:?}. Available: {}",
+                            crate::theme::names()
+                        ));
+                    }
+                }
+                None => self.set_status(format!("Themes: {}", crate::theme::names())),
+            },
+            "config" => match Document::open(crate::config::path()) {
+                Ok(doc) => {
+                    self.documents.push(doc);
+                    self.current = self.documents.len() - 1;
+                    self.set_status("editing crow.toml — changes apply on restart");
+                }
+                Err(e) => self.set_status(format!("Error: {e}")),
+            },
             other => {
                 // `:42` jumps to a line.
                 if let Ok(n) = other.parse::<usize>() {
@@ -846,6 +964,286 @@ impl Editor {
                 }
             }
         }
+    }
+
+    // ---- picker ------------------------------------------------------------
+
+    pub fn open_picker(&mut self, picker: crate::picker::Picker) {
+        self.picker = Some(picker);
+        self.set_mode(Mode::Picker);
+    }
+
+    fn close_picker(&mut self) {
+        self.picker = None;
+        self.set_mode(Mode::Normal);
+    }
+
+    fn handle_picker_key(&mut self, key: Key) {
+        use crate::picker::Kind;
+        let Some(picker) = self.picker.as_mut() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                if let Kind::Theme { original } = &picker.kind {
+                    crate::theme::set(original);
+                }
+                self.close_picker();
+            }
+            KeyCode::Enter => self.picker_accept(),
+            KeyCode::Down => self.picker_move(1),
+            KeyCode::Up => self.picker_move(-1),
+            KeyCode::Char('n') if key.ctrl => self.picker_move(1),
+            KeyCode::Char('p') if key.ctrl => self.picker_move(-1),
+            KeyCode::Backspace => {
+                if picker.query.pop().is_some() {
+                    picker.refilter();
+                    self.picker_preview();
+                } else if let Kind::Explorer { dir } = &picker.kind {
+                    // Empty query: backspace climbs to the parent directory.
+                    let parent = dir.parent().map(Path::to_path_buf);
+                    if let Some(parent) = parent {
+                        *picker = crate::picker::Picker::explorer(parent);
+                    }
+                }
+            }
+            KeyCode::Char(c) if !key.ctrl && !key.alt => {
+                picker.query.push(c);
+                picker.refilter();
+                self.picker_preview();
+            }
+            _ => {}
+        }
+    }
+
+    fn picker_move(&mut self, delta: isize) {
+        if let Some(picker) = self.picker.as_mut() {
+            picker.move_selection(delta);
+        }
+        self.picker_preview();
+    }
+
+    /// Theme picking previews live: the highlighted theme is applied at once.
+    fn picker_preview(&mut self) {
+        let Some(picker) = &self.picker else {
+            return;
+        };
+        if matches!(picker.kind, crate::picker::Kind::Theme { .. }) {
+            if let Some(item) = picker.selected_item() {
+                let name = item.label.clone();
+                crate::theme::set(&name);
+            }
+        }
+    }
+
+    fn picker_accept(&mut self) {
+        use crate::picker::Kind;
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let Some(item) = picker.selected_item() else {
+            self.close_picker();
+            return;
+        };
+        let label = item.label.clone();
+        self.close_picker();
+        match picker.kind {
+            Kind::Command => {
+                if let Some(command) = commands::find(&label) {
+                    self.register_fresh = true;
+                    (command.func)(self);
+                }
+            }
+            Kind::Theme { .. } => {
+                crate::theme::set(&label);
+                self.set_status(format!("theme: {label}"));
+            }
+            Kind::Files { root } => self.jump_to(root.join(label), 0, 0),
+            Kind::Explorer { dir } => {
+                if label == "../" {
+                    if let Some(parent) = dir.parent() {
+                        self.open_picker(crate::picker::Picker::explorer(parent.to_path_buf()));
+                    }
+                } else if let Some(subdir) = label.strip_suffix('/') {
+                    self.open_picker(crate::picker::Picker::explorer(dir.join(subdir)));
+                } else {
+                    self.jump_to(dir.join(label), 0, 0);
+                }
+            }
+        }
+    }
+
+    /// Overlay rectangle for the picker, centered near the top.
+    pub fn picker_rect(&self) -> Rect {
+        let w = ((self.size.0 as usize) * 3 / 4).clamp(20, 80) as u16;
+        let h = 12.min(self.size.1.saturating_sub(4)).max(2);
+        let x = (self.size.0.saturating_sub(w)) / 2;
+        (x, 1, w, h)
+    }
+
+    // ---- file tree ---------------------------------------------------------
+
+    /// `space e` from anywhere: hidden -> shown+focused, unfocused -> focused,
+    /// focused -> closed. Every state reaches every other with the same key.
+    pub fn tree_toggle(&mut self) {
+        match (&self.tree, self.tree_focused) {
+            (None, _) => {
+                let root = std::env::current_dir().unwrap_or_default();
+                self.tree = Some(crate::filetree::FileTree::new(root));
+                self.tree_focused = true;
+            }
+            (Some(_), false) => self.tree_focused = true,
+            (Some(_), true) => {
+                self.tree = None;
+                self.tree_focused = false;
+            }
+        }
+    }
+
+    fn handle_tree_key(&mut self, key: Key) {
+        // The tree owns the keyboard while focused, so it must recognize the
+        // `space e` toggle itself — otherwise the sidebar could never close.
+        if self.tree_leader {
+            self.tree_leader = false;
+            if key.code == KeyCode::Char('e') && !key.ctrl && !key.alt {
+                self.tree_toggle();
+            }
+            return;
+        }
+        if key.code == KeyCode::Char(' ') && !key.ctrl && !key.alt {
+            self.tree_leader = true;
+            return;
+        }
+        let Some(tree) = self.tree.as_mut() else {
+            self.tree_focused = false;
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.tree_focused = false,
+            KeyCode::Char('q') => {
+                self.tree = None;
+                self.tree_focused = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => tree.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => tree.move_selection(1),
+            KeyCode::Char('h') | KeyCode::Left => tree.collapse_or_parent(),
+            KeyCode::Char('r') => tree.rebuild(),
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                let Some(row) = tree.selected_row() else {
+                    return;
+                };
+                if row.is_dir {
+                    tree.toggle_selected();
+                } else {
+                    let path = row.path.clone();
+                    self.tree_focused = false;
+                    self.jump_to(path, 0, 0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- completion --------------------------------------------------------
+
+    /// Handle a key while the completion menu is open. Returns true if the
+    /// key was consumed.
+    fn handle_completion_key(&mut self, key: Key) -> bool {
+        let Some(completion) = self.completion.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Enter if completion.auto => {
+                self.completion = None;
+                false // the newline happens normally
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                self.completion_accept();
+                true
+            }
+            KeyCode::Esc => {
+                self.completion = None;
+                true
+            }
+            KeyCode::Down => {
+                completion.selected = (completion.selected + 1) % completion.items.len();
+                true
+            }
+            KeyCode::Up => {
+                completion.selected =
+                    (completion.selected + completion.items.len() - 1) % completion.items.len();
+                true
+            }
+            KeyCode::Char('n') if key.ctrl => {
+                completion.selected = (completion.selected + 1) % completion.items.len();
+                true
+            }
+            KeyCode::Char('p') if key.ctrl => {
+                completion.selected =
+                    (completion.selected + completion.items.len() - 1) % completion.items.len();
+                true
+            }
+            KeyCode::Char(c) if !key.ctrl && !key.alt => {
+                // Type through the menu: insert the char and narrow the list.
+                completion.prefix.push(c);
+                let prefix = completion.prefix.to_lowercase();
+                completion.items.retain(|(label, _)| label.to_lowercase().starts_with(&prefix));
+                completion.selected = 0;
+                let empty = completion.items.is_empty();
+                self.doc_mut().insert_at_cursor(&c.to_string());
+                if empty {
+                    self.completion = None;
+                }
+                true
+            }
+            _ => {
+                // Anything else (backspace, arrows, escape sequences…) closes
+                // the menu and is handled normally.
+                self.completion = None;
+                false
+            }
+        }
+    }
+
+    fn completion_accept(&mut self) {
+        let Some(completion) = self.completion.take() else {
+            return;
+        };
+        let Some((_, text)) = completion.items.get(completion.selected) else {
+            return;
+        };
+        let prefix_chars = completion.prefix.chars().count();
+        if text.to_lowercase().starts_with(&completion.prefix.to_lowercase()) {
+            // The typed prefix stands; append the rest at every cursor.
+            let suffix: String = text.chars().skip(prefix_chars).collect();
+            self.doc_mut().insert_at_cursor(&suffix);
+        } else {
+            // ponytail: replacement completions rewrite the primary cursor
+            // only; per-cursor replacement when multi-cursor completion itches.
+            let doc = self.doc_mut();
+            let from = doc.cursor.saturating_sub(prefix_chars);
+            doc.delete_range(from, doc.cursor);
+            let text = text.clone();
+            self.doc_mut().insert_at_cursor(&text);
+        }
+    }
+
+    /// The identifier fragment just before the cursor.
+    fn word_prefix(&self) -> String {
+        let doc = self.doc();
+        let (line, col) = doc.cursor_line_col();
+        let slice = doc.line(line);
+        let mut start = col;
+        while start > 0 {
+            let c = slice.char(start - 1);
+            if c.is_alphanumeric() || c == '_' {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        (start..col).map(|i| slice.char(i)).collect()
     }
 
     // ---- lsp ---------------------------------------------------------------
@@ -872,29 +1270,121 @@ impl Editor {
                 lsp::Event::Diagnostics(path, diags) => {
                     self.diagnostics.insert(path, diags);
                 }
+                lsp::Event::Completions(items) => self.show_completions(items),
             }
         }
     }
 
+    fn show_completions(&mut self, items: Vec<(String, String)>) {
+        if self.mode != Mode::Insert {
+            return; // the answer arrived after insert mode ended
+        }
+        let prefix = self.word_prefix();
+        let lower = prefix.to_lowercase();
+        let mut items: Vec<(String, String)> = items
+            .into_iter()
+            .filter(|(label, _)| label.to_lowercase().starts_with(&lower))
+            .collect();
+        items.truncate(50);
+        if items.is_empty() {
+            self.set_status("no completions");
+            self.completion = None;
+        } else {
+            self.completion = Some(Completion {
+                items,
+                selected: 0,
+                prefix,
+                auto: false,
+            });
+        }
+    }
+
+    /// Intellisense while typing: once two identifier chars are down, offer
+    /// matching words from every open buffer. Instant and offline; `C-space`
+    /// still asks the language server for the smart list.
+    fn maybe_autocomplete(&mut self) {
+        if self.completion.is_some() {
+            return;
+        }
+        let prefix = self.word_prefix();
+        if prefix.chars().count() < 2 {
+            return;
+        }
+        let items = self.buffer_words(&prefix);
+        if !items.is_empty() {
+            self.completion = Some(Completion {
+                items,
+                selected: 0,
+                prefix,
+                auto: true,
+            });
+        }
+    }
+
+    /// Words from all open buffers matching `prefix`, excluding the prefix
+    /// itself. ponytail: a full scan per popup; a word index maintained on
+    /// edit when huge buffers itch.
+    fn buffer_words(&self, prefix: &str) -> Vec<(String, String)> {
+        let lower = prefix.to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for doc in &self.documents {
+            let mut word = String::new();
+            for c in doc.text.chars().chain(std::iter::once(' ')) {
+                if c.is_alphanumeric() || c == '_' {
+                    word.push(c);
+                    continue;
+                }
+                if word.chars().count() >= 3
+                    && word.to_lowercase().starts_with(&lower)
+                    && word != prefix
+                    && seen.insert(word.clone())
+                {
+                    out.push((word.clone(), word.clone()));
+                }
+                word.clear();
+            }
+            if out.len() >= 50 {
+                break;
+            }
+        }
+        out.sort();
+        out.truncate(50);
+        out
+    }
+
     fn lsp_sync(&mut self) {
         if self.lsp.is_none() {
-            let wants_lsp = self.documents.iter().any(|d| is_rust(d.path.as_deref()));
-            if !wants_lsp || self.lsp_failed {
+            if self.lsp_failed {
                 return;
             }
+            // ponytail: one server per session — the first open file with a
+            // configured server picks it; a client per language when
+            // multi-language sessions itch.
+            let command = self
+                .documents
+                .iter()
+                .filter_map(|d| d.path.as_deref())
+                .find_map(|p| server_for(&self.lsp_table, p))
+                .map(str::to_string);
+            let Some(command) = command else {
+                return;
+            };
             let root = std::env::current_dir().unwrap_or_default();
-            match lsp::Client::spawn(&root) {
+            match lsp::Client::spawn(&root, &command) {
                 Some(client) => self.lsp = Some(client),
                 None => {
                     self.lsp_failed = true;
-                    self.set_status("rust-analyzer not found in PATH — no LSP");
+                    self.set_status(format!("could not start {command:?} — no LSP"));
                     return;
                 }
             }
         }
+        let table = &self.lsp_table;
         let lsp = self.lsp.as_mut().unwrap();
         for doc in &self.documents {
-            let Some(path) = doc.path.as_ref().filter(|p| is_rust(Some(p))) else {
+            let Some(path) = doc.path.as_ref().filter(|p| server_for(table, p).is_some())
+            else {
                 continue;
             };
             match lsp.synced.get(path.as_path()) {
@@ -950,7 +1440,7 @@ impl Editor {
         if height == 0 || width == 0 {
             return;
         }
-        let scrolloff = 3.min(height.saturating_sub(1) / 2);
+        let scrolloff = crate::config::scrolloff().min(height.saturating_sub(1) / 2);
 
         let doc = self.doc_mut();
         let (line, col) = doc.cursor_display();
@@ -977,6 +1467,15 @@ impl Editor {
 
     /// Cursor position on screen as (column, row), or `None` if off-screen.
     pub fn screen_cursor(&self) -> Option<(u16, u16)> {
+        if self.tree_focused {
+            return None; // the tree's reversed row is the focus indicator
+        }
+        if self.mode == Mode::Picker {
+            let picker = self.picker.as_ref()?;
+            let (x, y, w, _) = self.picker_rect();
+            let col = 1 + picker.title.chars().count() + 3 + picker.query.chars().count();
+            return Some((x + (col as u16).min(w.saturating_sub(1)), y));
+        }
         let prompt_len = match self.mode {
             Mode::Command => Some(1),
             Mode::Search => Some(crate::ui::search_prompt(self).chars().count()),
@@ -1009,13 +1508,18 @@ impl Editor {
     pub fn cursor_indicator(&self) -> String {
         let doc = self.doc();
         let (line, col) = doc.cursor_line_col();
-        let display = crate::position::char_to_display_col(doc.line(line), col, TAB_WIDTH);
+        let display = crate::position::char_to_display_col(doc.line(line), col, crate::config::tab_width());
         format!("{}:{}", line + 1, display + 1)
     }
 }
 
-fn is_rust(path: Option<&Path>) -> bool {
-    path.is_some_and(|p| p.extension().is_some_and(|e| e == "rs"))
+/// The configured server command for a file, by extension.
+fn server_for<'a>(table: &'a [(String, String)], path: &Path) -> Option<&'a str> {
+    let ext = path.extension()?.to_str()?;
+    table
+        .iter()
+        .find(|(e, _)| e == ext)
+        .map(|(_, cmd)| cmd.as_str())
 }
 
 #[cfg(test)]
@@ -1024,7 +1528,8 @@ mod tests {
     use crate::keymap::Key;
 
     fn editor_with(text: &str) -> Editor {
-        let mut editor = Editor::new(vec![], (80, 24)).unwrap();
+        let mut editor =
+            Editor::new(vec![], (80, 24), &crate::config::Config::default()).unwrap();
         editor.doc_mut().text = ropey::Rope::from_str(text);
         editor
     }
@@ -1354,6 +1859,122 @@ mod tests {
         let (a, c) = (editor.doc().anchor, editor.doc().cursor);
         let sel = editor.doc().text.slice(a.min(c)..a.max(c)).to_string();
         assert_eq!(sel, "fn main() { let x = 1; }");
+    }
+
+    #[test]
+    fn command_palette_runs_the_picked_command() {
+        let mut editor = editor_with("hello");
+        press(&mut editor, "<space> c");
+        assert_eq!(editor.mode, Mode::Picker);
+        press(&mut editor, "quit");
+        press(&mut editor, "<enter>");
+        assert!(editor.should_quit);
+    }
+
+    #[test]
+    fn theme_picker_previews_live_and_esc_restores() {
+        let _guard = crate::theme::TEST_LOCK.lock().unwrap();
+        crate::theme::set("default");
+        let mut editor = editor_with("hello");
+        press(&mut editor, "<space> t");
+        press(&mut editor, "<down>"); // move to the second theme: live preview
+        assert_ne!(crate::theme::current().name, "default");
+        press(&mut editor, "<esc>");
+        assert_eq!(crate::theme::current().name, "default");
+        assert_eq!(editor.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn completion_accepts_by_appending_the_suffix() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "pri");
+        editor.show_completions(vec![
+            ("println!".into(), "println!".into()),
+            ("print!".into(), "print!".into()),
+        ]);
+        assert_eq!(editor.completion.as_ref().unwrap().items.len(), 2);
+        press(&mut editor, "<tab>");
+        assert_eq!(editor.doc().text.to_string(), "println!");
+        assert!(editor.completion.is_none());
+    }
+
+    #[test]
+    fn typing_narrows_the_completion_menu() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "p");
+        editor.show_completions(vec![
+            ("print!".into(), "print!".into()),
+            ("push".into(), "push".into()),
+        ]);
+        press(&mut editor, "u"); // types through the menu
+        assert_eq!(editor.doc().text.to_string(), "pu");
+        assert_eq!(editor.completion.as_ref().unwrap().items.len(), 1);
+        press(&mut editor, "<tab>");
+        assert_eq!(editor.doc().text.to_string(), "push");
+    }
+
+    #[test]
+    fn typing_pops_intellisense_from_buffer_words() {
+        let mut editor = editor_with("printer value");
+        press(&mut editor, "A");
+        press(&mut editor, "<space>");
+        press(&mut editor, "pri"); // two identifier chars trigger the menu
+        let completion = editor.completion.as_ref().expect("menu popped");
+        assert!(completion.auto);
+        assert_eq!(completion.items[0].0, "printer");
+        press(&mut editor, "<tab>");
+        assert_eq!(editor.doc().text.to_string(), "printer value printer");
+    }
+
+    #[test]
+    fn enter_stays_a_newline_when_the_menu_popped_itself() {
+        let mut editor = editor_with("printer value");
+        press(&mut editor, "A");
+        press(&mut editor, "<space>");
+        press(&mut editor, "pr");
+        assert!(editor.completion.is_some());
+        press(&mut editor, "<enter>");
+        assert!(editor.completion.is_none());
+        assert_eq!(editor.doc().text.to_string(), "printer value pr\n");
+    }
+
+    #[test]
+    fn tree_sidebar_toggles_focuses_and_opens_files() {
+        let mut editor = editor_with("");
+        press(&mut editor, "<space> e");
+        assert!(editor.tree.is_some() && editor.tree_focused);
+        // Windows shift right to make room for the sidebar.
+        let (wins, _) = editor.window_rects();
+        assert_eq!(wins[0].1 .0, editor.tree_width());
+        // The tree intercepts keys: `j` moves selection, not the cursor.
+        press(&mut editor, "j");
+        assert_eq!(editor.doc().cursor, 0);
+        press(&mut editor, "<esc>");
+        assert!(!editor.tree_focused && editor.tree.is_some());
+        press(&mut editor, "<space> e"); // refocus
+        assert!(editor.tree_focused);
+        // The same toggle closes it even though the tree has the keyboard.
+        press(&mut editor, "<space> e");
+        assert!(editor.tree.is_none());
+        assert_eq!(editor.window_rects().0[0].1 .0, 0);
+        // And a plain open-then-toggle round trip closes it too.
+        press(&mut editor, "<space> e");
+        assert!(editor.tree.is_some() && editor.tree_focused);
+        press(&mut editor, "<space> e");
+        assert!(editor.tree.is_none());
+    }
+
+    #[test]
+    fn config_keys_bind_registry_commands() {
+        let mut config = crate::config::Config::default();
+        config.keys_normal.push(("Q".into(), "quit".into()));
+        config.keys_normal.push(("Z".into(), "not_a_command".into()));
+        let mut editor = Editor::new(vec![], (80, 24), &config).unwrap();
+        assert!(editor.status.contains("not_a_command")); // bad bind reported
+        press(&mut editor, "Q");
+        assert!(editor.should_quit);
     }
 
     #[test]

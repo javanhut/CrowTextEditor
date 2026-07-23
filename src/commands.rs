@@ -6,7 +6,8 @@
 
 use crate::document::Document;
 use crate::editor::{Editor, Mode};
-use crate::position::{self, CharClass, TAB_WIDTH};
+use crate::config::tab_width;
+use crate::position::{self, CharClass};
 use crate::transaction::Transaction;
 
 pub struct Command {
@@ -46,6 +47,12 @@ commands! {
     remove_extra_cursors => "keep only the primary cursor",
     goto_definition => "jump to the definition under the cursor (LSP)",
     hover => "show type and docs for the symbol under the cursor (LSP)",
+    complete => "open the completion menu (LSP)",
+    command_palette => "fuzzy-pick any command by name",
+    find_files => "fuzzy-find a file under the current directory",
+    file_explorer => "browse the current directory in a picker",
+    tree_toggle => "toggle the file tree sidebar",
+    theme_picker => "pick a theme with live preview",
     search => "search forward, selecting the match",
     select_matches => "select every match of a pattern",
     search_next => "select the next match of the last search",
@@ -157,7 +164,7 @@ fn move_vertical(doc: &mut Document, delta: isize, past_end: bool) {
     let last = doc.line_count().saturating_sub(1) as isize;
     let target = (line as isize + delta).clamp(0, last) as usize;
 
-    let offset = position::display_col_to_char(doc.line(target), goal, TAB_WIDTH);
+    let offset = position::display_col_to_char(doc.line(target), goal, tab_width());
     doc.cursor = doc.line_start(target) + offset;
     doc.clamp_cursor(past_end);
     doc.goal_col = Some(goal);
@@ -366,10 +373,10 @@ fn add_cursor(editor: &mut Editor, dir: isize) {
         let target = target as usize;
 
         let col_on = |doc: &Document, line: usize, pos: usize| {
-            position::char_to_display_col(doc.line(line), pos - doc.line_start(line), TAB_WIDTH)
+            position::char_to_display_col(doc.line(line), pos - doc.line_start(line), tab_width())
         };
         let to_target = |doc: &Document, col: usize| {
-            doc.line_start(target) + position::display_col_to_char(doc.line(target), col, TAB_WIDTH)
+            doc.line_start(target) + position::display_col_to_char(doc.line(target), col, tab_width())
         };
 
         let new_c = to_target(doc, col_on(doc, cline, c));
@@ -389,7 +396,35 @@ fn remove_extra_cursors(editor: &mut Editor) {
     editor.doc_mut().extra.clear();
 }
 
+// ---- pickers ---------------------------------------------------------------
+
+fn command_palette(editor: &mut Editor) {
+    editor.open_picker(crate::picker::Picker::commands());
+}
+
+fn theme_picker(editor: &mut Editor) {
+    editor.open_picker(crate::picker::Picker::themes());
+}
+
+fn find_files(editor: &mut Editor) {
+    let root = std::env::current_dir().unwrap_or_default();
+    editor.open_picker(crate::picker::Picker::files(&root));
+}
+
+fn file_explorer(editor: &mut Editor) {
+    let dir = std::env::current_dir().unwrap_or_default();
+    editor.open_picker(crate::picker::Picker::explorer(dir));
+}
+
+fn tree_toggle(editor: &mut Editor) {
+    editor.tree_toggle();
+}
+
 // ---- lsp -------------------------------------------------------------------
+
+fn complete(editor: &mut Editor) {
+    lsp_position_request(editor, "completion", "textDocument/completion");
+}
 
 fn goto_definition(editor: &mut Editor) {
     lsp_position_request(editor, "definition", "textDocument/definition");

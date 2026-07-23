@@ -17,9 +17,6 @@ use ropey::RopeSlice;
 use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 use unicode_width::UnicodeWidthChar;
 
-/// Columns a tab advances to the next stop.
-pub const TAB_WIDTH: usize = 4;
-
 /// Display width of a single character at a given display column.
 ///
 /// Tabs depend on where they start, which is why this takes the current column.

@@ -14,14 +14,18 @@ use crossterm::{cursor, queue};
 use ropey::RopeSlice;
 
 use crate::editor::{Editor, Mode};
-use crate::position::{self, TAB_WIDTH};
+use crate::config::tab_width;
+use crate::position::{self};
 
 pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     queue!(out, cursor::Hide, cursor::MoveTo(0, 0))?;
 
+    render_tree(editor, out)?;
     render_text(editor, out)?;
     render_status_line(editor, out)?;
     render_command_line(editor, out)?;
+    render_picker(editor, out)?;
+    render_completion(editor, out)?;
 
     match editor.screen_cursor() {
         Some((col, row)) => queue!(out, cursor::MoveTo(col, row), cursor::Show)?,
@@ -51,7 +55,7 @@ fn render_text(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         render_window(editor, id, rect, out)?;
     }
     for &((x, y, w, h), vertical) in &seps {
-        queue!(out, SetForegroundColor(Color::DarkGrey))?;
+        queue!(out, SetForegroundColor(crate::theme::current().gutter))?;
         if vertical {
             for row in y..y + h {
                 queue!(out, cursor::MoveTo(x, row), Print("│"))?;
@@ -123,7 +127,7 @@ fn render_window(
         if line_idx >= line_count {
             queue!(
                 out,
-                SetForegroundColor(Color::DarkGrey),
+                SetForegroundColor(crate::theme::current().gutter),
                 Print("~"),
                 ResetColor,
                 Print(" ".repeat((rw as usize).saturating_sub(1)))
@@ -142,9 +146,9 @@ fn render_window(
         queue!(
             out,
             SetForegroundColor(diag_color.unwrap_or(if line_idx == cursor_line && focused {
-                Color::Yellow
+                crate::theme::current().gutter_cursor
             } else {
-                Color::DarkGrey
+                crate::theme::current().gutter
             })),
             Print(number),
             ResetColor
@@ -178,7 +182,7 @@ fn render_window(
                 queue!(out, SetForegroundColor(color))?;
             }
             match overlay {
-                ST_SEL => queue!(out, SetBackgroundColor(Color::DarkGrey))?,
+                ST_SEL => queue!(out, SetBackgroundColor(crate::theme::current().selection))?,
                 ST_CURSOR => queue!(out, SetAttribute(Attribute::Reverse))?,
                 _ => {}
             }
@@ -233,7 +237,7 @@ fn styled_visible(
         }
 
         let start = col;
-        let w = position::char_width(c, col, TAB_WIDTH);
+        let w = position::char_width(c, col, tab_width());
         col += w;
 
         if col <= view_col {
@@ -316,6 +320,184 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         SetAttribute(Attribute::Reset),
         Clear(ClearType::UntilNewLine)
     )
+}
+
+/// The file tree sidebar: indented rows, `▸`/`▾` on directories, the
+/// selected row reversed while the tree has focus.
+fn render_tree(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    let Some(tree) = &editor.tree else {
+        return Ok(());
+    };
+    let w = editor.tree_width() as usize;
+    if w < 4 {
+        return Ok(());
+    }
+    let inner = w - 1; // last column is the separator
+    let height = editor.size.1.saturating_sub(2) as usize;
+    let theme = crate::theme::current();
+
+    let start = tree
+        .selected
+        .saturating_sub(height.saturating_sub(1).min(tree.selected));
+    for row in 0..height {
+        queue!(out, cursor::MoveTo(0, row as u16))?;
+        let line = match tree.rows.get(start + row) {
+            Some(r) => {
+                let marker = if r.is_dir {
+                    if r.expanded {
+                        "▾ "
+                    } else {
+                        "▸ "
+                    }
+                } else {
+                    "  "
+                };
+                format!("{}{}{}", " ".repeat(r.depth), marker, r.name)
+            }
+            None => String::new(),
+        };
+        let line: String = line.chars().take(inner).collect();
+        if start + row == tree.selected && editor.tree_focused {
+            queue!(
+                out,
+                SetAttribute(Attribute::Reverse),
+                Print(format!("{line:<inner$}")),
+                SetAttribute(Attribute::Reset)
+            )?;
+        } else {
+            let is_dir = tree.rows.get(start + row).is_some_and(|r| r.is_dir);
+            if is_dir {
+                queue!(out, SetForegroundColor(theme.gutter_cursor))?;
+            }
+            queue!(out, Print(format!("{line:<inner$}")), ResetColor)?;
+        }
+        queue!(
+            out,
+            SetForegroundColor(theme.gutter),
+            Print("│"),
+            ResetColor
+        )?;
+    }
+    Ok(())
+}
+
+/// The popup picker: a reversed title/query row, then the filtered list.
+fn render_picker(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    let Some(picker) = &editor.picker else {
+        return Ok(());
+    };
+    let (x, y, w, h) = editor.picker_rect();
+    let w = w as usize;
+
+    let title = format!(" {} ▸ {}", picker.title, picker.query);
+    let title: String = title.chars().take(w).collect();
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        SetAttribute(Attribute::Reverse),
+        Print(format!("{title:<w$}")),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    let list_h = (h as usize).saturating_sub(1);
+    let start = picker
+        .selected
+        .saturating_sub(list_h.saturating_sub(1).min(picker.selected));
+    let start = start.min(picker.filtered.len().saturating_sub(list_h).max(0));
+    let popup_bg = crate::theme::current().selection;
+
+    for row in 0..list_h {
+        queue!(out, cursor::MoveTo(x, y + 1 + row as u16))?;
+        let line = match picker.filtered.get(start + row) {
+            Some(&idx) => {
+                let item = &picker.items[idx];
+                let mut line = format!(" {}", item.label);
+                if !item.detail.is_empty() {
+                    line.push_str("  · ");
+                    line.push_str(&item.detail);
+                }
+                line
+            }
+            None => String::new(),
+        };
+        let line: String = line.chars().take(w).collect();
+        if start + row == picker.selected && !picker.filtered.is_empty() {
+            queue!(
+                out,
+                SetAttribute(Attribute::Reverse),
+                Print(format!("{line:<w$}")),
+                SetAttribute(Attribute::Reset)
+            )?;
+        } else {
+            queue!(
+                out,
+                SetBackgroundColor(popup_bg),
+                Print(format!("{line:<w$}")),
+                ResetColor
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The completion menu: a small list anchored at the cursor.
+fn render_completion(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    let Some(completion) = &editor.completion else {
+        return Ok(());
+    };
+    if editor.mode != Mode::Insert {
+        return Ok(());
+    }
+    let Some((cx, cy)) = editor.screen_cursor() else {
+        return Ok(());
+    };
+
+    let shown = completion.items.len().min(8);
+    let width = completion
+        .items
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(8, 40)
+        + 2;
+    let text_rows = editor.size.1.saturating_sub(2);
+    // Below the cursor when there is room, above otherwise.
+    let top = if cy + 1 + (shown as u16) <= text_rows {
+        cy + 1
+    } else {
+        cy.saturating_sub(shown as u16)
+    };
+    let x = cx.min(editor.size.0.saturating_sub(width as u16));
+
+    let start = completion
+        .selected
+        .saturating_sub(shown.saturating_sub(1).min(completion.selected));
+    let popup_bg = crate::theme::current().selection;
+
+    for row in 0..shown {
+        let Some((label, _)) = completion.items.get(start + row) else {
+            break;
+        };
+        let line: String = format!(" {label}").chars().take(width).collect();
+        queue!(out, cursor::MoveTo(x, top + row as u16))?;
+        if start + row == completion.selected {
+            queue!(
+                out,
+                SetAttribute(Attribute::Reverse),
+                Print(format!("{line:<width$}")),
+                SetAttribute(Attribute::Reset)
+            )?;
+        } else {
+            queue!(
+                out,
+                SetBackgroundColor(popup_bg),
+                Print(format!("{line:<width$}")),
+                ResetColor
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn search_prompt(editor: &Editor) -> &'static str {

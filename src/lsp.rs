@@ -10,7 +10,7 @@
 //! they itch.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
@@ -29,6 +29,8 @@ pub enum Event {
     Definition(PathBuf, usize, usize),
     Hover(String),
     Diagnostics(PathBuf, Vec<Diagnostic>),
+    /// Completion candidates as (label, insert text).
+    Completions(Vec<(String, String)>),
     Status(String),
 }
 
@@ -47,8 +49,11 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn spawn(root: &Path) -> Option<Client> {
-        let mut child = Command::new("rust-analyzer")
+    /// Spawn a server from a command line like `"pyright-langserver --stdio"`.
+    pub fn spawn(root: &Path, command: &str) -> Option<Client> {
+        let mut parts = command.split_whitespace();
+        let mut child = Command::new(parts.next()?)
+            .args(parts)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -132,7 +137,10 @@ impl Client {
         self.notify(
             "textDocument/didOpen",
             json!({"textDocument": {
-                "uri": uri_from_path(path), "languageId": "rust", "version": 1, "text": text
+                "uri": uri_from_path(path),
+                "languageId": language_id(path),
+                "version": 1,
+                "text": text
             }}),
         );
     }
@@ -254,6 +262,9 @@ impl Client {
                         Some(text) => events.push(Event::Hover(text)),
                         None => events.push(Event::Status("no hover info".into())),
                     },
+                    "completion" => {
+                        events.push(Event::Completions(parse_completions(&msg["result"])))
+                    }
                     _ => {}
                 }
             }
@@ -289,6 +300,65 @@ fn parse_location(result: &Value) -> Option<(PathBuf, usize, usize)> {
         range["start"]["line"].as_u64()? as usize,
         range["start"]["character"].as_u64()? as usize,
     ))
+}
+
+/// CompletionItem[] or CompletionList; text preference is
+/// textEdit.newText > insertText > label, with snippet placeholders stripped.
+fn parse_completions(result: &Value) -> Vec<(String, String)> {
+    let items = result
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| result.as_array());
+    let Some(items) = items else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .take(100)
+        .filter_map(|item| {
+            let label = item["label"].as_str()?.trim().to_string();
+            let text = item["textEdit"]["newText"]
+                .as_str()
+                .or_else(|| item["insertText"].as_str())
+                .map(strip_snippet)
+                .unwrap_or_else(|| label.clone());
+            Some((label, text))
+        })
+        .collect()
+}
+
+/// Drop `$0` / `${1:placeholder}` snippet syntax from an insert text.
+fn strip_snippet(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('{') => {
+                // ${n:placeholder} — keep the placeholder text, drop the rest.
+                let mut inner = String::new();
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                    inner.push(c);
+                }
+                if let Some((_, placeholder)) = inner.split_once(':') {
+                    out.push_str(placeholder);
+                }
+            }
+            Some(c) if c.is_ascii_digit() => {
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    chars.next();
+                }
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
 }
 
 /// First useful line out of the various shapes hover contents can take.
@@ -334,6 +404,28 @@ fn read_message(r: &mut impl BufRead) -> Option<Value> {
     let mut buf = vec![0u8; len?];
     r.read_exact(&mut buf).ok()?;
     serde_json::from_slice(&buf).ok()
+}
+
+/// LSP languageId from a file extension; the extension itself is a decent
+/// fallback for anything not listed.
+fn language_id(path: &Path) -> &str {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "rs" => "rust",
+        "py" => "python",
+        "ts" => "typescript",
+        "tsx" => "typescriptreact",
+        "js" => "javascript",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "hpp" => "cpp",
+        "rb" => "ruby",
+        "kt" => "kotlin",
+        "hs" => "haskell",
+        "ex" | "exs" => "elixir",
+        "md" => "markdown",
+        "sh" => "shellscript",
+        other => other,
+    }
 }
 
 fn uri_from_path(path: &Path) -> String {
@@ -405,7 +497,7 @@ mod tests {
     #[test]
     #[ignore] // needs rust-analyzer on PATH; run with `cargo test -- --ignored`
     fn handshake_with_a_real_server() {
-        let Some(mut client) = Client::spawn(Path::new(".")) else {
+        let Some(mut client) = Client::spawn(Path::new("."), "rust-analyzer") else {
             return; // no server installed — nothing to verify
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -434,7 +526,7 @@ mod tests {
         let src = "fn foo() {}\nfn main() { foo(); }\n";
         std::fs::write(&file, src).unwrap();
 
-        let Some(mut client) = Client::spawn(&dir) else {
+        let Some(mut client) = Client::spawn(&dir, "rust-analyzer") else {
             return;
         };
         let deadline = Instant::now() + Duration::from_secs(30);

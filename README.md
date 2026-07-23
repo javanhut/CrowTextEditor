@@ -1,10 +1,11 @@
-# crow
+# Crow
 
 A selection-first modal terminal text editor. One cursor is a crow; many are a
 murder.
 
 ```
-cargo run --release -- src/main.rs
+./install.sh          # builds and installs to ~/.local/bin
+crow src/main.rs      # or: cargo run --release -- src/main.rs
 ```
 
 ## What works
@@ -32,12 +33,33 @@ Syntax is a selection too. Tree-sitter parses Rust files, colors them, and
 statement, block, function — one keypress per level. Since it's just a
 selection, `d`/`c`/`y`, multi-cursor, and `s` all compose with it.
 
-LSP without an async runtime: rust-analyzer runs as a child process, a thread
+LSP without an async runtime: the server runs as a child process, a thread
 feeds its messages into a channel, and the main loop drains it between
 keystrokes — the editor never blocks on the server. Diagnostics color the
 gutter (red errors, yellow warnings) and the message for the cursor line shows
 below the status bar; `gd` jumps to a definition (opening the file if needed);
-`K` shows hover info. Needs `rust-analyzer` on PATH and a Cargo project.
+`K` shows hover info. rust-analyzer is wired up by default; any server is one
+config line.
+
+Configuration is a data file, not a program. `~/.config/crow/crow.toml` —
+created with comments on first run, opened with `:config` — declares
+everything, NvCrow-style: names in, wiring out.
+
+```toml
+theme = "gruvbox"            # default | gruvbox | mono; :theme switches live
+
+[options]
+tab_width = 4
+scrolloff = 3
+
+[lsp]                        # file extension = server command
+rs = "rust-analyzer"
+py = "pyright-langserver --stdio"
+
+[keys.normal]                # any :command name is bindable
+"C-p" = "search"
+gq = "quit"
+```
 
 Plus splits (`C-w v/s/w/q`) with independent cursors per window, counts (`3x`,
 `10d`, `5C`), multi-key bindings (`gg`), transaction-based undo/redo with
@@ -69,6 +91,13 @@ an emoji ZWJ sequence or a combining stack.
 | `u` `C-r` | undo / redo |
 | `gn` `gp` | next / previous buffer |
 | `gd` `K` | goto definition / hover (LSP) |
+| *(typing)* | intellisense pops itself from buffer words — Tab accepts, Enter stays Enter |
+| `C-space` (insert) | LSP completion menu — Tab/Enter accepts, type to narrow |
+| `space e` | file tree sidebar — same key focuses and closes; `j`/`k` move, Enter/`l` expand or open, `h` collapse, `Esc` back to editor, `q` close |
+| `space c` | command palette: fuzzy-run any command |
+| `space f` | fuzzy file finder |
+| `space d` | directory browser picker (Enter descends, Backspace goes up) |
+| `space t` | theme picker with live preview |
 | `:w` `:q` `:wq` `:q!` `:e f` `:42` | ex commands |
 
 Any command in the registry is also callable by name, so `:join_lines` works.
@@ -134,7 +163,10 @@ Roughly in the order worth doing them:
    `InputEdit` wants.
 4. **Rendering-side graphemes** — the cursor steps by grapheme now, but width
    is still summed per char, so a ZWJ emoji renders wider than it should.
-5. **Config file** for keymaps and options. `bind_str` already takes the format.
+5. **More themes and config options** — a theme is one entry in
+   `theme::THEMES`; an option is one key in `config.rs`. The parser is a
+   deliberate TOML subset; swap in the `toml` crate if the config ever needs
+   arrays or nesting.
 
 ## Tests
 

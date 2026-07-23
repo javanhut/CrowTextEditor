@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use ropey::{Rope, RopeSlice};
 
-use crate::position::{self, TAB_WIDTH};
+use crate::config::tab_width;
+use crate::position::{self};
 use crate::transaction::Transaction;
 
 /// One reversible step in the undo history.
@@ -166,7 +167,7 @@ impl Document {
         let (line, col) = self.cursor_line_col();
         (
             line,
-            position::char_to_display_col(self.text.line(line), col, TAB_WIDTH),
+            position::char_to_display_col(self.text.line(line), col, tab_width()),
         )
     }
 
