@@ -1,8 +1,10 @@
 //! Editor state and the key dispatch loop.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::commands;
+use crate::lsp;
 use crate::document::Document;
 use crate::keymap::{Key, KeyCode, KeyTrie, KeymapResult};
 use crate::position::TAB_WIDTH;
@@ -263,6 +265,8 @@ impl Default for Keymaps {
         normal.bind_str("C-w q", "quit");
         normal.bind_str("gn", "next_buffer");
         normal.bind_str("gp", "prev_buffer");
+        normal.bind_str("gd", "goto_definition");
+        normal.bind_str("K", "hover");
         normal.bind_str("C-s", "save");
         normal.bind_str(":", "command_mode");
         normal.bind_str("<esc>", "normal_mode");
@@ -322,6 +326,12 @@ pub struct Editor {
     pub keep_selection: bool,
     /// Extend mode (`v`): motions grow the selection instead of replacing it.
     pub extend: bool,
+    /// The language server, once one has started.
+    pub lsp: Option<lsp::Client>,
+    /// Set after a failed spawn so we don't retry every tick.
+    lsp_failed: bool,
+    /// Latest diagnostics per file (canonical paths, as the server sends them).
+    pub diagnostics: HashMap<PathBuf, Vec<lsp::Diagnostic>>,
     pub should_quit: bool,
     /// Terminal size as (columns, rows).
     pub size: (u16, u16),
@@ -367,6 +377,9 @@ impl Editor {
             search_origin: (0, 0),
             keep_selection: false,
             extend: false,
+            lsp: None,
+            lsp_failed: false,
+            diagnostics: HashMap::new(),
             should_quit: false,
             size,
             keymaps: Keymaps::default(),
@@ -835,6 +848,98 @@ impl Editor {
         }
     }
 
+    // ---- lsp ---------------------------------------------------------------
+
+    /// Called from the main loop between keystrokes: keep the server in sync
+    /// with edited buffers and apply anything it sent back.
+    pub fn lsp_tick(&mut self) {
+        self.lsp_sync();
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        let events = lsp.poll();
+        if lsp.is_dead() {
+            // The server exited (crashed, or was a broken shim): stop syncing
+            // and don't respawn every tick.
+            self.lsp = None;
+            self.lsp_failed = true;
+        }
+        for event in events {
+            match event {
+                lsp::Event::Definition(path, line, col) => self.jump_to(path, line, col),
+                lsp::Event::Hover(text) => self.set_status(text),
+                lsp::Event::Status(text) => self.set_status(text),
+                lsp::Event::Diagnostics(path, diags) => {
+                    self.diagnostics.insert(path, diags);
+                }
+            }
+        }
+    }
+
+    fn lsp_sync(&mut self) {
+        if self.lsp.is_none() {
+            let wants_lsp = self.documents.iter().any(|d| is_rust(d.path.as_deref()));
+            if !wants_lsp || self.lsp_failed {
+                return;
+            }
+            let root = std::env::current_dir().unwrap_or_default();
+            match lsp::Client::spawn(&root) {
+                Some(client) => self.lsp = Some(client),
+                None => {
+                    self.lsp_failed = true;
+                    self.set_status("rust-analyzer not found in PATH — no LSP");
+                    return;
+                }
+            }
+        }
+        let lsp = self.lsp.as_mut().unwrap();
+        for doc in &self.documents {
+            let Some(path) = doc.path.as_ref().filter(|p| is_rust(Some(p))) else {
+                continue;
+            };
+            match lsp.synced.get(path.as_path()) {
+                None => lsp.did_open(path, doc.text.to_string(), doc.revision),
+                Some(&(_, revision)) if revision != doc.revision => {
+                    lsp.did_change(path, doc.text.to_string(), doc.revision)
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// Jump to a position given as (path, line, UTF-16 column) — reusing an
+    /// open buffer for the file when there is one.
+    pub fn jump_to(&mut self, path: PathBuf, line: usize, utf16_col: usize) {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let existing = self.documents.iter().position(|d| {
+            d.path
+                .as_ref()
+                .and_then(|p| p.canonicalize().ok())
+                .is_some_and(|p| p == canon)
+        });
+        let idx = match existing {
+            Some(i) => i,
+            None => match Document::open(&path) {
+                Ok(doc) => {
+                    self.documents.push(doc);
+                    self.documents.len() - 1
+                }
+                Err(e) => {
+                    self.set_status(format!("Error: {e}"));
+                    return;
+                }
+            },
+        };
+        self.current = idx;
+        let doc = self.doc_mut();
+        let line = line.min(doc.line_count().saturating_sub(1));
+        let col = crate::position::utf16_to_char(doc.line(line), utf16_col);
+        doc.cursor = doc.line_start(line) + col;
+        doc.anchor = doc.cursor;
+        doc.clamp_cursor(false);
+        doc.goal_col = None;
+    }
+
     // ---- scrolling ---------------------------------------------------------
 
     /// Adjust the viewport so the cursor is on screen, keeping a few lines of
@@ -907,6 +1012,10 @@ impl Editor {
         let display = crate::position::char_to_display_col(doc.line(line), col, TAB_WIDTH);
         format!("{}:{}", line + 1, display + 1)
     }
+}
+
+fn is_rust(path: Option<&Path>) -> bool {
+    path.is_some_and(|p| p.extension().is_some_and(|e| e == "rs"))
 }
 
 #[cfg(test)]

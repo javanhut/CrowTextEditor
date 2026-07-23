@@ -1,6 +1,7 @@
-# ked
+# crow
 
-A modal terminal text editor, built as a foundation to grow into a daily driver.
+A selection-first modal terminal text editor. One cursor is a crow; many are a
+murder.
 
 ```
 cargo run --release -- src/main.rs
@@ -31,6 +32,13 @@ Syntax is a selection too. Tree-sitter parses Rust files, colors them, and
 statement, block, function — one keypress per level. Since it's just a
 selection, `d`/`c`/`y`, multi-cursor, and `s` all compose with it.
 
+LSP without an async runtime: rust-analyzer runs as a child process, a thread
+feeds its messages into a channel, and the main loop drains it between
+keystrokes — the editor never blocks on the server. Diagnostics color the
+gutter (red errors, yellow warnings) and the message for the cursor line shows
+below the status bar; `gd` jumps to a definition (opening the file if needed);
+`K` shows hover info. Needs `rust-analyzer` on PATH and a Cargo project.
+
 Plus splits (`C-w v/s/w/q`) with independent cursors per window, counts (`3x`,
 `10d`, `5C`), multi-key bindings (`gg`), transaction-based undo/redo with
 sensible grouping, multiple buffers, ex commands, vertical and horizontal
@@ -60,6 +68,7 @@ an emoji ZWJ sequence or a combining stack.
 | `D` `J` | delete to line end, join |
 | `u` `C-r` | undo / redo |
 | `gn` `gp` | next / previous buffer |
+| `gd` `K` | goto definition / hover (LSP) |
 | `:w` `:q` `:wq` `:q!` `:e f` `:42` | ex commands |
 
 Any command in the registry is also callable by name, so `:join_lines` works.
@@ -115,13 +124,11 @@ command needed rewriting to become multi-cursor aware.
 
 Roughly in the order worth doing them:
 
-1. **LSP.** The one big feature left, and the one that must not be done badly:
-   it needs an async transport (`tokio` + `lsp-types`) so a slow server can
-   never freeze the editor, plus server lifecycle management. LSP positions
-   are UTF-16 code units — add the conversion to `position.rs` rather than
-   scattering it.
-2. **More grammars** — each is one dependency and one arm in
-   `syntax::config_for`.
+1. **Completion** — the LSP plumbing is there; this needs a popup-menu widget,
+   which is why it isn't. `textDocument/completion` plus a filtering list.
+2. **More grammars and servers** — each grammar is one dependency and one arm
+   in `syntax::config_for`; each server is one row in a table `lsp.rs` doesn't
+   have yet (rust-analyzer is hardcoded).
 3. **Incremental parsing** — tree-sitter currently reparses the file per edit
    (fine below ~1MB); the transaction model already produces the edit deltas
    `InputEdit` wants.

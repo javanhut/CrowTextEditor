@@ -2,6 +2,7 @@ mod commands;
 mod document;
 mod editor;
 mod keymap;
+mod lsp;
 mod position;
 mod search;
 mod syntax;
@@ -22,10 +23,10 @@ use editor::Editor;
 use keymap::Key;
 
 const HELP: &str = "\
-ked — a modal terminal text editor
+crow — a selection-first modal terminal text editor
 
 USAGE:
-    ked [FILE]...
+    crow [FILE]...
 
 KEYS (normal mode):
     h j k l      move            i a I A o O   insert
@@ -38,6 +39,7 @@ KEYS (normal mode):
     0 ^ $        line ends       u  C-r        undo, redo
     gg G  42gg   file ends, jump to line       :w :q :wq  write, quit
     C-d C-u      half page       gn gp         next/prev buffer
+    gd K         goto definition, hover (needs rust-analyzer)
 
     Motions select the text they cross; d/c/y act on the selection.
     Every motion, edit, and inserted keystroke applies at every cursor.
@@ -71,21 +73,29 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
         editor.ensure_cursor_visible();
         ui::render(editor, &mut out)?;
 
-        match event::read()? {
-            Event::Key(ev) => {
-                if let Some(key) = Key::from_crossterm(ev) {
-                    editor.handle_key(key);
+        // Poll instead of block, so language-server messages arriving while
+        // idle still get drained and drawn.
+        if event::poll(std::time::Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(ev) => {
+                    if let Some(key) = Key::from_crossterm(ev) {
+                        editor.handle_key(key);
+                    }
                 }
+                Event::Resize(cols, rows) => editor.size = (cols, rows),
+                _ => {}
             }
-            Event::Resize(cols, rows) => editor.size = (cols, rows),
-            _ => {}
         }
+        editor.lsp_tick();
 
         if editor.should_quit {
             break;
         }
     }
 
+    if let Some(lsp) = editor.lsp.take() {
+        lsp.shutdown();
+    }
     Ok(())
 }
 

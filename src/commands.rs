@@ -44,6 +44,8 @@ commands! {
     add_cursor_below => "add a cursor on the next line",
     add_cursor_above => "add a cursor on the previous line",
     remove_extra_cursors => "keep only the primary cursor",
+    goto_definition => "jump to the definition under the cursor (LSP)",
+    hover => "show type and docs for the symbol under the cursor (LSP)",
     search => "search forward, selecting the match",
     select_matches => "select every match of a pattern",
     search_next => "select the next match of the last search",
@@ -385,6 +387,29 @@ fn add_cursor(editor: &mut Editor, dir: isize) {
 fn remove_extra_cursors(editor: &mut Editor) {
     editor.keep_selection = true;
     editor.doc_mut().extra.clear();
+}
+
+// ---- lsp -------------------------------------------------------------------
+
+fn goto_definition(editor: &mut Editor) {
+    lsp_position_request(editor, "definition", "textDocument/definition");
+}
+
+fn hover(editor: &mut Editor) {
+    lsp_position_request(editor, "hover", "textDocument/hover");
+}
+
+fn lsp_position_request(editor: &mut Editor, tag: &'static str, method: &str) {
+    let Some(path) = editor.doc().path.clone() else {
+        editor.set_status("buffer has no file");
+        return;
+    };
+    let (line, col) = editor.doc().cursor_line_col();
+    let utf16_col = position::char_to_utf16(editor.doc().line(line), col);
+    match editor.lsp.as_mut() {
+        Some(lsp) => lsp.request_position(tag, method, &path, line, utf16_col),
+        None => editor.set_status("language server not running"),
+    }
 }
 
 // ---- search ----------------------------------------------------------------

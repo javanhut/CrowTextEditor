@@ -87,6 +87,14 @@ fn render_window(
         (d, win.cursor, win.anchor, win.extra.clone(), win.view_line, win.view_col)
     };
 
+    let diags: &[crate::lsp::Diagnostic] = doc
+        .path
+        .as_ref()
+        .and_then(|p| p.canonicalize().ok())
+        .and_then(|p| editor.diagnostics.get(&p))
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+
     let len = doc.text.len_chars();
     let line_count = doc.line_count();
     let gutter = doc.line_count().to_string().len().max(3) + 1;
@@ -124,13 +132,20 @@ fn render_window(
         }
 
         let number = format!("{:>width$} ", line_idx + 1, width = gutter - 1);
+        // A diagnostic on the line colors its number: red error, yellow warning.
+        let diag_color = diags
+            .iter()
+            .filter(|d| d.line == line_idx)
+            .map(|d| d.severity)
+            .min()
+            .map(|s| if s == 1 { Color::Red } else { Color::Yellow });
         queue!(
             out,
-            SetForegroundColor(if line_idx == cursor_line && focused {
+            SetForegroundColor(diag_color.unwrap_or(if line_idx == cursor_line && focused {
                 Color::Yellow
             } else {
                 Color::DarkGrey
-            }),
+            })),
             Print(number),
             ResetColor
         )?;
@@ -315,11 +330,24 @@ fn render_command_line(editor: &Editor, out: &mut impl Write) -> std::io::Result
     let row = editor.size.1.saturating_sub(1);
     let width = editor.size.0 as usize;
 
-    let content = match editor.mode {
+    let mut content = match editor.mode {
         Mode::Command => format!(":{}", editor.command_line),
         Mode::Search => format!("{}{}", search_prompt(editor), editor.command_line),
         _ => editor.status.clone(),
     };
+    // With nothing else to say, surface the diagnostic under the cursor.
+    if content.is_empty() {
+        let doc = editor.doc();
+        if let Some(d) = doc
+            .path
+            .as_ref()
+            .and_then(|p| p.canonicalize().ok())
+            .and_then(|p| editor.diagnostics.get(&p))
+            .and_then(|v| v.iter().find(|d| d.line == doc.cursor_line()))
+        {
+            content = format!("● {}", d.message);
+        }
+    }
     let content: String = content.chars().take(width).collect();
 
     queue!(

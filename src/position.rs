@@ -135,6 +135,23 @@ pub fn prev_grapheme_boundary(slice: RopeSlice, char_idx: usize) -> usize {
     }
 }
 
+/// Char offset within a line -> UTF-16 code units, the metric LSP speaks.
+pub fn char_to_utf16(line: RopeSlice, char_offset: usize) -> usize {
+    line.chars().take(char_offset).map(|c| c.len_utf16()).sum()
+}
+
+/// UTF-16 code units -> char offset within a line.
+pub fn utf16_to_char(line: RopeSlice, utf16_offset: usize) -> usize {
+    let mut units = 0;
+    for (i, c) in line.chars().enumerate() {
+        if units >= utf16_offset {
+            return i;
+        }
+        units += c.len_utf16();
+    }
+    line_len_without_newline(line)
+}
+
 /// Classification used by word motions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharClass {
@@ -209,6 +226,16 @@ mod tests {
         assert_eq!(next_grapheme_boundary(s, 1), 6); // skips the whole family
         assert_eq!(prev_grapheme_boundary(s, 6), 1);
         assert_eq!(prev_grapheme_boundary(s, 7), 6);
+    }
+
+    #[test]
+    fn utf16_conversion_roundtrips_past_astral_chars() {
+        // 𝕏 is one char but two UTF-16 units.
+        let rope = Rope::from_str("a𝕏b");
+        let line = rope.line(0);
+        assert_eq!(char_to_utf16(line, 2), 3);
+        assert_eq!(utf16_to_char(line, 3), 2);
+        assert_eq!(utf16_to_char(line, 1), 1);
     }
 
     #[test]

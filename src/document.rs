@@ -36,6 +36,8 @@ pub struct Document {
     pub extra: Vec<(usize, usize)>,
     /// Tree-sitter state, when the file's language has a grammar.
     pub syntax: Option<crate::syntax::Syntax>,
+    /// Bumped on every text change; lets the LSP layer notice edits.
+    pub revision: u64,
     /// Sticky display column for vertical motion, so moving down through a
     /// short line and back out does not lose the original column.
     pub goal_col: Option<usize>,
@@ -60,6 +62,7 @@ impl Document {
             anchor: 0,
             extra: Vec::new(),
             syntax: None,
+            revision: 0,
             goal_col: None,
             modified: false,
             view_line: 0,
@@ -229,6 +232,7 @@ impl Document {
             group: self.group,
         });
         self.redo_stack.clear();
+        self.revision += 1;
         self.refresh_syntax();
     }
 
@@ -270,6 +274,7 @@ impl Document {
         self.goal_col = None;
         // Any further edit must not join the group we just undid.
         self.group += 1;
+        self.revision += 1;
         self.refresh_syntax();
         true
     }
@@ -295,6 +300,7 @@ impl Document {
 
         self.modified = true;
         self.goal_col = None;
+        self.revision += 1;
         self.refresh_syntax();
         true
     }
