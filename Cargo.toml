@@ -1,0 +1,21 @@
+[package]
+name = "ked"
+version = "0.1.0"
+edition = "2021"
+description = "A modal terminal text editor"
+
+[dependencies]
+ropey = "1.6"
+crossterm = "0.27"
+unicode-width = "0.1"
+unicode-segmentation = "1"
+regex = "1"
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+streaming-iterator = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+# Deliberately not panic = "abort": the panic hook restores the terminal, and
+# unwinding gives it the best chance of running cleanly.
