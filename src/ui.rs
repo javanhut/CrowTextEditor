@@ -24,6 +24,7 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     render_text(editor, out)?;
     render_status_line(editor, out)?;
     render_command_line(editor, out)?;
+    render_prompt_popup(editor, out)?;
     render_picker(editor, out)?;
     render_completion(editor, out)?;
 
@@ -55,7 +56,12 @@ fn render_text(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         render_window(editor, id, rect, out)?;
     }
     for &((x, y, w, h), vertical) in &seps {
-        queue!(out, SetForegroundColor(crate::theme::current().gutter))?;
+        let theme = crate::theme::current();
+        queue!(
+            out,
+            SetBackgroundColor(theme.bg.unwrap_or(Color::Reset)),
+            SetForegroundColor(theme.gutter)
+        )?;
         if vertical {
             for row in y..y + h {
                 queue!(out, cursor::MoveTo(x, row), Print("│"))?;
@@ -120,17 +126,28 @@ fn render_window(
         curs = extra.iter().map(|&(_, c)| c.min(len)).collect();
     }
 
+    let theme = crate::theme::current();
+    // Reset foreground only (`Color::Reset`) so the theme background, once
+    // set for a row, survives every color change within it.
+    let base_bg = theme.bg.unwrap_or(Color::Reset);
+    let base_fg = theme.fg.unwrap_or(Color::Reset);
+
     for row in 0..rh as usize {
         let line_idx = view_line + row;
-        queue!(out, cursor::MoveTo(rx, ry + row as u16))?;
+        queue!(
+            out,
+            cursor::MoveTo(rx, ry + row as u16),
+            ResetColor,
+            SetBackgroundColor(base_bg)
+        )?;
 
         if line_idx >= line_count {
             queue!(
                 out,
-                SetForegroundColor(crate::theme::current().gutter),
+                SetForegroundColor(theme.gutter),
                 Print("~"),
-                ResetColor,
-                Print(" ".repeat((rw as usize).saturating_sub(1)))
+                Print(" ".repeat((rw as usize).saturating_sub(1))),
+                ResetColor
             )?;
             continue;
         }
@@ -146,12 +163,11 @@ fn render_window(
         queue!(
             out,
             SetForegroundColor(diag_color.unwrap_or(if line_idx == cursor_line && focused {
-                crate::theme::current().gutter_cursor
+                theme.gutter_cursor
             } else {
-                crate::theme::current().gutter
+                theme.gutter
             })),
-            Print(number),
-            ResetColor
+            Print(number)
         )?;
 
         let ls = doc.line_start(line_idx);
@@ -178,23 +194,24 @@ fn render_window(
         let mut printed = 0usize;
         for ((overlay, fg), s) in runs {
             printed += display_width(&s);
-            if let Some(color) = fg {
-                queue!(out, SetForegroundColor(color))?;
-            }
+            queue!(out, SetForegroundColor(fg.unwrap_or(base_fg)))?;
             match overlay {
-                ST_SEL => queue!(out, SetBackgroundColor(crate::theme::current().selection))?,
+                ST_SEL => queue!(out, SetBackgroundColor(theme.selection))?,
                 ST_CURSOR => queue!(out, SetAttribute(Attribute::Reverse))?,
                 _ => {}
             }
             queue!(out, Print(s))?;
-            if fg.is_some() || overlay != ST_NONE {
-                queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+            match overlay {
+                ST_SEL => queue!(out, SetBackgroundColor(base_bg))?,
+                ST_CURSOR => queue!(out, SetAttribute(Attribute::NoReverse))?,
+                _ => {}
             }
         }
         // Pad to the window edge; UntilNewLine would bleed into a neighbour.
         if printed < width {
             queue!(out, Print(" ".repeat(width - printed)))?;
         }
+        queue!(out, ResetColor)?;
     }
 
     Ok(())
@@ -340,7 +357,12 @@ fn render_tree(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         .selected
         .saturating_sub(height.saturating_sub(1).min(tree.selected));
     for row in 0..height {
-        queue!(out, cursor::MoveTo(0, row as u16))?;
+        queue!(
+            out,
+            cursor::MoveTo(0, row as u16),
+            ResetColor,
+            SetBackgroundColor(theme.bg.unwrap_or(Color::Reset))
+        )?;
         let line = match tree.rows.get(start + row) {
             Some(r) => {
                 let marker = if r.is_dir {
@@ -404,7 +426,7 @@ fn render_picker(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         .selected
         .saturating_sub(list_h.saturating_sub(1).min(picker.selected));
     let start = start.min(picker.filtered.len().saturating_sub(list_h).max(0));
-    let popup_bg = crate::theme::current().selection;
+    let popup_bg = crate::theme::current().popup_bg;
 
     for row in 0..list_h {
         queue!(out, cursor::MoveTo(x, y + 1 + row as u16))?;
@@ -473,7 +495,7 @@ fn render_completion(editor: &Editor, out: &mut impl Write) -> std::io::Result<(
     let start = completion
         .selected
         .saturating_sub(shown.saturating_sub(1).min(completion.selected));
-    let popup_bg = crate::theme::current().selection;
+    let popup_bg = crate::theme::current().popup_bg;
 
     for row in 0..shown {
         let Some((label, _)) = completion.items.get(start + row) else {
@@ -500,23 +522,13 @@ fn render_completion(editor: &Editor, out: &mut impl Write) -> std::io::Result<(
     Ok(())
 }
 
-pub fn search_prompt(editor: &Editor) -> &'static str {
-    if editor.search_select {
-        "select/"
-    } else {
-        "/"
-    }
-}
-
+/// The bottom line: status messages and the cursor line's diagnostic. The
+/// `:` and `/` prompts live in the floating popup, not here.
 fn render_command_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     let row = editor.size.1.saturating_sub(1);
     let width = editor.size.0 as usize;
 
-    let mut content = match editor.mode {
-        Mode::Command => format!(":{}", editor.command_line),
-        Mode::Search => format!("{}{}", search_prompt(editor), editor.command_line),
-        _ => editor.status.clone(),
-    };
+    let mut content = editor.status.clone();
     // With nothing else to say, surface the diagnostic under the cursor.
     if content.is_empty() {
         let doc = editor.doc();
@@ -531,12 +543,52 @@ fn render_command_line(editor: &Editor, out: &mut impl Write) -> std::io::Result
         }
     }
     let content: String = content.chars().take(width).collect();
+    let theme = crate::theme::current();
 
     queue!(
         out,
         cursor::MoveTo(0, row),
-        Print(content),
-        Clear(ClearType::UntilNewLine)
+        ResetColor,
+        SetBackgroundColor(theme.bg.unwrap_or(Color::Reset)),
+        SetForegroundColor(theme.fg.unwrap_or(Color::Reset)),
+        Print(format!("{content:<width$}")),
+        ResetColor
+    )
+}
+
+/// The `:` and `/` prompts as a floating bordered popup, NvCrow-style: a
+/// rounded box near the top with the prompt kind in the border.
+fn render_prompt_popup(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    let title = match editor.mode {
+        Mode::Command => " Command ",
+        Mode::Search if editor.search_select => " Select ",
+        Mode::Search => " Search ",
+        _ => return Ok(()),
+    };
+    let (x, y, w) = editor.prompt_rect();
+    let inner = (w as usize).saturating_sub(2);
+    let theme = crate::theme::current();
+
+    let prefix = if editor.mode == Mode::Command { ':' } else { '/' };
+    let content = format!(" {prefix}{}", editor.command_line);
+    let content: String = content.chars().take(inner).collect();
+
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        ResetColor,
+        SetBackgroundColor(theme.popup_bg),
+        SetForegroundColor(theme.border),
+        Print(format!("╭{title:─^inner$}╮")),
+        cursor::MoveTo(x, y + 1),
+        Print("│"),
+        SetForegroundColor(theme.fg.unwrap_or(Color::Reset)),
+        Print(format!("{content:<inner$}")),
+        SetForegroundColor(theme.border),
+        Print("│"),
+        cursor::MoveTo(x, y + 2),
+        Print(format!("╰{}╯", "─".repeat(inner))),
+        ResetColor
     )
 }
 

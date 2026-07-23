@@ -26,7 +26,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            theme: "default".into(),
+            theme: "tokyonight".into(),
             tab_width: 4,
             scrolloff: 3,
             keys_normal: Vec::new(),
@@ -66,7 +66,7 @@ pub fn path() -> PathBuf {
 const TEMPLATE: &str = r#"# crow.toml — crow's config. Everything here is optional;
 # delete a line and the default comes back.
 
-theme = "default"        # default | gruvbox | mono
+theme = "tokyonight"     # tokyonight | gruvbox | mono | default (terminal colors)
 
 [options]
 tab_width = 4
@@ -254,7 +254,7 @@ py = "pyright-langserver --stdio"
     #[test]
     fn the_template_parses_to_defaults() {
         let config = parse(TEMPLATE);
-        assert_eq!(config.theme, "default");
+        assert_eq!(config.theme, "tokyonight");
         assert_eq!(config.tab_width, 4);
         assert_eq!(config.scrolloff, 3);
         assert!(config.keys_normal.is_empty());

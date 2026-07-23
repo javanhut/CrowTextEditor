@@ -12,12 +12,24 @@ pub struct Theme {
     /// Syntax colors indexed by highlight group id (see `syntax::group_of`);
     /// index 0 is unused (plain text).
     pub syntax: [Option<Color>; 8],
+    /// Editor background; `None` keeps the terminal's own.
+    pub bg: Option<Color>,
+    /// Default text color; `None` keeps the terminal's own.
+    pub fg: Option<Color>,
     /// Selection background.
     pub selection: Color,
     /// Line numbers.
     pub gutter: Color,
     /// The cursor line's number.
     pub gutter_cursor: Color,
+    /// Background of popups (pickers, completion menus, prompt bar).
+    pub popup_bg: Color,
+    /// Popup borders and accents.
+    pub border: Color,
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    Color::Rgb { r, g, b }
 }
 
 pub static THEMES: &[Theme] = &[
@@ -33,32 +45,64 @@ pub static THEMES: &[Theme] = &[
             Some(Color::DarkYellow), // constant, number
             Some(Color::Blue),       // macro, attribute
         ],
+        bg: None,
+        fg: None,
         selection: Color::DarkGrey,
         gutter: Color::DarkGrey,
         gutter_cursor: Color::Yellow,
+        popup_bg: Color::DarkGrey,
+        border: Color::Yellow,
+    },
+    Theme {
+        name: "tokyonight",
+        syntax: [
+            None,
+            Some(rgb(0x56, 0x5f, 0x89)), // comment
+            Some(rgb(0x9e, 0xce, 0x6a)), // string
+            Some(rgb(0xbb, 0x9a, 0xf7)), // keyword
+            Some(rgb(0x7a, 0xa2, 0xf7)), // function
+            Some(rgb(0x2a, 0xc3, 0xde)), // type
+            Some(rgb(0xff, 0x9e, 0x64)), // constant, number
+            Some(rgb(0xe0, 0xaf, 0x68)), // macro, attribute
+        ],
+        bg: Some(rgb(0x1a, 0x1b, 0x26)),
+        fg: Some(rgb(0xc0, 0xca, 0xf5)),
+        selection: rgb(0x28, 0x34, 0x57),
+        gutter: rgb(0x3b, 0x42, 0x61),
+        gutter_cursor: rgb(0xe0, 0xaf, 0x68),
+        popup_bg: rgb(0x24, 0x28, 0x3b),
+        border: rgb(0xff, 0x9e, 0x64),
     },
     Theme {
         name: "gruvbox",
         syntax: [
             None,
-            Some(Color::Rgb { r: 0x92, g: 0x83, b: 0x74 }), // comment
-            Some(Color::Rgb { r: 0xb8, g: 0xbb, b: 0x26 }), // string
-            Some(Color::Rgb { r: 0xfb, g: 0x49, b: 0x34 }), // keyword
-            Some(Color::Rgb { r: 0x83, g: 0xa5, b: 0x98 }), // function
-            Some(Color::Rgb { r: 0xfa, g: 0xbd, b: 0x2f }), // type
-            Some(Color::Rgb { r: 0xd3, g: 0x86, b: 0x9b }), // constant
-            Some(Color::Rgb { r: 0x8e, g: 0xc0, b: 0x7c }), // macro
+            Some(rgb(0x92, 0x83, 0x74)), // comment
+            Some(rgb(0xb8, 0xbb, 0x26)), // string
+            Some(rgb(0xfb, 0x49, 0x34)), // keyword
+            Some(rgb(0x83, 0xa5, 0x98)), // function
+            Some(rgb(0xfa, 0xbd, 0x2f)), // type
+            Some(rgb(0xd3, 0x86, 0x9b)), // constant
+            Some(rgb(0x8e, 0xc0, 0x7c)), // macro
         ],
-        selection: Color::Rgb { r: 0x50, g: 0x49, b: 0x45 },
-        gutter: Color::Rgb { r: 0x7c, g: 0x6f, b: 0x64 },
-        gutter_cursor: Color::Rgb { r: 0xfa, g: 0xbd, b: 0x2f },
+        bg: Some(rgb(0x28, 0x28, 0x28)),
+        fg: Some(rgb(0xeb, 0xdb, 0xb2)),
+        selection: rgb(0x50, 0x49, 0x45),
+        gutter: rgb(0x7c, 0x6f, 0x64),
+        gutter_cursor: rgb(0xfa, 0xbd, 0x2f),
+        popup_bg: rgb(0x3c, 0x38, 0x36),
+        border: rgb(0xfa, 0xbd, 0x2f),
     },
     Theme {
         name: "mono",
         syntax: [None; 8],
+        bg: None,
+        fg: None,
         selection: Color::DarkGrey,
         gutter: Color::DarkGrey,
         gutter_cursor: Color::White,
+        popup_bg: Color::DarkGrey,
+        border: Color::White,
     },
 ];
 

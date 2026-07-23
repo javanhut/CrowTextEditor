@@ -1074,6 +1074,13 @@ impl Editor {
         }
     }
 
+    /// The floating `:`/`/` prompt: (x, y, width), centered near the top.
+    pub fn prompt_rect(&self) -> (u16, u16, u16) {
+        let w = ((self.size.0 as usize) * 3 / 5).clamp(20, 70) as u16;
+        let x = (self.size.0.saturating_sub(w)) / 2;
+        (x, 1, w)
+    }
+
     /// Overlay rectangle for the picker, centered near the top.
     pub fn picker_rect(&self) -> Rect {
         let w = ((self.size.0 as usize) * 3 / 4).clamp(20, 80) as u16;
@@ -1476,14 +1483,11 @@ impl Editor {
             let col = 1 + picker.title.chars().count() + 3 + picker.query.chars().count();
             return Some((x + (col as u16).min(w.saturating_sub(1)), y));
         }
-        let prompt_len = match self.mode {
-            Mode::Command => Some(1),
-            Mode::Search => Some(crate::ui::search_prompt(self).chars().count()),
-            _ => None,
-        };
-        if let Some(n) = prompt_len {
-            let col = self.command_line.chars().count() + n;
-            return Some((col as u16, self.size.1.saturating_sub(1)));
+        if matches!(self.mode, Mode::Command | Mode::Search) {
+            // Inside the floating prompt: after the border, space, and prefix.
+            let (x, y, w) = self.prompt_rect();
+            let col = 3 + self.command_line.chars().count();
+            return Some((x + (col as u16).min(w.saturating_sub(2)), y + 1));
         }
 
         let (rx, ry, rw, rh) = self.focused_rect();
