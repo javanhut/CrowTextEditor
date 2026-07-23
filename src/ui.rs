@@ -9,7 +9,9 @@ use std::io::Write;
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::terminal::{
+    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
+};
 use crossterm::{cursor, queue};
 use ropey::RopeSlice;
 
@@ -18,7 +20,10 @@ use crate::config::tab_width;
 use crate::position::{self};
 
 pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
-    queue!(out, cursor::Hide, cursor::MoveTo(0, 0))?;
+    // Synchronized updates make the terminal present the frame atomically
+    // instead of painting it cell by cell as the bytes stream in; ignored by
+    // terminals that don't support it.
+    queue!(out, BeginSynchronizedUpdate, cursor::Hide, cursor::MoveTo(0, 0))?;
 
     render_tree(editor, out)?;
     render_text(editor, out)?;
@@ -34,13 +39,30 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         None => queue!(out, cursor::Hide)?,
     }
 
-    // The cursor shape is the clearest signal of which mode you're in.
-    match editor.mode {
-        Mode::Insert => queue!(out, cursor::SetCursorStyle::SteadyBar)?,
-        _ => queue!(out, cursor::SetCursorStyle::SteadyBlock)?,
-    }
+    // The cursor shape is the clearest signal of which mode you're in. Some
+    // terminals visibly blink the cursor every time the style is set, so only
+    // send it when it actually changed.
+    let insert = editor.mode == Mode::Insert;
+    let style = if insert {
+        cursor::SetCursorStyle::SteadyBar
+    } else {
+        cursor::SetCursorStyle::SteadyBlock
+    };
+    LAST_CURSOR_INSERT.with(|last| {
+        if last.get() != Some(insert) {
+            last.set(Some(insert));
+            let _ = queue!(out, style);
+        }
+    });
 
+    queue!(out, EndSynchronizedUpdate)?;
     out.flush()
+}
+
+thread_local! {
+    /// Whether the last cursor style we sent was the insert-mode bar.
+    static LAST_CURSOR_INSERT: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Cell styling: an overlay (selection or extra cursor) plus a syntax color.

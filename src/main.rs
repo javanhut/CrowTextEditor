@@ -81,10 +81,16 @@ fn main() -> std::io::Result<()> {
 
 fn run(editor: &mut Editor) -> std::io::Result<()> {
     let mut out = stdout();
+    // Repaint only when state actually changed; redrawing the whole screen
+    // on every idle poll tick is what made the cursor and text flicker.
+    let mut dirty = true;
 
     loop {
-        editor.ensure_cursor_visible();
-        ui::render(editor, &mut out)?;
+        if dirty {
+            editor.ensure_cursor_visible();
+            ui::render(editor, &mut out)?;
+            dirty = false;
+        }
 
         // Poll instead of block, so language-server messages arriving while
         // idle still get drained and drawn.
@@ -93,13 +99,19 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
                 Event::Key(ev) => {
                     if let Some(key) = Key::from_crossterm(ev) {
                         editor.handle_key(key);
+                        dirty = true;
                     }
                 }
-                Event::Resize(cols, rows) => editor.size = (cols, rows),
+                Event::Resize(cols, rows) => {
+                    editor.size = (cols, rows);
+                    dirty = true;
+                }
                 _ => {}
             }
         }
-        editor.lsp_tick();
+        if editor.lsp_tick() {
+            dirty = true;
+        }
 
         if editor.should_quit {
             break;

@@ -1516,10 +1516,12 @@ impl Editor {
 
     /// Called from the main loop between keystrokes: keep the server in sync
     /// with edited buffers and apply anything it sent back.
-    pub fn lsp_tick(&mut self) {
+    /// Drains language-server messages. Returns true when anything on screen
+    /// may have changed, so the main loop knows a redraw is needed.
+    pub fn lsp_tick(&mut self) -> bool {
         self.lsp_sync();
         let Some(lsp) = self.lsp.as_mut() else {
-            return;
+            return false;
         };
         let events = lsp.poll();
         if lsp.is_dead() {
@@ -1528,6 +1530,7 @@ impl Editor {
             self.lsp = None;
             self.lsp_failed = true;
         }
+        let changed = !events.is_empty();
         for event in events {
             match event {
                 lsp::Event::Definition(path, line, col) => self.jump_to(path, line, col),
@@ -1539,6 +1542,7 @@ impl Editor {
                 lsp::Event::Completions(items) => self.show_completions(items),
             }
         }
+        changed
     }
 
     fn show_completions(&mut self, items: Vec<(String, String)>) {
