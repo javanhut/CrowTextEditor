@@ -189,7 +189,9 @@ mod tests {
     use super::*;
 
     fn scratch_tree() -> (PathBuf, FileTree) {
-        let dir = std::env::temp_dir().join(format!("crow-tree-test-{}", std::process::id()));
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("crow-tree-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("b.txt"), "").unwrap();

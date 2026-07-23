@@ -44,26 +44,44 @@ fn group_of(capture_name: &str) -> u8 {
     }
 }
 
-pub fn config_for(path: Option<&Path>) -> Option<&'static Config> {
-    match path?.extension()?.to_str()? {
-        "rs" => Some(rust()),
-        _ => None,
-    }
+/// One lazily built grammar config; `None` if its bundled query fails to
+/// compile (a broken grammar should degrade to plain text, not a panic).
+macro_rules! lang {
+    ($fn_name:ident, $language:expr, $query:expr) => {
+        fn $fn_name() -> Option<&'static Config> {
+            static CELL: OnceLock<Option<Config>> = OnceLock::new();
+            CELL.get_or_init(|| {
+                let language: Language = $language.into();
+                let query = Query::new(&language, $query).ok()?;
+                let groups = query.capture_names().iter().map(|n| group_of(n)).collect();
+                Some(Config {
+                    language,
+                    query,
+                    groups,
+                })
+            })
+            .as_ref()
+        }
+    };
 }
 
-fn rust() -> &'static Config {
-    static CONFIG: OnceLock<Config> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let language: Language = tree_sitter_rust::LANGUAGE.into();
-        let query = Query::new(&language, tree_sitter_rust::HIGHLIGHTS_QUERY)
-            .expect("bundled highlight query compiles");
-        let groups = query.capture_names().iter().map(|n| group_of(n)).collect();
-        Config {
-            language,
-            query,
-            groups,
-        }
-    })
+lang!(rust, tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY);
+lang!(toml, tree_sitter_toml_ng::LANGUAGE, tree_sitter_toml_ng::HIGHLIGHTS_QUERY);
+lang!(json, tree_sitter_json::LANGUAGE, tree_sitter_json::HIGHLIGHTS_QUERY);
+lang!(python, tree_sitter_python::LANGUAGE, tree_sitter_python::HIGHLIGHTS_QUERY);
+lang!(bash, tree_sitter_bash::LANGUAGE, tree_sitter_bash::HIGHLIGHT_QUERY);
+lang!(javascript, tree_sitter_javascript::LANGUAGE, tree_sitter_javascript::HIGHLIGHT_QUERY);
+
+pub fn config_for(path: Option<&Path>) -> Option<&'static Config> {
+    match path?.extension()?.to_str()? {
+        "rs" => rust(),
+        "toml" => toml(),
+        "json" => json(),
+        "py" => python(),
+        "sh" | "bash" | "zsh" => bash(),
+        "js" | "jsx" | "mjs" => javascript(),
+        _ => None,
+    }
 }
 
 /// Parse the whole buffer and collect highlight spans.
@@ -121,13 +139,31 @@ mod tests {
     #[test]
     fn rust_source_gets_highlight_spans() {
         let text = Rope::from_str("fn main() { let x = \"hi\"; }\n");
-        let syntax = parse(rust(), &text).unwrap();
+        let syntax = parse(rust().unwrap(), &text).unwrap();
         assert!(!syntax.spans.is_empty());
         // "fn" at chars 0..2 is a keyword.
         assert_eq!(group_at(&syntax.spans, 0), 3);
         // The string literal is a string.
         let quote = text.to_string().find('"').unwrap();
         assert_eq!(group_at(&syntax.spans, quote + 1), 2);
+    }
+
+    #[test]
+    fn every_bundled_grammar_loads_and_highlights() {
+        for (file, source, probe) in [
+            ("x.toml", "# note\nkey = \"v\"\n", 0usize),
+            ("x.json", "{\"k\": \"v\"}\n", 1),
+            ("x.py", "# note\ndef f():\n    pass\n", 0),
+            ("x.sh", "# note\necho hi\n", 0),
+            ("x.js", "// note\nlet x = 1;\n", 0),
+        ] {
+            let config = config_for(Some(Path::new(file))).unwrap_or_else(|| {
+                panic!("grammar for {file} failed to load");
+            });
+            let syntax = parse(config, &Rope::from_str(source)).unwrap();
+            assert!(!syntax.spans.is_empty(), "{file}: no spans");
+            assert_ne!(group_at(&syntax.spans, probe), 0, "{file}: probe unstyled");
+        }
     }
 
     #[test]

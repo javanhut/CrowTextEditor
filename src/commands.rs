@@ -939,7 +939,19 @@ fn delete_backward(editor: &mut Editor) {
         return;
     }
     let from = position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor);
-    doc.delete_range(from, doc.cursor);
+    // Backspacing an opener eats its auto-closed partner too.
+    let prev = doc.text.char(doc.cursor - 1);
+    let next = (doc.cursor < doc.text.len_chars()).then(|| doc.text.char(doc.cursor));
+    let empty_pair = matches!(
+        (prev, next),
+        ('(', Some(')')) | ('[', Some(']')) | ('{', Some('}')) | ('"', Some('"')) | ('\'', Some('\''))
+    );
+    let to = if empty_pair && crate::config::autoclose() {
+        doc.cursor + 1
+    } else {
+        doc.cursor
+    };
+    doc.delete_range(from, to);
 }
 
 fn delete_forward(editor: &mut Editor) {

@@ -28,10 +28,19 @@ replace-all is just `s foo ⏎ c bar ⎋`, with every edit site visible before y
 type, and `s \d+ ⏎` puts a cursor on every number. A pattern that doesn't
 compile (yet) is searched literally, so the preview never breaks mid-keystroke.
 
-Syntax is a selection too. Tree-sitter parses Rust files, colors them, and
+Syntax is a selection too. Tree-sitter parses Rust, TOML, JSON, Python,
+shell, and JavaScript (each further language is one grammar dependency and
+one match arm), colors them, and
 `A-o` grows the selection to the enclosing syntax node — token, expression,
 statement, block, function — one keypress per level. Since it's just a
 selection, `d`/`c`/`y`, multi-cursor, and `s` all compose with it.
+
+Insert-mode niceties: brackets and quotes auto-close (type `(` and `)`
+appears, retype the closer to step over it, backspace eats an empty pair;
+quotes stay single after word characters so `don't` types naturally), and the
+file tree shows Nerd Font icons per file type. Both are options in crow.toml
+(`autoclose`, `icons`); the installer offers JetBrains Mono Nerd Font on
+macOS.
 
 LSP without an async runtime: the server runs as a child process, a thread
 feeds its messages into a channel, and the main loop drains it between

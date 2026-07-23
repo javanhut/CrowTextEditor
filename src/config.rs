@@ -10,12 +10,14 @@
 //! the config ever needs arrays or nesting.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct Config {
     pub theme: String,
     pub tab_width: usize,
     pub scrolloff: usize,
+    pub autoclose: bool,
+    pub icons: bool,
     /// Extra bindings per mode: (key sequence, command name).
     pub keys_normal: Vec<(String, String)>,
     pub keys_insert: Vec<(String, String)>,
@@ -29,6 +31,8 @@ impl Default for Config {
             theme: "tokyonight".into(),
             tab_width: 4,
             scrolloff: 3,
+            autoclose: true,
+            icons: true,
             keys_normal: Vec::new(),
             keys_insert: Vec::new(),
             lsp: vec![("rs".into(), "rust-analyzer".into())],
@@ -39,6 +43,8 @@ impl Default for Config {
 // Options read from hot paths live in statics, set once by `apply`.
 static TAB_WIDTH: AtomicUsize = AtomicUsize::new(4);
 static SCROLLOFF: AtomicUsize = AtomicUsize::new(3);
+static AUTOCLOSE: AtomicBool = AtomicBool::new(true);
+static ICONS: AtomicBool = AtomicBool::new(true);
 
 pub fn tab_width() -> usize {
     TAB_WIDTH.load(Ordering::Relaxed)
@@ -48,10 +54,20 @@ pub fn scrolloff() -> usize {
     SCROLLOFF.load(Ordering::Relaxed)
 }
 
+pub fn autoclose() -> bool {
+    AUTOCLOSE.load(Ordering::Relaxed)
+}
+
+pub fn icons() -> bool {
+    ICONS.load(Ordering::Relaxed)
+}
+
 /// Install the config's options and theme as the live values.
 pub fn apply(config: &Config) {
     TAB_WIDTH.store(config.tab_width.clamp(1, 16), Ordering::Relaxed);
     SCROLLOFF.store(config.scrolloff.min(50), Ordering::Relaxed);
+    AUTOCLOSE.store(config.autoclose, Ordering::Relaxed);
+    ICONS.store(config.icons, Ordering::Relaxed);
     crate::theme::set(&config.theme);
 }
 
@@ -71,6 +87,8 @@ theme = "tokyonight"     # tokyonight | gruvbox | mono | default (terminal color
 [options]
 tab_width = 4
 scrolloff = 3
+autoclose = true         # type ( [ { " ' and the closer appears
+icons = true             # Nerd Font file icons in the tree (needs a Nerd Font)
 
 # Language servers: file extension = server command. crow starts the first
 # server whose extension matches an open file.
@@ -135,6 +153,8 @@ fn parse(text: &str) -> Config {
             "options" => match key.as_str() {
                 "tab_width" => config.tab_width = value.parse().unwrap_or(config.tab_width),
                 "scrolloff" => config.scrolloff = value.parse().unwrap_or(config.scrolloff),
+                "autoclose" => config.autoclose = value.parse().unwrap_or(config.autoclose),
+                "icons" => config.icons = value.parse().unwrap_or(config.icons),
                 _ => {}
             },
             "keys.normal" => config.keys_normal.push((key, value)),

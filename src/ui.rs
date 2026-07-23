@@ -375,7 +375,12 @@ fn render_tree(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
                 } else {
                     "  "
                 };
-                format!("{}{}{}", " ".repeat(r.depth), marker, r.name)
+                let icon = if crate::config::icons() {
+                    format!("{} ", file_icon(&r.name, r.is_dir, r.expanded))
+                } else {
+                    String::new()
+                };
+                format!("{}{}{}{}", " ".repeat(r.depth), marker, icon, r.name)
             }
             None => String::new(),
         };
@@ -559,6 +564,33 @@ fn render_command_line(editor: &Editor, out: &mut impl Write) -> std::io::Result
         Print(format!("{content:<width$}")),
         ResetColor
     )
+}
+
+/// Nerd Font glyph for a tree row. Needs a Nerd Font in the terminal
+/// (`icons = false` in crow.toml otherwise).
+fn file_icon(name: &str, is_dir: bool, expanded: bool) -> &'static str {
+    if is_dir {
+        return if expanded { "\u{f07c}" } else { "\u{f07b}" }; // open/closed folder
+    }
+    match name.rsplit('.').next().unwrap_or("") {
+        "rs" => "\u{e7a8}",
+        "toml" => "\u{e615}",
+        "md" => "\u{f48a}",
+        "json" => "\u{e60b}",
+        "sh" | "bash" | "zsh" => "\u{f489}",
+        "py" => "\u{e73c}",
+        "js" | "jsx" | "mjs" => "\u{e74e}",
+        "ts" | "tsx" => "\u{e628}",
+        "c" | "h" => "\u{e61e}",
+        "cc" | "cpp" | "hpp" => "\u{e61d}",
+        "go" => "\u{e626}",
+        "html" => "\u{e736}",
+        "css" => "\u{e749}",
+        "yml" | "yaml" => "\u{e615}",
+        "lock" => "\u{f023}",
+        "txt" => "\u{f15c}",
+        _ => "\u{f15b}", // generic file
+    }
 }
 
 /// A rounded, bordered one-line popup with its title in the top border —

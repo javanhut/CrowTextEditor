@@ -732,11 +732,7 @@ impl Editor {
                 // In insert mode an unbound printable key is literal text.
                 if self.mode == Mode::Insert && self.pending.len() == 1 && !key.ctrl && !key.alt {
                     if let KeyCode::Char(c) = key.code {
-                        let s = c.to_string();
-                        self.doc_mut().insert_at_cursor(&s);
-                        if c.is_alphanumeric() || c == '_' {
-                            self.maybe_autocomplete();
-                        }
+                        self.insert_typed(c);
                     }
                 }
                 self.pending.clear();
@@ -1569,6 +1565,58 @@ impl Editor {
         }
     }
 
+    /// One typed character in insert mode: bracket/quote pairs close
+    /// themselves, retyping a closer steps over it, and identifier chars
+    /// feed the intellisense popup.
+    fn insert_typed(&mut self, c: char) {
+        if crate::config::autoclose() {
+            let doc = self.doc();
+            let next = (doc.cursor < doc.text.len_chars()).then(|| doc.text.char(doc.cursor));
+            let prev = (doc.cursor > 0).then(|| doc.text.char(doc.cursor - 1));
+
+            // Retyping the closer that's already there steps over it.
+            if matches!(c, ')' | ']' | '}' | '"' | '\'') && next == Some(c) {
+                let doc = self.doc_mut();
+                let len = doc.text.len_chars();
+                doc.cursor = (doc.cursor + 1).min(len);
+                doc.anchor = doc.cursor;
+                for (a, cur) in &mut doc.extra {
+                    *cur = (*cur + 1).min(len);
+                    *a = *cur;
+                }
+                return;
+            }
+
+            // Openers bring their closer; quotes only where a pair reads as
+            // one (not right after a word: don't, can't…).
+            let close = match c {
+                '(' => Some(')'),
+                '[' => Some(']'),
+                '{' => Some('}'),
+                '"' | '\'' if !prev.is_some_and(|p| p.is_alphanumeric() || p == '_') => Some(c),
+                _ => None,
+            };
+            if let Some(close) = close {
+                let pair: String = [c, close].iter().collect();
+                self.doc_mut().insert_at_cursor(&pair);
+                // Every cursor steps back between its pair.
+                let doc = self.doc_mut();
+                doc.cursor = doc.cursor.saturating_sub(1);
+                doc.anchor = doc.cursor;
+                for (a, cur) in &mut doc.extra {
+                    *cur = cur.saturating_sub(1);
+                    *a = *cur;
+                }
+                return;
+            }
+        }
+
+        self.doc_mut().insert_at_cursor(&c.to_string());
+        if c.is_alphanumeric() || c == '_' {
+            self.maybe_autocomplete();
+        }
+    }
+
     /// Intellisense while typing: once two identifier chars are down, offer
     /// matching words from every open buffer. Instant and offline; `C-space`
     /// still asks the language server for the smart list.
@@ -2337,6 +2385,43 @@ mod tests {
         assert!(!dir.join("sub/c.txt").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn brackets_autoclose_step_over_and_backspace_as_pairs() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "(x");
+        assert_eq!(editor.doc().text.to_string(), "(x)");
+        press(&mut editor, ")"); // retyping the closer steps over it
+        assert_eq!(editor.doc().text.to_string(), "(x)");
+        assert_eq!(editor.doc().cursor, 3);
+        press(&mut editor, "[");
+        press(&mut editor, "<bs>"); // backspace eats the empty pair
+        assert_eq!(editor.doc().text.to_string(), "(x)");
+    }
+
+    #[test]
+    fn quotes_pair_except_after_word_chars() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "\"hi");
+        assert_eq!(editor.doc().text.to_string(), "\"hi\"");
+        press(&mut editor, "\""); // step over
+        press(&mut editor, "<space>");
+        press(&mut editor, "don't");
+        assert_eq!(editor.doc().text.to_string(), "\"hi\" don't");
+    }
+
+    #[test]
+    fn autoclose_works_at_every_cursor() {
+        let mut editor = editor_with("a\nb");
+        press(&mut editor, "C"); // cursor on both lines
+        press(&mut editor, "i");
+        press(&mut editor, "(");
+        assert_eq!(editor.doc().text.to_string(), "()a\n()b");
+        press(&mut editor, "x"); // typing lands inside both pairs
+        assert_eq!(editor.doc().text.to_string(), "(x)a\n(x)b");
     }
 
     #[test]

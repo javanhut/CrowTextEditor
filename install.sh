@@ -27,4 +27,20 @@ if ! command -v rust-analyzer >/dev/null 2>&1; then
   echo "Optional: install rust-analyzer for LSP support:  rustup component add rust-analyzer"
 fi
 
+# The file tree uses Nerd Font icons; offer the font if it's missing.
+if [ "$(uname)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+  if ! ls "$HOME/Library/Fonts" /Library/Fonts 2>/dev/null | grep -qi "JetBrainsMono.*Nerd"; then
+    printf "Install JetBrains Mono Nerd Font (file-tree icons)? [y/N] "
+    read -r answer
+    case "$answer" in
+      y|Y) brew install --cask font-jetbrains-mono-nerd-font \
+             && echo "Installed — select 'JetBrainsMono Nerd Font' in your terminal's settings." ;;
+      *) echo "Skipped. Icons need a Nerd Font; set icons = false in crow.toml to hide them." ;;
+    esac
+  fi
+else
+  echo "Tip: tree icons need a Nerd Font (e.g. JetBrains Mono Nerd Font from nerdfonts.com);"
+  echo "     set icons = false in crow.toml if you'd rather go without."
+fi
+
 echo "Done. Run: crow <file>   (config: ~/.config/crow/crow.toml, created on first run)"
