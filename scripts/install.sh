@@ -2,7 +2,7 @@
 # Build crow and install it to ~/.local/bin (or the directory given as $1).
 set -e
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 if ! command -v cargo >/dev/null 2>&1; then
   echo "crow needs the Rust toolchain to build. Install it from https://rustup.rs, then rerun."

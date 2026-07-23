@@ -33,6 +33,7 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     render_tree_prompt(editor, out)?;
     render_picker(editor, out)?;
     render_completion(editor, out)?;
+    render_help(editor, out)?;
 
     match editor.screen_cursor() {
         Some((col, row)) => queue!(out, cursor::MoveTo(col, row), cursor::Show)?,
@@ -504,6 +505,40 @@ fn render_picker(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
                 ResetColor
             )?;
         }
+    }
+    Ok(())
+}
+
+/// The `:help` window: a scrollable command reference, picker-styled.
+fn render_help(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    let Some(scroll) = editor.help_scroll else {
+        return Ok(());
+    };
+    let (x, y, w, h) = editor.help_rect();
+    let w = w as usize;
+    let lines = crate::commands::help_lines();
+
+    let title = format!(" Help — j/k scroll · esc close  ({}/{})", scroll + 1, lines.len());
+    let title: String = title.chars().take(w).collect();
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        SetAttribute(Attribute::Reverse),
+        Print(format!("{title:<w$}")),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    let popup_bg = crate::theme::current().popup_bg;
+    for row in 0..(h as usize).saturating_sub(1) {
+        let line = lines.get(scroll + row).map(String::as_str).unwrap_or("");
+        let line: String = line.chars().take(w).collect();
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 1 + row as u16),
+            SetBackgroundColor(popup_bg),
+            Print(format!("{line:<w$}")),
+            ResetColor
+        )?;
     }
     Ok(())
 }

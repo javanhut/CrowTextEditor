@@ -52,6 +52,8 @@ commands! {
     find_files => "fuzzy-find a file under the current directory",
     file_explorer => "browse the current directory in a picker",
     tree_toggle => "toggle the file tree sidebar",
+    focus_left => "focus the window to the left, or the file tree",
+    focus_right => "focus the window to the right",
     theme_picker => "pick a theme with live preview",
     search => "search forward, selecting the match",
     select_matches => "select every match of a pattern",
@@ -99,6 +101,34 @@ commands! {
     next_window => "focus the next window",
     save => "write the buffer to disk",
     quit => "close the window, or the editor with the last one",
+}
+
+/// The `:help` window's text: the `:` commands, then every named command.
+pub fn help_lines() -> Vec<String> {
+    let mut out: Vec<String> = [
+        (":w [path], :write", "write the buffer (optionally to path)"),
+        (":q, :quit", "close the window, or the editor with the last one"),
+        (":q!", "quit without saving"),
+        (":wq, :x", "write, then quit"),
+        (":e <file>, :edit", "open a file"),
+        (":fmt, :format", "run the file's formatter over the buffer"),
+        (":bn / :bp", "next / previous buffer"),
+        (":theme [name]", "list themes, or switch to one"),
+        (":config", "edit crow.toml"),
+        (":<number>", "jump to that line"),
+        (":help, :h", "this window"),
+        (":<command>", "run any command below by name"),
+    ]
+    .iter()
+    .map(|(cmd, doc)| format!(" {cmd:<26} {doc}"))
+    .collect();
+    out.push(String::new());
+    out.push(" Commands (also in the palette, <space> c):".to_string());
+    out.push(String::new());
+    for c in COMMANDS {
+        out.push(format!(" {:<26} {}", c.name, c.doc));
+    }
+    out
 }
 
 /// Commands that run once per cursor when extra cursors exist.
@@ -419,6 +449,22 @@ fn file_explorer(editor: &mut Editor) {
 
 fn tree_toggle(editor: &mut Editor) {
     editor.tree_toggle();
+}
+
+fn focus_left(editor: &mut Editor) {
+    if editor.focus_window_horizontal(true) {
+        return;
+    }
+    // Leftmost window already: the tree is next (opened if hidden).
+    if editor.tree.is_none() {
+        editor.tree_toggle();
+    } else {
+        editor.tree_focused = true;
+    }
+}
+
+fn focus_right(editor: &mut Editor) {
+    editor.focus_window_horizontal(false);
 }
 
 // ---- lsp -------------------------------------------------------------------

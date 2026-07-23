@@ -297,6 +297,10 @@ impl Default for Keymaps {
         normal.bind_str("<space> c", "command_palette");
         normal.bind_str("<space> f", "find_files");
         normal.bind_str("<space> e", "tree_toggle");
+        normal.bind_str("C-h", "focus_left");
+        normal.bind_str("C-<left>", "focus_left");
+        normal.bind_str("C-l", "focus_right");
+        normal.bind_str("C-<right>", "focus_right");
         normal.bind_str("<space> d", "file_explorer");
         normal.bind_str("<space> t", "theme_picker");
         normal.bind_str("C-s", "save");
@@ -372,6 +376,8 @@ pub struct Editor {
     pub picker: Option<crate::picker::Picker>,
     /// The active completion menu, if any (mode == Insert).
     pub completion: Option<Completion>,
+    /// Scroll offset of the `:help` window; None when closed.
+    pub help_scroll: Option<usize>,
     /// The file tree sidebar, when visible.
     pub tree: Option<crate::filetree::FileTree>,
     /// Keys go to the tree instead of the buffer.
@@ -457,6 +463,7 @@ impl Editor {
             diagnostics: HashMap::new(),
             picker: None,
             completion: None,
+            help_scroll: None,
             tree: None,
             tree_focused: false,
             tree_leader: false,
@@ -511,6 +518,15 @@ impl Editor {
         let mut seps = Vec::new();
         self.layout.rects(area, &mut wins, &mut seps);
         (wins, seps)
+    }
+
+    /// The `:help` window: centered, most of the screen.
+    pub fn help_rect(&self) -> Rect {
+        let w = ((self.size.0 as usize) * 3 / 4).clamp(30, 90) as u16;
+        let w = w.min(self.size.0);
+        let h = self.size.1.saturating_sub(6).max(3);
+        let x = (self.size.0.saturating_sub(w)) / 2;
+        (x, 2, w, h)
     }
 
     pub fn focused_rect(&self) -> Rect {
@@ -583,6 +599,29 @@ impl Editor {
         self.layout.close(closing);
     }
 
+    /// Move focus to the nearest window left/right of the current one.
+    /// Returns false when there is none in that direction.
+    pub fn focus_window_horizontal(&mut self, left: bool) -> bool {
+        let (wins, _) = self.window_rects();
+        let (fx, fy, _, fh) = self.focused_rect();
+        let fmid = fy as i32 + fh as i32 / 2;
+        let target = wins
+            .iter()
+            .filter(|&&(id, (x, ..))| id != self.focused && if left { x < fx } else { x > fx })
+            .min_by_key(|&&(_, (x, y, _, h))| {
+                let dx = if left { fx - x } else { x - fx };
+                (dx, (y as i32 + h as i32 / 2 - fmid).abs())
+            })
+            .map(|&(id, _)| id);
+        let Some(id) = target else {
+            return false;
+        };
+        self.save_focus_state();
+        self.focused = id;
+        self.restore_focus_state();
+        true
+    }
+
     pub fn focus_next_window(&mut self) {
         let mut ids = Vec::new();
         self.layout.leaf_ids(&mut ids);
@@ -634,6 +673,10 @@ impl Editor {
     pub fn handle_key(&mut self, key: Key) {
         self.status.clear();
 
+        if let Some(scroll) = self.help_scroll {
+            self.handle_help_key(key, scroll);
+            return;
+        }
         if self.mode == Mode::Command {
             self.handle_command_key(key);
             return;
@@ -768,6 +811,28 @@ impl Editor {
         }
         self.count = count;
         (command.func)(self);
+    }
+
+    /// Keys while the `:help` window is open: scroll or close.
+    fn handle_help_key(&mut self, key: Key, scroll: usize) {
+        let (_, _, _, h) = self.help_rect();
+        let visible = (h as usize).saturating_sub(1); // minus the title row
+        let max = crate::commands::help_lines().len().saturating_sub(visible);
+        let clamp = |s: usize| Some(s.min(max));
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.help_scroll = None,
+            KeyCode::Up | KeyCode::Char('k') => self.help_scroll = clamp(scroll.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => self.help_scroll = clamp(scroll + 1),
+            KeyCode::Char('d') if key.ctrl => self.help_scroll = clamp(scroll + visible / 2),
+            KeyCode::Char('u') if key.ctrl => {
+                self.help_scroll = clamp(scroll.saturating_sub(visible / 2))
+            }
+            KeyCode::PageDown => self.help_scroll = clamp(scroll + visible),
+            KeyCode::PageUp => self.help_scroll = clamp(scroll.saturating_sub(visible)),
+            KeyCode::Char('g') => self.help_scroll = Some(0),
+            KeyCode::Char('G') => self.help_scroll = Some(max),
+            _ => {}
+        }
     }
 
     fn handle_command_key(&mut self, key: Key) {
@@ -938,6 +1003,7 @@ impl Editor {
                 },
                 None => self.set_status("Usage: :e <file>"),
             },
+            "help" | "h" => self.help_scroll = Some(0),
             "fmt" | "format" => (commands::find("format_buffer").unwrap().func)(self),
             "bn" => (commands::find("next_buffer").unwrap().func)(self),
             "bp" => (commands::find("prev_buffer").unwrap().func)(self),
@@ -1145,6 +1211,7 @@ impl Editor {
             return;
         };
         match key.code {
+            KeyCode::Char('l') | KeyCode::Right if key.ctrl => self.tree_focused = false,
             KeyCode::Esc => self.tree_focused = false,
             KeyCode::Char('q') => {
                 self.tree = None;
@@ -1451,6 +1518,14 @@ impl Editor {
                     (completion.selected + completion.items.len() - 1) % completion.items.len();
                 true
             }
+            KeyCode::Char('/') if !key.ctrl && !key.alt => {
+                // A slash ends the current word; for paths it descends, so
+                // start over and list the next directory.
+                self.completion = None;
+                self.doc_mut().insert_at_cursor("/");
+                self.maybe_autocomplete();
+                true
+            }
             KeyCode::Char(c) if !key.ctrl && !key.alt => {
                 // Type through the menu: insert the char and narrow the list.
                 completion.prefix.push(c);
@@ -1481,6 +1556,7 @@ impl Editor {
             return;
         };
         let prefix_chars = completion.prefix.chars().count();
+        let entered_dir = text.ends_with('/');
         if text.to_lowercase().starts_with(&completion.prefix.to_lowercase()) {
             // The typed prefix stands; append the rest at every cursor.
             let suffix: String = text.chars().skip(prefix_chars).collect();
@@ -1493,6 +1569,10 @@ impl Editor {
             doc.delete_range(from, doc.cursor);
             let text = text.clone();
             self.doc_mut().insert_at_cursor(&text);
+        }
+        // Accepting a directory rolls straight into listing its contents.
+        if entered_dir {
+            self.maybe_autocomplete();
         }
     }
 
@@ -1633,7 +1713,7 @@ impl Editor {
         }
 
         self.doc_mut().insert_at_cursor(&c.to_string());
-        if c.is_alphanumeric() || c == '_' {
+        if c.is_alphanumeric() || c == '_' || c == '/' {
             self.maybe_autocomplete();
         }
     }
@@ -1643,6 +1723,10 @@ impl Editor {
     /// still asks the language server for the smart list.
     fn maybe_autocomplete(&mut self) {
         if self.completion.is_some() {
+            return;
+        }
+        if let Some(completion) = self.path_completion() {
+            self.completion = Some(completion);
             return;
         }
         let prefix = self.word_prefix();
@@ -1690,6 +1774,64 @@ impl Editor {
         out.sort();
         out.truncate(50);
         out
+    }
+
+    /// Filesystem completion for a `./`, `../` or absolute path being typed.
+    /// Returns None when the text before the cursor doesn't look like one.
+    fn path_completion(&self) -> Option<Completion> {
+        let doc = self.doc();
+        let (line, col) = doc.cursor_line_col();
+        let slice = doc.line(line);
+        let mut start = col;
+        while start > 0 {
+            let c = slice.char(start - 1);
+            if c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~') {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        let token: String = (start..col).map(|i| slice.char(i)).collect();
+        // A bare "/" (division, say) doesn't count; "./", "../", "~/" and "/usr" do.
+        let looks_like_path = token.starts_with("./")
+            || token.starts_with("../")
+            || token.starts_with("~/")
+            || (token.starts_with('/') && token.len() > 1);
+        if !looks_like_path {
+            return None;
+        }
+        let (dir, prefix) = token.rsplit_once('/')?;
+        let dir = match dir.strip_prefix('~') {
+            Some(rest) => format!("{}{rest}", std::env::var("HOME").ok()?),
+            None => dir.to_string(),
+        };
+        let lower = prefix.to_lowercase();
+        let mut items: Vec<(String, String)> = std::fs::read_dir(format!("{dir}/"))
+            .ok()?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let mut name = entry.file_name().into_string().ok()?;
+                // Hidden entries only once the prefix opts in with a dot.
+                if name.starts_with('.') && !prefix.starts_with('.') {
+                    return None;
+                }
+                if !name.to_lowercase().starts_with(&lower) || name == prefix {
+                    return None;
+                }
+                if entry.file_type().ok()?.is_dir() {
+                    name.push('/');
+                }
+                Some((name.clone(), name))
+            })
+            .collect();
+        items.sort();
+        items.truncate(50);
+        (!items.is_empty()).then(|| Completion {
+            items,
+            selected: 0,
+            prefix: prefix.to_string(),
+            auto: true,
+        })
     }
 
     fn lsp_sync(&mut self) {
@@ -1806,6 +1948,9 @@ impl Editor {
 
     /// Cursor position on screen as (column, row), or `None` if off-screen.
     pub fn screen_cursor(&self) -> Option<(u16, u16)> {
+        if self.help_scroll.is_some() {
+            return None; // the help window has no cursor
+        }
         if let Some(TreeInput::Create { name, .. } | TreeInput::Rename { name, .. }) =
             &self.tree_input
         {
@@ -2256,6 +2401,74 @@ mod tests {
         assert_eq!(editor.completion.as_ref().unwrap().items.len(), 1);
         press(&mut editor, "<tab>");
         assert_eq!(editor.doc().text.to_string(), "push");
+    }
+
+    #[test]
+    fn colon_help_opens_a_scrollable_window() {
+        let mut editor = editor_with("hello");
+        press(&mut editor, ": help <enter>");
+        assert_eq!(editor.help_scroll, Some(0));
+        press(&mut editor, "j j k");
+        assert_eq!(editor.help_scroll, Some(1));
+        press(&mut editor, "G");
+        let bottom = editor.help_scroll.unwrap();
+        assert!(bottom > 1, "G jumps to the end");
+        press(&mut editor, "j");
+        assert_eq!(editor.help_scroll, Some(bottom), "scroll clamps at the end");
+        press(&mut editor, "<esc>");
+        assert_eq!(editor.help_scroll, None);
+        assert_eq!(editor.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn ctrl_h_l_move_between_splits_before_the_tree() {
+        let mut editor = editor_with("hello");
+        editor.split_window(true);
+        let (wins, _) = editor.window_rects();
+        assert_eq!(wins.len(), 2);
+        let rightmost = wins.iter().max_by_key(|&&(_, (x, ..))| x).unwrap().0;
+        // Start from the rightmost window: C-h crosses the split first…
+        editor.focused = rightmost;
+        press(&mut editor, "C-h");
+        assert!(!editor.tree_focused, "split comes before the tree");
+        assert_ne!(editor.focused, rightmost);
+        // …and only the leftmost window opens the tree.
+        press(&mut editor, "C-h");
+        assert!(editor.tree_focused);
+        press(&mut editor, "C-l"); // back to the editor
+        assert!(!editor.tree_focused);
+        press(&mut editor, "C-l"); // and across to the right window
+        assert_eq!(editor.focused, rightmost);
+    }
+
+    #[test]
+    fn ctrl_h_focuses_the_tree_and_ctrl_l_returns() {
+        let mut editor = editor_with("hello");
+        press(&mut editor, "C-h");
+        assert!(editor.tree.is_some() && editor.tree_focused);
+        press(&mut editor, "C-l");
+        assert!(!editor.tree_focused);
+        assert!(editor.tree.is_some(), "tree stays open, just unfocused");
+        press(&mut editor, "C-h"); // already open: just refocus
+        assert!(editor.tree_focused);
+    }
+
+    #[test]
+    fn typing_a_path_pops_directory_completions() {
+        let dir = std::env::temp_dir().join("crow-path-completion-test");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        for c in format!("{}/", dir.display()).chars() {
+            editor.handle_key(Key::char(c));
+        }
+        let completion = editor.completion.as_ref().expect("path menu popped");
+        assert!(completion.items.iter().any(|(label, _)| label == "sub/"));
+        assert!(completion.items.iter().any(|(label, _)| label == "notes.txt"));
+        press(&mut editor, "n");
+        press(&mut editor, "<tab>");
+        assert!(editor.doc().text.to_string().ends_with("/notes.txt"));
     }
 
     #[test]

@@ -39,3 +39,15 @@ run = ["echo Hello from imlazy!"]
 [commands.test]
 desc = "Cargo test"
 run = ["cargo test"]
+
+[commands.check]
+desc = "Cargo check"
+run = ["cargo check"]
+
+[commands.install]
+desc = "Installs crow"
+run = ["sudo ./scripts/install.sh"]
+
+[commands.uninstall]
+desc = "Installs crow"
+run = ["sudo ./scripts/uninstall.sh"]
