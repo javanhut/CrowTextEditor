@@ -1,0 +1,41 @@
+# ImLazy configuration file
+
+[settings]
+# default = "build"  # Uncomment to set default command
+# parallel = false   # Enable parallel dependency execution
+# include = ["ci.toml"]  # Include other config files
+# env_file = [".env", ".env.local"]  # Dotenv files to load
+
+[variables]
+# name = "myproject"
+# output_dir = "bin"
+
+[env]
+# GO111MODULE = "on"
+
+[commands]
+
+[commands.example]
+desc = "An example command"
+run = ["echo Hello from imlazy!"]
+# alias = ["ex", "e"]  # Uncomment to add aliases
+# dep = []  # Add dependencies here
+# env = {}  # Add environment variables here
+# watch = ["**/*.go"]  # Watch patterns for watch mode
+# if_changed = ["src/**/*.go"]  # Only run if these files changed
+# dir = "subdir"  # Working directory for this command
+# timeout = "5m"  # Timeout for command execution
+# pre = ["lint"]  # Commands to run before
+# post = ["notify"]  # Commands to run after (on success)
+# retry = 2  # Number of retries on failure
+# retry_delay = "1s"  # Delay between retries
+
+# Platform-specific commands (use run.linux, run.darwin, run.windows)
+# [commands.build]
+# run.linux = ["go build -o app"]
+# run.darwin = ["go build -o app"]
+# run.windows = ["go build -o app.exe"]
+
+[commands.test]
+desc = "Cargo test"
+run = ["cargo test"]
