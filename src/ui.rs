@@ -706,7 +706,56 @@ fn render_prompt_popup(editor: &Editor, out: &mut impl Write) -> std::io::Result
     };
     let (x, y, w) = editor.prompt_rect();
     let prefix = if editor.mode == Mode::Command { ':' } else { '/' };
-    draw_popup(out, x, y, w, title, &format!(" {prefix}{}", editor.command_line))
+    draw_popup(out, x, y, w, title, &format!(" {prefix}{}", editor.command_line))?;
+
+    // Fuzzy command suggestions extend the prompt's box; Tab/arrows highlight.
+    if editor.mode == Mode::Command {
+        let suggestions = editor.command_suggestions();
+        if !suggestions.is_empty() {
+            let inner = (w as usize).saturating_sub(2);
+            let theme = crate::theme::current();
+            // The prompt's bottom border becomes a separator…
+            queue!(
+                out,
+                cursor::MoveTo(x, y + 2),
+                SetBackgroundColor(theme.popup_bg),
+                SetForegroundColor(theme.border),
+                Print(format!("├{}┤", "─".repeat(inner)))
+            )?;
+            // …the rows sit inside the same walls…
+            for (row, name) in suggestions.iter().enumerate() {
+                let doc = crate::commands::find(name).map(|c| c.doc).unwrap_or("");
+                let line: String = format!(" {name:<18} {doc}").chars().take(inner).collect();
+                queue!(
+                    out,
+                    cursor::MoveTo(x, y + 3 + row as u16),
+                    SetForegroundColor(theme.border),
+                    Print("│"),
+                    SetForegroundColor(theme.fg.unwrap_or(Color::Reset))
+                )?;
+                if editor.command_suggest == Some(row) {
+                    queue!(
+                        out,
+                        SetAttribute(Attribute::Reverse),
+                        Print(format!("{line:<inner$}")),
+                        SetAttribute(Attribute::Reset),
+                        SetBackgroundColor(theme.popup_bg)
+                    )?;
+                } else {
+                    queue!(out, Print(format!("{line:<inner$}")))?;
+                }
+                queue!(out, SetForegroundColor(theme.border), Print("│"))?;
+            }
+            // …and the box closes under the last row.
+            queue!(
+                out,
+                cursor::MoveTo(x, y + 3 + suggestions.len() as u16),
+                Print(format!("╰{}╯", "─".repeat(inner))),
+                ResetColor
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// The tree's create/delete prompts, in the same popup style.

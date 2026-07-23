@@ -31,7 +31,7 @@ fi
 if [ "$(uname)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
   if ! ls "$HOME/Library/Fonts" /Library/Fonts 2>/dev/null | grep -qi "JetBrainsMono.*Nerd"; then
     printf "Install JetBrains Mono Nerd Font (file-tree icons)? [y/N] "
-    read -r answer
+    read -r answer || answer="" # no stdin (imlazy): skip the font
     case "$answer" in
       y|Y) brew install --cask font-jetbrains-mono-nerd-font \
              && echo "Installed — select 'JetBrainsMono Nerd Font' in your terminal's settings." ;;

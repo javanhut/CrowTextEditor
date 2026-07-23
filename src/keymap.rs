@@ -53,14 +53,6 @@ impl Key {
         }
     }
 
-    pub fn ctrl(code: KeyCode) -> Self {
-        Key {
-            code,
-            ctrl: true,
-            alt: false,
-        }
-    }
-
     pub fn char(c: char) -> Self {
         Key::new(KeyCode::Char(c))
     }
@@ -271,7 +263,14 @@ mod tests {
     #[test]
     fn parses_plain_and_modified_keys() {
         assert_eq!(Key::parse("j"), Some(Key::char('j')));
-        assert_eq!(Key::parse("C-d"), Some(Key::ctrl(KeyCode::Char('d'))));
+        assert_eq!(
+            Key::parse("C-d"),
+            Some(Key {
+                code: KeyCode::Char('d'),
+                ctrl: true,
+                alt: false
+            })
+        );
         assert_eq!(Key::parse("<esc>"), Some(Key::new(KeyCode::Esc)));
         assert_eq!(
             Key::parse("A-x"),

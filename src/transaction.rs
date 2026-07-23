@@ -31,18 +31,10 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn new() -> Self {
-        Transaction { ops: Vec::new() }
-    }
-
     pub fn is_empty(&self) -> bool {
         self.ops
             .iter()
             .all(|op| matches!(op, Operation::Retain(_)))
-    }
-
-    pub fn ops(&self) -> &[Operation] {
-        &self.ops
     }
 
     /// Build a transaction from a set of changes over `text`.

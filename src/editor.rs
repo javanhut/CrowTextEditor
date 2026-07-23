@@ -378,6 +378,8 @@ pub struct Editor {
     pub completion: Option<Completion>,
     /// Scroll offset of the `:help` window; None when closed.
     pub help_scroll: Option<usize>,
+    /// Highlighted row of the `:` suggestion dropdown; None until Tab/arrows.
+    pub command_suggest: Option<usize>,
     /// The file tree sidebar, when visible.
     pub tree: Option<crate::filetree::FileTree>,
     /// Keys go to the tree instead of the buffer.
@@ -464,6 +466,7 @@ impl Editor {
             picker: None,
             completion: None,
             help_scroll: None,
+            command_suggest: None,
             tree: None,
             tree_focused: false,
             tree_leader: false,
@@ -821,6 +824,15 @@ impl Editor {
         let clamp = |s: usize| Some(s.min(max));
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.help_scroll = None,
+            // The focus keys work from here too: close, then move.
+            KeyCode::Char('h') | KeyCode::Left if key.ctrl => {
+                self.help_scroll = None;
+                (crate::commands::find("focus_left").unwrap().func)(self);
+            }
+            KeyCode::Char('l') | KeyCode::Right if key.ctrl => {
+                self.help_scroll = None;
+                (crate::commands::find("focus_right").unwrap().func)(self);
+            }
             KeyCode::Up | KeyCode::Char('k') => self.help_scroll = clamp(scroll.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => self.help_scroll = clamp(scroll + 1),
             KeyCode::Char('d') if key.ctrl => self.help_scroll = clamp(scroll + visible / 2),
@@ -839,21 +851,70 @@ impl Editor {
         match key.code {
             KeyCode::Esc => {
                 self.command_line.clear();
+                self.command_suggest = None;
                 self.mode = Mode::Normal;
             }
             KeyCode::Enter => {
-                let line = std::mem::take(&mut self.command_line);
+                // A highlighted suggestion wins; otherwise the line as typed.
+                let line = match self.command_suggest.take() {
+                    Some(i) => self
+                        .command_suggestions()
+                        .into_iter()
+                        .nth(i)
+                        .unwrap_or_else(|| std::mem::take(&mut self.command_line)),
+                    None => std::mem::take(&mut self.command_line),
+                };
+                self.command_line.clear();
                 self.mode = Mode::Normal;
                 self.execute_command(&line);
             }
+            KeyCode::Tab | KeyCode::Down => {
+                let n = self.command_suggestions().len();
+                if n > 0 {
+                    self.command_suggest = Some(self.command_suggest.map_or(0, |i| (i + 1) % n));
+                }
+            }
+            KeyCode::Up => {
+                let n = self.command_suggestions().len();
+                if n > 0 {
+                    self.command_suggest =
+                        Some(self.command_suggest.map_or(n - 1, |i| (i + n - 1) % n));
+                }
+            }
             KeyCode::Backspace => {
+                self.command_suggest = None;
                 if self.command_line.pop().is_none() {
                     self.mode = Mode::Normal;
                 }
             }
-            KeyCode::Char(c) if !key.ctrl && !key.alt => self.command_line.push(c),
+            KeyCode::Char(c) if !key.ctrl && !key.alt => {
+                self.command_suggest = None;
+                self.command_line.push(c);
+            }
             _ => {}
         }
+    }
+
+    /// Fuzzy matches for the command word being typed at the `:` prompt.
+    /// Empty once an argument starts — only the command itself completes.
+    pub fn command_suggestions(&self) -> Vec<String> {
+        let line = &self.command_line;
+        if line.is_empty() || line.contains(' ') || line.chars().all(|c| c.is_ascii_digit()) {
+            return Vec::new();
+        }
+        const BUILTINS: &[&str] =
+            &["w", "q", "q!", "wq", "e", "fmt", "bn", "bp", "theme", "config", "help"];
+        let mut scored: Vec<(i64, String)> = BUILTINS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(crate::commands::COMMANDS.iter().map(|c| c.name.to_string()))
+            .filter_map(|name| {
+                crate::picker::fuzzy_score(line, &name).map(|score| (score, name))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.truncate(8);
+        scored.into_iter().map(|(_, name)| name).collect()
     }
 
     // ---- search ------------------------------------------------------------
@@ -1065,11 +1126,15 @@ impl Editor {
             return;
         };
         match key.code {
-            KeyCode::Esc => {
-                if let Kind::Theme { original } = &picker.kind {
-                    crate::theme::set(original);
-                }
-                self.close_picker();
+            KeyCode::Esc => self.picker_cancel(),
+            // The focus keys work from here too: cancel, then move.
+            KeyCode::Char('h') | KeyCode::Left if key.ctrl => {
+                self.picker_cancel();
+                (crate::commands::find("focus_left").unwrap().func)(self);
+            }
+            KeyCode::Char('l') | KeyCode::Right if key.ctrl => {
+                self.picker_cancel();
+                (crate::commands::find("focus_right").unwrap().func)(self);
             }
             KeyCode::Enter => self.picker_accept(),
             KeyCode::Down => self.picker_move(1),
@@ -1095,6 +1160,16 @@ impl Editor {
             }
             _ => {}
         }
+    }
+
+    /// Close the picker without accepting, undoing any live theme preview.
+    fn picker_cancel(&mut self) {
+        if let Some(picker) = &self.picker {
+            if let crate::picker::Kind::Theme { original } = &picker.kind {
+                crate::theme::set(original);
+            }
+        }
+        self.close_picker();
     }
 
     fn picker_move(&mut self, delta: isize) {
@@ -2404,6 +2479,39 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_h_closes_the_picker_and_moves_focus() {
+        let mut editor = editor_with("hello");
+        press(&mut editor, "<space> f");
+        assert_eq!(editor.mode, Mode::Picker);
+        press(&mut editor, "C-h");
+        assert!(editor.picker.is_none());
+        assert!(editor.tree_focused);
+    }
+
+    #[test]
+    fn command_bar_suggests_and_tab_enter_runs_the_pick() {
+        let mut editor = editor_with("hello");
+        press(&mut editor, ":");
+        press(&mut editor, "qui");
+        let suggestions = editor.command_suggestions();
+        assert_eq!(suggestions.first().map(String::as_str), Some("quit"));
+        assert_eq!(editor.command_suggest, None, "nothing highlighted until Tab");
+        press(&mut editor, "<tab>");
+        assert_eq!(editor.command_suggest, Some(0));
+        press(&mut editor, "<enter>");
+        assert!(editor.should_quit, "Enter runs the highlighted suggestion");
+    }
+
+    #[test]
+    fn plain_enter_runs_the_typed_line_not_a_suggestion() {
+        let mut editor = editor_with("hello");
+        press(&mut editor, ":");
+        press(&mut editor, "42 <enter>"); // line jump: digits never suggest
+        assert!(!editor.should_quit);
+        assert_eq!(editor.mode, Mode::Normal);
+    }
+
+    #[test]
     fn colon_help_opens_a_scrollable_window() {
         let mut editor = editor_with("hello");
         press(&mut editor, ": help <enter>");
@@ -2418,6 +2526,12 @@ mod tests {
         press(&mut editor, "<esc>");
         assert_eq!(editor.help_scroll, None);
         assert_eq!(editor.mode, Mode::Normal);
+
+        // C-h closes the window and moves focus in one press.
+        press(&mut editor, ": help <enter>");
+        press(&mut editor, "C-h");
+        assert_eq!(editor.help_scroll, None);
+        assert!(editor.tree_focused);
     }
 
     #[test]

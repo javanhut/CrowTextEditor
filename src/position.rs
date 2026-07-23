@@ -59,18 +59,6 @@ pub fn display_col_to_char(line: RopeSlice, target_col: usize, tab_width: usize)
     line_len_without_newline(line)
 }
 
-/// Total display width of a line, excluding its line ending.
-pub fn line_display_width(line: RopeSlice, tab_width: usize) -> usize {
-    let mut col = 0usize;
-    for c in line.chars() {
-        if c == '\n' || c == '\r' {
-            break;
-        }
-        col += char_width(c, col, tab_width);
-    }
-    col
-}
-
 /// Length of a line in chars, not counting `\n` or `\r\n`.
 pub fn line_len_without_newline(line: RopeSlice) -> usize {
     let mut len = line.len_chars();
@@ -192,7 +180,7 @@ mod tests {
     fn wide_chars_take_two_columns() {
         let rope = Rope::from_str("日本語");
         let line = rope.line(0);
-        assert_eq!(line_display_width(line, 4), 6);
+        assert_eq!(char_to_display_col(line, 3, 4), 6);
         assert_eq!(char_to_display_col(line, 2, 4), 4);
     }
 
@@ -201,7 +189,7 @@ mod tests {
         // "e" followed by U+0301 COMBINING ACUTE ACCENT renders as one column.
         let rope = Rope::from_str("e\u{0301}x");
         let line = rope.line(0);
-        assert_eq!(line_display_width(line, 4), 2);
+        assert_eq!(char_to_display_col(line, 3, 4), 2);
     }
 
     #[test]

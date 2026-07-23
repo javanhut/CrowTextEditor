@@ -46,8 +46,8 @@ run = ["cargo check"]
 
 [commands.install]
 desc = "Installs crow"
-run = ["sudo ./scripts/install.sh"]
+run = ["./scripts/install.sh"]
 
 [commands.uninstall]
-desc = "Installs crow"
-run = ["sudo ./scripts/uninstall.sh"]
+desc = "Uninstalls crow"
+run = ["./scripts/uninstall.sh"]

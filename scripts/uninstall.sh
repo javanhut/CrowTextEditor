@@ -14,7 +14,7 @@ fi
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/crow"
 if [ -d "$CONFIG_DIR" ]; then
   printf "Also remove your config at %s? [y/N] " "$CONFIG_DIR"
-  read -r answer
+  read -r answer || answer="" # no stdin (imlazy): keep the config
   case "$answer" in
     y|Y) rm -r "$CONFIG_DIR"; echo "Removed $CONFIG_DIR" ;;
     *) echo "Kept $CONFIG_DIR" ;;
