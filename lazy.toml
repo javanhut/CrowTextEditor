@@ -36,6 +36,10 @@ run = ["echo Hello from imlazy!"]
 # run.darwin = ["go build -o app"]
 # run.windows = ["go build -o app.exe"]
 
+[commands.run]
+desc = "Runs the code using cargo run"
+run = ["cargo run"]
+
 [commands.test]
 desc = "Cargo test"
 run = ["cargo test"]
