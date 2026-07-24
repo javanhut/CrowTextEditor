@@ -984,20 +984,31 @@ impl Editor {
                 self.mode = Mode::Normal;
             }
             KeyCode::Enter => {
-                // A highlighted suggestion wins; otherwise the line as typed.
-                let line = match self.command_suggest.take() {
-                    Some(i) => self
-                        .command_suggestions()
-                        .into_iter()
-                        .nth(i)
-                        .unwrap_or_else(|| std::mem::take(&mut self.command_line)),
-                    None => std::mem::take(&mut self.command_line),
-                };
-                self.command_line.clear();
+                // Exactly what's in the bar — a highlighted suggestion has
+                // to be Tab-accepted first, so Enter never runs something
+                // you didn't put there.
+                self.command_suggest = None;
+                let line = std::mem::take(&mut self.command_line);
                 self.mode = Mode::Normal;
                 self.execute_command(&line);
             }
-            KeyCode::Tab | KeyCode::Down => {
+            // First Tab highlights the top suggestion, a second Tab puts it
+            // in the bar (trailing space, ready for an argument); Up/Down
+            // pick a different one in between.
+            KeyCode::Tab => match self.command_suggest {
+                Some(i) => {
+                    if let Some(pick) = self.command_suggestions().into_iter().nth(i) {
+                        self.command_line = format!("{pick} ");
+                    }
+                    self.command_suggest = None;
+                }
+                None => {
+                    if !self.command_suggestions().is_empty() {
+                        self.command_suggest = Some(0);
+                    }
+                }
+            },
+            KeyCode::Down => {
                 let n = self.command_suggestions().len();
                 if n > 0 {
                     self.command_suggest = Some(self.command_suggest.map_or(0, |i| (i + 1) % n));
@@ -3105,7 +3116,7 @@ mod tests {
     }
 
     #[test]
-    fn command_bar_suggests_and_tab_enter_runs_the_pick() {
+    fn command_bar_tab_completes_into_the_bar_and_enter_submits() {
         let mut editor = editor_with("hello");
         press(&mut editor, ":");
         press(&mut editor, "qui");
@@ -3117,8 +3128,27 @@ mod tests {
         );
         press(&mut editor, "<tab>");
         assert_eq!(editor.command_suggest, Some(0));
+        assert!(!editor.should_quit, "highlighting never runs anything");
+        press(&mut editor, "<tab>");
+        assert_eq!(editor.command_line, "quit ", "second Tab fills the bar");
+        assert_eq!(editor.command_suggest, None);
         press(&mut editor, "<enter>");
-        assert!(editor.should_quit, "Enter runs the highlighted suggestion");
+        assert!(editor.should_quit, "Enter submits what's in the bar");
+    }
+
+    #[test]
+    fn command_bar_completion_leaves_room_for_an_argument() {
+        let mut editor = editor_with("hello");
+        press(&mut editor, ":");
+        for c in "lsp-inst".chars() {
+            editor.handle_key(Key::char(c));
+        }
+        // Down cycles the highlight; Tab accepts it into the bar.
+        press(&mut editor, "<down> <tab>");
+        assert_eq!(editor.command_line, "lsp-install ");
+        assert_eq!(editor.mode, Mode::Command, "still editing, not submitted");
+        press(&mut editor, "rs");
+        assert_eq!(editor.command_line, "lsp-install rs");
     }
 
     #[test]

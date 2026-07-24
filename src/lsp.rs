@@ -238,8 +238,11 @@ impl Client {
             // server never stalls waiting on us.
             (Some(m), Some(id)) => {
                 let result = if m == "workspace/configuration" {
+                    // An empty object per item, not null: "no settings, use
+                    // your defaults". Taplo treats a null here as a failed
+                    // config fetch and excludes every document.
                     let n = msg["params"]["items"].as_array().map_or(0, Vec::len);
-                    Value::Array(vec![Value::Null; n])
+                    Value::Array(vec![json!({}); n])
                 } else {
                     Value::Null
                 };
