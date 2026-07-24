@@ -137,6 +137,44 @@ const BUILTIN_FMT: &[(&str, &str)] = &[
     ("yaml", "prettier --stdin-filepath {file}"),
 ];
 
+/// Built-in language servers by file extension, used when crow.toml's [lsp]
+/// section has no entry for the extension. Every one has an `:install` entry.
+const BUILTIN_LSP: &[(&str, &str)] = &[
+    ("rs", "rust-analyzer"),
+    ("py", "pyright-langserver --stdio"),
+    ("go", "gopls"),
+    ("js", "typescript-language-server --stdio"),
+    ("jsx", "typescript-language-server --stdio"),
+    ("mjs", "typescript-language-server --stdio"),
+    ("cjs", "typescript-language-server --stdio"),
+    ("ts", "typescript-language-server --stdio"),
+    ("mts", "typescript-language-server --stdio"),
+    ("tsx", "typescript-language-server --stdio"),
+    ("c", "clangd"),
+    ("h", "clangd"),
+    ("cpp", "clangd"),
+    ("hpp", "clangd"),
+    ("cc", "clangd"),
+    ("cxx", "clangd"),
+    ("hh", "clangd"),
+    ("sh", "bash-language-server start"),
+    ("bash", "bash-language-server start"),
+    ("lua", "lua-language-server"),
+    ("zig", "zls"),
+    ("toml", "taplo lsp stdio"),
+    ("yml", "yaml-language-server --stdio"),
+    ("yaml", "yaml-language-server --stdio"),
+    ("json", "vscode-json-language-server --stdio"),
+    ("css", "vscode-css-language-server --stdio"),
+    ("html", "vscode-html-language-server --stdio"),
+    ("htm", "vscode-html-language-server --stdio"),
+];
+
+/// The built-in language server command for a file extension.
+pub fn builtin_lsp(ext: &str) -> Option<&'static str> {
+    BUILTIN_LSP.iter().find(|(e, _)| *e == ext).map(|(_, c)| *c)
+}
+
 /// How to install a missing tool, keyed by the program :fmt or the LSP
 /// tries to spawn. Powers `:install` and the "install? (y/N)" offer.
 /// ponytail: macOS-first (brew/rustup/npm); add a Linux column when crow
@@ -153,6 +191,7 @@ const INSTALLERS: &[(&str, &str)] = &[
     ("stylua", "brew install stylua"),
     ("taplo", "brew install taplo"),
     ("clang-format", "brew install clang-format"),
+    ("clangd", "brew install llvm"),
     ("zig", "brew install zig"),
     ("pyright-langserver", "npm install -g pyright"),
     (

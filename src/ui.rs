@@ -181,6 +181,12 @@ fn render_window(
         curs = extra.iter().map(|&(_, c)| c.min(len)).collect();
     }
 
+    let manifest_badges = !editor.crate_info.is_empty()
+        && doc
+            .path
+            .as_ref()
+            .is_some_and(|p| p.file_name().is_some_and(|n| n == "Cargo.toml"));
+
     let theme = crate::theme::current();
     // Reset foreground only (`Color::Reset`) so the theme background, once
     // set for a row, survives every color change within it.
@@ -273,6 +279,69 @@ fn render_window(
             }
             if attrs & crate::syntax::ITALIC != 0 {
                 queue!(out, SetAttribute(Attribute::NoItalic))?;
+            }
+        }
+        // Cargo.toml: the dependency's locked version, and the newer one on
+        // crates.io when there is one — like the diagnostics, virtual text.
+        if manifest_badges {
+            let key: String = {
+                let head: String = doc.line(line_idx).chars().take(64).collect();
+                let key = head.split_once('=').map(|(k, _)| k).unwrap_or("");
+                let key = key.trim().trim_matches('"');
+                key.split('.').next().unwrap_or(key).to_string()
+            };
+            if let Some((locked, latest)) = editor.crate_info.get(&key) {
+                let mut avail = width.saturating_sub(printed);
+                let mut badge = |text: String, color: Color| -> std::io::Result<()> {
+                    let w = display_width(&text);
+                    if w < avail {
+                        avail -= w;
+                        printed += w;
+                        queue!(out, SetForegroundColor(color), Print(text))?;
+                    }
+                    Ok(())
+                };
+                if let Some(l) = locked {
+                    badge(format!("  ✓ {l}"), Color::Cyan)?;
+                }
+                let newer = match (locked, latest) {
+                    (Some(l), Some(n)) => {
+                        crate::crates::semver_key(n) > crate::crates::semver_key(l)
+                    }
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if newer {
+                    badge(format!("  ↑ {}", latest.as_deref().unwrap()), Color::Yellow)?;
+                }
+            }
+        }
+
+        // The line's worst diagnostic, inline after the text (virtual text).
+        let inline = diags
+            .iter()
+            .filter(|d| d.line == line_idx)
+            .min_by_key(|d| d.severity);
+        if let Some(d) = inline {
+            let avail = width.saturating_sub(printed);
+            if avail > 8 {
+                let mut text = String::from("  ■ ");
+                let mut w = display_width(&text);
+                for ch in d.message.chars() {
+                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if w + cw > avail {
+                        break;
+                    }
+                    text.push(ch);
+                    w += cw;
+                }
+                printed += w;
+                let color = if d.severity == 1 {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                };
+                queue!(out, SetForegroundColor(color), Print(text))?;
             }
         }
         // Pad to the window edge; UntilNewLine would bleed into a neighbour.
@@ -408,6 +477,34 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         Print(&file)
     )?;
 
+    // Diagnostic counts for this buffer: ● errors, ▲ warnings.
+    let (errs, warns) = doc
+        .path
+        .as_ref()
+        .and_then(|p| p.canonicalize().ok())
+        .and_then(|p| editor.diagnostics.get(&p))
+        .map(|ds| {
+            ds.iter().fold((0usize, 0usize), |(e, w), d| {
+                if d.severity == 1 {
+                    (e + 1, w)
+                } else {
+                    (e, w + 1)
+                }
+            })
+        })
+        .unwrap_or((0, 0));
+    let mut diag_w = 0;
+    if errs > 0 {
+        let s = format!(" ● {errs}");
+        diag_w += s.chars().count();
+        queue!(out, SetForegroundColor(Color::Red), Print(s))?;
+    }
+    if warns > 0 {
+        let s = format!(" ▲ {warns}");
+        diag_w += s.chars().count();
+        queue!(out, SetForegroundColor(Color::Yellow), Print(s))?;
+    }
+
     // Right side: transient input state, then the pills.
     let reg = match (editor.awaiting_register, editor.active_register) {
         (true, _) => "\"".to_string(),
@@ -442,7 +539,7 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         ((line + 1) * 100 / doc.line_count().max(1)).min(100)
     );
 
-    let left_w = 2 + label.chars().count() + lsep.chars().count() + file.chars().count();
+    let left_w = 2 + label.chars().count() + lsep.chars().count() + file.chars().count() + diag_w;
     let right_w =
         info.chars().count() + rsep.chars().count() * 2 + pos.chars().count() + pct.chars().count();
     if left_w + right_w < width {
@@ -901,7 +998,7 @@ fn render_completion(editor: &Editor, out: &mut impl Write) -> std::io::Result<(
         };
         let line: String = format!(" {label}").chars().take(width).collect();
         queue!(out, cursor::MoveTo(x, top + row as u16))?;
-        if start + row == completion.selected {
+        if completion.navigated && start + row == completion.selected {
             queue!(
                 out,
                 SetAttribute(Attribute::Reverse),

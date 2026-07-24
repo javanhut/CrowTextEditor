@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod crates;
 mod document;
 mod editor;
 mod filetree;
@@ -117,6 +118,9 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
             dirty = true;
         }
         if editor.install_tick() {
+            dirty = true;
+        }
+        if editor.crates_tick() {
             dirty = true;
         }
 

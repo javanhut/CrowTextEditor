@@ -128,6 +128,7 @@ impl Key {
                 "enter" | "cr" | "return" => KeyCode::Enter,
                 "bs" | "backspace" => KeyCode::Backspace,
                 "tab" => KeyCode::Tab,
+                "backtab" | "s-tab" => KeyCode::BackTab,
                 "del" | "delete" => KeyCode::Delete,
                 "left" => KeyCode::Left,
                 "right" => KeyCode::Right,

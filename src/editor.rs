@@ -37,9 +37,10 @@ pub struct Completion {
     pub selected: usize,
     /// The word before the cursor when the menu appeared.
     pub prefix: String,
-    /// Popped up on its own while typing (buffer words). Auto menus accept
-    /// with Tab only — Enter stays a newline, so typing is never hijacked.
-    pub auto: bool,
+    /// The user has stepped into the list (Tab/S-Tab/arrows). Until then a
+    /// menu that popped up on its own highlights nothing and Enter stays a
+    /// newline, so typing is never hijacked; LSP menus start navigated.
+    pub navigated: bool,
 }
 
 /// A window's saved view state. The focused window's state lives in its
@@ -404,10 +405,19 @@ pub struct Editor {
     /// Terminal size as (columns, rows).
     pub size: (u16, u16),
     pub keymaps: Keymaps,
+    /// A `.`/`::` was just typed: ask the server for members on the next
+    /// tick, after the edit has been synced.
+    lsp_completion_pending: bool,
     /// A "not installed — run `…`? (y/N)" offer; the next keypress answers it.
     pub pending_install: Option<(String, String)>,
     /// A background install in flight: (program, its result channel).
     install: Option<(String, std::sync::mpsc::Receiver<Result<(), String>>)>,
+    /// Cargo.toml badges: crate name -> (locked version, latest on crates.io).
+    pub crate_info: HashMap<String, (Option<String>, Option<String>)>,
+    /// The in-flight crates.io fetch, streaming one crate per message.
+    crates_rx: Option<std::sync::mpsc::Receiver<crate::crates::Info>>,
+    /// A fetch was started; one per session is enough.
+    crates_fetched: bool,
 }
 
 impl Editor {
@@ -492,8 +502,12 @@ impl Editor {
             size,
             keymaps,
             lsp_table: config.lsp.clone(),
+            lsp_completion_pending: false,
             pending_install: None,
             install: None,
+            crate_info: HashMap::new(),
+            crates_rx: None,
+            crates_fetched: false,
         })
     }
 
@@ -1211,7 +1225,9 @@ impl Editor {
             table
                 .iter()
                 .find(|(e, _)| e == name)
-                .and_then(|(_, c)| c.split_whitespace().next().map(str::to_string))
+                .map(|(_, c)| c.as_str())
+                .or_else(|| crate::config::builtin_lsp(name))
+                .and_then(|c| c.split_whitespace().next().map(str::to_string))
         };
         let program = if crate::config::installer(name).is_some() {
             Some(name.to_string())
@@ -1307,6 +1323,44 @@ impl Editor {
             Err(e) => self.set_status(format!("{program}: install failed — {e}")),
         }
         true
+    }
+
+    // ---- crate versions ----------------------------------------------------
+
+    /// Poll the crates.io fetch from the main loop, starting it the first
+    /// time a Cargo.toml is among the open buffers. True on new badges.
+    pub fn crates_tick(&mut self) -> bool {
+        if !self.crates_fetched {
+            let manifest = self.documents.iter().find(|d| {
+                d.path
+                    .as_ref()
+                    .is_some_and(|p| p.file_name().is_some_and(|n| n == "Cargo.toml"))
+            });
+            if let Some(doc) = manifest {
+                self.crates_fetched = true;
+                let (tx, rx) = std::sync::mpsc::channel();
+                crate::crates::fetch(doc.path.clone().unwrap(), doc.text.to_string(), tx);
+                self.crates_rx = Some(rx);
+            }
+        }
+        let Some(rx) = self.crates_rx.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        loop {
+            match rx.try_recv() {
+                Ok((name, locked, latest)) => {
+                    self.crate_info.insert(name, (locked, latest));
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.crates_rx = None;
+                    break;
+                }
+            }
+        }
+        changed
     }
 
     // ---- paste -------------------------------------------------------------
@@ -1810,12 +1864,18 @@ impl Editor {
         let Some(completion) = self.completion.as_mut() else {
             return false;
         };
+        let next = |c: &mut Completion| {
+            c.selected = (c.selected + 1) % c.items.len();
+        };
+        let prev = |c: &mut Completion| {
+            c.selected = (c.selected + c.items.len() - 1) % c.items.len();
+        };
         match key.code {
-            KeyCode::Enter if completion.auto => {
+            KeyCode::Enter if !completion.navigated => {
                 self.completion = None;
                 false // the newline happens normally
             }
-            KeyCode::Tab | KeyCode::Enter => {
+            KeyCode::Enter => {
                 self.completion_accept();
                 true
             }
@@ -1823,23 +1883,49 @@ impl Editor {
                 self.completion = None;
                 true
             }
+            // Tab steps into the list (first press selects the top item),
+            // then Tab/S-Tab cycle; Enter accepts.
+            KeyCode::Tab => {
+                if completion.navigated {
+                    next(completion);
+                } else {
+                    completion.navigated = true;
+                }
+                true
+            }
+            KeyCode::BackTab => {
+                if completion.navigated {
+                    prev(completion);
+                } else {
+                    completion.navigated = true;
+                }
+                true
+            }
             KeyCode::Down => {
-                completion.selected = (completion.selected + 1) % completion.items.len();
+                completion.navigated = true;
+                next(completion);
                 true
             }
             KeyCode::Up => {
-                completion.selected =
-                    (completion.selected + completion.items.len() - 1) % completion.items.len();
+                completion.navigated = true;
+                prev(completion);
                 true
             }
             KeyCode::Char('n') if key.ctrl => {
-                completion.selected = (completion.selected + 1) % completion.items.len();
+                completion.navigated = true;
+                next(completion);
                 true
             }
             KeyCode::Char('p') if key.ctrl => {
-                completion.selected =
-                    (completion.selected + completion.items.len() - 1) % completion.items.len();
+                completion.navigated = true;
+                prev(completion);
                 true
+            }
+            KeyCode::Char('.' | ':') if !key.ctrl && !key.alt => {
+                // Member access ends this menu; `insert_typed` sees the key
+                // and asks the language server for the members.
+                self.completion = None;
+                false
             }
             KeyCode::Char('/') if !key.ctrl && !key.alt => {
                 // A slash ends the current word; for paths it descends, so
@@ -1929,6 +2015,21 @@ impl Editor {
     /// may have changed, so the main loop knows a redraw is needed.
     pub fn lsp_tick(&mut self) -> bool {
         self.lsp_sync();
+        if std::mem::take(&mut self.lsp_completion_pending) && self.mode == Mode::Insert {
+            if let Some(path) = self.doc().path.clone() {
+                let (line, col) = self.doc().cursor_line_col();
+                let utf16_col = crate::position::char_to_utf16(self.doc().line(line), col);
+                if let Some(lsp) = self.lsp.as_mut() {
+                    lsp.request_position(
+                        "completion",
+                        "textDocument/completion",
+                        &path,
+                        line,
+                        utf16_col,
+                    );
+                }
+            }
+        }
         let Some(lsp) = self.lsp.as_mut() else {
             return false;
         };
@@ -1973,7 +2074,9 @@ impl Editor {
                 items,
                 selected: 0,
                 prefix,
-                auto: false,
+                // The server was asked (C-space or a `::`/`.` trigger):
+                // the list is the point, so Enter accepts right away.
+                navigated: true,
             });
         }
     }
@@ -2040,9 +2143,21 @@ impl Editor {
             }
         }
 
+        let prev = {
+            let doc = self.doc();
+            (doc.cursor > 0).then(|| doc.text.char(doc.cursor - 1))
+        };
         self.doc_mut().insert_at_cursor(&c.to_string());
         if c.is_alphanumeric() || c == '_' || c == '/' {
             self.maybe_autocomplete();
+        }
+        // Member access: `.` or a second `:` asks the server what's inside.
+        // Deferred to `lsp_tick` so the request follows this edit's didChange.
+        // A digit before the dot is a float literal, not member access.
+        let member_dot = c == '.' && !prev.is_some_and(|p| p.is_ascii_digit());
+        if self.lsp.is_some() && (member_dot || (c == ':' && prev == Some(':'))) {
+            self.completion = None;
+            self.lsp_completion_pending = true;
         }
     }
 
@@ -2067,7 +2182,7 @@ impl Editor {
                 items,
                 selected: 0,
                 prefix,
-                auto: true,
+                navigated: false,
             });
         }
     }
@@ -2158,7 +2273,7 @@ impl Editor {
             items,
             selected: 0,
             prefix: prefix.to_string(),
-            auto: true,
+            navigated: false,
         })
     }
 
@@ -2336,13 +2451,15 @@ impl Editor {
     }
 }
 
-/// The configured server command for a file, by extension.
+/// The server command for a file, by extension: crow.toml's [lsp] entries
+/// first, then the built-in table.
 fn server_for<'a>(table: &'a [(String, String)], path: &Path) -> Option<&'a str> {
     let ext = path.extension()?.to_str()?;
     table
         .iter()
         .find(|(e, _)| e == ext)
         .map(|(_, cmd)| cmd.as_str())
+        .or_else(|| crate::config::builtin_lsp(ext))
 }
 
 #[cfg(test)]
@@ -2730,9 +2847,27 @@ mod tests {
             ("print!".into(), "print!".into()),
         ]);
         assert_eq!(editor.completion.as_ref().unwrap().items.len(), 2);
-        press(&mut editor, "<tab>");
+        press(&mut editor, "<enter>");
         assert_eq!(editor.doc().text.to_string(), "println!");
         assert!(editor.completion.is_none());
+    }
+
+    #[test]
+    fn tab_and_shift_tab_cycle_the_completion_menu() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "p");
+        editor.show_completions(vec![
+            ("print!".into(), "print!".into()),
+            ("push".into(), "push".into()),
+        ]);
+        // An LSP menu starts navigated: Tab advances, S-Tab goes back.
+        press(&mut editor, "<tab>");
+        assert_eq!(editor.completion.as_ref().unwrap().selected, 1);
+        press(&mut editor, "<backtab>");
+        assert_eq!(editor.completion.as_ref().unwrap().selected, 0);
+        press(&mut editor, "<tab> <enter>");
+        assert_eq!(editor.doc().text.to_string(), "push");
     }
 
     #[test]
@@ -2747,7 +2882,7 @@ mod tests {
         press(&mut editor, "u"); // types through the menu
         assert_eq!(editor.doc().text.to_string(), "pu");
         assert_eq!(editor.completion.as_ref().unwrap().items.len(), 1);
-        press(&mut editor, "<tab>");
+        press(&mut editor, "<enter>");
         assert_eq!(editor.doc().text.to_string(), "push");
     }
 
@@ -2942,7 +3077,7 @@ mod tests {
             .iter()
             .any(|(label, _)| label == "notes.txt"));
         press(&mut editor, "n");
-        press(&mut editor, "<tab>");
+        press(&mut editor, "<tab> <enter>");
         assert!(editor.doc().text.to_string().ends_with("/notes.txt"));
     }
 
@@ -2953,9 +3088,10 @@ mod tests {
         press(&mut editor, "<space>");
         press(&mut editor, "pri"); // two identifier chars trigger the menu
         let completion = editor.completion.as_ref().expect("menu popped");
-        assert!(completion.auto);
+        assert!(!completion.navigated);
         assert_eq!(completion.items[0].0, "printer");
-        press(&mut editor, "<tab>");
+        // Tab steps into the list, Enter accepts.
+        press(&mut editor, "<tab> <enter>");
         assert_eq!(editor.doc().text.to_string(), "printer value printer");
     }
 
