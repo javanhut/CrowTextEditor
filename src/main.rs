@@ -1,6 +1,6 @@
 mod commands;
 mod config;
-mod crates;
+mod deps;
 mod document;
 mod editor;
 mod filetree;
@@ -36,6 +36,7 @@ USAGE:
 KEYS (normal mode):
     h j k l      move            i a I A o O   insert
     w b e        select word     d c y p P     delete/change/yank/paste
+    dd           delete line (into the register, so p pastes it)
     x v ;        select line, extend mode,     collapse selection
     C A-C  ,     add cursor below/above, drop  extra cursors
     A-o          expand selection to syntax node
@@ -120,7 +121,7 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
         if editor.install_tick() {
             dirty = true;
         }
-        if editor.crates_tick() {
+        if editor.deps_tick() {
             dirty = true;
         }
 

@@ -37,6 +37,7 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     render_tree_prompt(editor, out)?;
     render_picker(editor, out)?;
     render_completion(editor, out)?;
+    render_hover(editor, out)?;
     render_pending_keys(editor, out)?;
     render_help(editor, out)?;
 
@@ -181,11 +182,15 @@ fn render_window(
         curs = extra.iter().map(|&(_, c)| c.min(len)).collect();
     }
 
-    let manifest_badges = !editor.crate_info.is_empty()
-        && doc
-            .path
-            .as_ref()
-            .is_some_and(|p| p.file_name().is_some_and(|n| n == "Cargo.toml"));
+    let manifest_kind = (!editor.dep_info.is_empty())
+        .then(|| {
+            doc.path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .and_then(crate::deps::manifest_kind)
+        })
+        .flatten();
 
     let theme = crate::theme::current();
     // Reset foreground only (`Color::Reset`) so the theme background, once
@@ -281,16 +286,14 @@ fn render_window(
                 queue!(out, SetAttribute(Attribute::NoItalic))?;
             }
         }
-        // Cargo.toml: the dependency's locked version, and the newer one on
-        // crates.io when there is one — like the diagnostics, virtual text.
-        if manifest_badges {
-            let key: String = {
-                let head: String = doc.line(line_idx).chars().take(64).collect();
-                let key = head.split_once('=').map(|(k, _)| k).unwrap_or("");
-                let key = key.trim().trim_matches('"');
-                key.split('.').next().unwrap_or(key).to_string()
-            };
-            if let Some((locked, latest)) = editor.crate_info.get(&key) {
+        // Package manifests: the dependency's current version, and the newer
+        // one on its registry when there is one — like the diagnostics,
+        // virtual text.
+        if let Some(kind) = manifest_kind {
+            let head: String = doc.line(line_idx).chars().take(200).collect();
+            let dep = crate::deps::line_dep(kind, &head)
+                .and_then(|name| editor.dep_info.get(&(kind, name)));
+            if let Some((locked, latest)) = dep {
                 let mut avail = width.saturating_sub(printed);
                 let mut badge = |text: String, color: Color| -> std::io::Result<()> {
                     let w = display_width(&text);
@@ -305,9 +308,7 @@ fn render_window(
                     badge(format!("  ✓ {l}"), Color::Cyan)?;
                 }
                 let newer = match (locked, latest) {
-                    (Some(l), Some(n)) => {
-                        crate::crates::semver_key(n) > crate::crates::semver_key(l)
-                    }
+                    (Some(l), Some(n)) => crate::deps::semver_key(n) > crate::deps::semver_key(l),
                     (None, Some(_)) => true,
                     _ => false,
                 };
@@ -1014,7 +1015,137 @@ fn render_completion(editor: &Editor, out: &mut impl Write) -> std::io::Result<(
             )?;
         }
     }
+
+    // Docs for the highlighted item, in a panel beside the menu — signature
+    // and description straight from the language server.
+    if completion.navigated {
+        let doc = completion
+            .items
+            .get(completion.selected)
+            .and_then(|(label, _)| completion.docs.get(label))
+            .filter(|d| !d.is_empty()); // empty = resolve still in flight
+        if let Some(doc) = doc {
+            let text_w = 44;
+            let mut rows = Vec::new();
+            for line in doc.lines() {
+                wrap_line(line, text_w, &mut rows);
+            }
+            rows.truncate(12);
+            let panel_w = (text_w + 4) as u16;
+            let right = x + width as u16;
+            let px = if right + panel_w <= editor.size.0 {
+                Some(right)
+            } else if x >= panel_w {
+                Some(x - panel_w)
+            } else {
+                None // no room on either side
+            };
+            if let Some(px) = px {
+                let top = top.min(editor.size.1.saturating_sub(rows.len() as u16 + 2));
+                draw_text_popup(out, px, top, text_w, &rows)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Word-wrap `line` onto `out` at `width` columns; lines that fit (code
+/// examples with their indentation) pass through untouched.
+fn wrap_line(line: &str, width: usize, out: &mut Vec<String>) {
+    if line.chars().count() <= width {
+        out.push(line.to_string());
+        return;
+    }
+    let mut cur = String::new();
+    for word in line.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+}
+
+/// A bordered popup of text rows with its top-left corner at (x, y).
+fn draw_text_popup(
+    out: &mut impl Write,
+    x: u16,
+    y: u16,
+    inner_w: usize,
+    rows: &[String],
+) -> std::io::Result<()> {
+    let theme = crate::theme::current();
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        SetBackgroundColor(theme.popup_bg),
+        SetForegroundColor(theme.border),
+        Print(format!("╭{}╮", "─".repeat(inner_w + 2)))
+    )?;
+    for (i, row) in rows.iter().enumerate() {
+        let line: String = row.chars().take(inner_w).collect();
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 1 + i as u16),
+            SetForegroundColor(theme.border),
+            Print("│ "),
+            SetForegroundColor(theme.fg.unwrap_or(Color::Reset)),
+            Print(format!("{line:<inner_w$}")),
+            SetForegroundColor(theme.border),
+            Print(" │")
+        )?;
+    }
+    queue!(
+        out,
+        cursor::MoveTo(x, y + 1 + rows.len() as u16),
+        SetForegroundColor(theme.border),
+        Print(format!("╰{}╯", "─".repeat(inner_w + 2))),
+        ResetColor
+    )?;
+    Ok(())
+}
+
+/// The hover docs popup (K): signature, description, and examples from the
+/// language server, wrapped and scrollable with j/k.
+fn render_hover(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    let Some((lines, scroll)) = &editor.hover else {
+        return Ok(());
+    };
+    let Some((cx, cy)) = editor.screen_cursor() else {
+        return Ok(());
+    };
+    let text_w = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(24, 76)
+        .min(editor.size.0.saturating_sub(4) as usize);
+
+    let mut rows = Vec::new();
+    for line in lines {
+        wrap_line(line, text_w, &mut rows);
+    }
+    let h = rows.len().min(14);
+    let start = (*scroll).min(rows.len().saturating_sub(h));
+    let rows = &rows[start..start + h];
+
+    let w = (text_w + 4) as u16;
+    // Above the cursor when there is room — the code under discussion stays
+    // visible — otherwise below.
+    let box_h = h as u16 + 2;
+    let top = if cy >= box_h {
+        cy - box_h
+    } else {
+        (cy + 1).min(editor.size.1.saturating_sub(box_h))
+    };
+    let x = cx.min(editor.size.0.saturating_sub(w));
+    draw_text_popup(out, x, top, text_w, rows)
 }
 
 /// The bottom line: status messages and the cursor line's diagnostic. The

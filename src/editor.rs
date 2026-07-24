@@ -41,6 +41,8 @@ pub struct Completion {
     /// menu that popped up on its own highlights nothing and Enter stays a
     /// newline, so typing is never hijacked; LSP menus start navigated.
     pub navigated: bool,
+    /// Signature + docs per label, for the side panel (LSP menus only).
+    pub docs: std::collections::HashMap<String, String>,
 }
 
 /// A window's saved view state. The focused window's state lives in its
@@ -408,16 +410,21 @@ pub struct Editor {
     /// A `.`/`::` was just typed: ask the server for members on the next
     /// tick, after the edit has been synced.
     lsp_completion_pending: bool,
+    /// A bare `d` was pressed (with its count): a second `d` deletes lines.
+    pub pending_dd: Option<usize>,
+    /// The hover docs popup: its lines and scroll offset (K to open).
+    pub hover: Option<(Vec<String>, usize)>,
     /// A "not installed — run `…`? (y/N)" offer; the next keypress answers it.
     pub pending_install: Option<(String, String)>,
     /// A background install in flight: (program, its result channel).
     install: Option<(String, std::sync::mpsc::Receiver<Result<(), String>>)>,
-    /// Cargo.toml badges: crate name -> (locked version, latest on crates.io).
-    pub crate_info: HashMap<String, (Option<String>, Option<String>)>,
-    /// The in-flight crates.io fetch, streaming one crate per message.
-    crates_rx: Option<std::sync::mpsc::Receiver<crate::crates::Info>>,
-    /// A fetch was started; one per session is enough.
-    crates_fetched: bool,
+    /// Manifest badges: (ecosystem, dep name) -> (current version, latest).
+    pub dep_info: HashMap<(crate::deps::Kind, String), (Option<String>, Option<String>)>,
+    /// All in-flight registry fetches stream over this one channel.
+    deps_rx: Option<std::sync::mpsc::Receiver<crate::deps::Info>>,
+    deps_tx: Option<std::sync::mpsc::Sender<crate::deps::Info>>,
+    /// Manifests already fetched this session.
+    deps_fetched: std::collections::HashSet<PathBuf>,
 }
 
 impl Editor {
@@ -503,11 +510,14 @@ impl Editor {
             keymaps,
             lsp_table: config.lsp.clone(),
             lsp_completion_pending: false,
+            pending_dd: None,
+            hover: None,
             pending_install: None,
             install: None,
-            crate_info: HashMap::new(),
-            crates_rx: None,
-            crates_fetched: false,
+            dep_info: HashMap::new(),
+            deps_rx: None,
+            deps_tx: None,
+            deps_fetched: std::collections::HashSet::new(),
         })
     }
 
@@ -757,6 +767,42 @@ impl Editor {
             return;
         }
         self.status.clear();
+
+        // The hover docs popup: j/k scroll, Esc/q/K close; any other key
+        // closes it and is handled normally.
+        if let Some((lines, scroll)) = self.hover.as_mut() {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    *scroll = (*scroll + 1).min(lines.len().saturating_sub(1));
+                    return;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *scroll = scroll.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('K') => {
+                    self.hover = None;
+                    return;
+                }
+                _ => self.hover = None,
+            }
+        }
+
+        // A bare `d` is waiting: a second `d` deletes the line (vim's dd);
+        // any other key cancels and is handled normally.
+        if let Some(count) = self.pending_dd.take() {
+            if self.mode == Mode::Normal && !key.ctrl && !key.alt && key.code == KeyCode::Char('d')
+            {
+                self.count = Some(count);
+                self.register_fresh = true;
+                (commands::find("delete_line").unwrap().func)(self);
+                let doc = self.doc_mut();
+                doc.anchor = doc.cursor;
+                doc.commit_undo_group();
+                self.count = None;
+                return;
+            }
+        }
 
         if let Some(scroll) = self.help_scroll {
             self.handle_help_key(key, scroll);
@@ -1325,40 +1371,41 @@ impl Editor {
         true
     }
 
-    // ---- crate versions ----------------------------------------------------
+    // ---- dependency versions -------------------------------------------------
 
-    /// Poll the crates.io fetch from the main loop, starting it the first
-    /// time a Cargo.toml is among the open buffers. True on new badges.
-    pub fn crates_tick(&mut self) -> bool {
-        if !self.crates_fetched {
-            let manifest = self.documents.iter().find(|d| {
-                d.path
-                    .as_ref()
-                    .is_some_and(|p| p.file_name().is_some_and(|n| n == "Cargo.toml"))
-            });
-            if let Some(doc) = manifest {
-                self.crates_fetched = true;
-                let (tx, rx) = std::sync::mpsc::channel();
-                crate::crates::fetch(doc.path.clone().unwrap(), doc.text.to_string(), tx);
-                self.crates_rx = Some(rx);
-            }
+    /// Poll the registry fetches from the main loop, starting one for any
+    /// open package manifest not yet fetched. True on new badges.
+    pub fn deps_tick(&mut self) -> bool {
+        let pending: Vec<(crate::deps::Kind, PathBuf, String)> = self
+            .documents
+            .iter()
+            .filter_map(|d| {
+                let path = d.path.as_ref()?;
+                let kind = crate::deps::manifest_kind(path.file_name()?.to_str()?)?;
+                (!self.deps_fetched.contains(path))
+                    .then(|| (kind, path.clone(), d.text.to_string()))
+            })
+            .collect();
+        for (kind, path, text) in pending {
+            self.deps_fetched.insert(path.clone());
+            let tx = match &self.deps_tx {
+                Some(tx) => tx.clone(),
+                None => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.deps_rx = Some(rx);
+                    self.deps_tx = Some(tx.clone());
+                    tx
+                }
+            };
+            crate::deps::fetch(kind, path, text, tx);
         }
-        let Some(rx) = self.crates_rx.as_ref() else {
+        let Some(rx) = self.deps_rx.as_ref() else {
             return false;
         };
         let mut changed = false;
-        loop {
-            match rx.try_recv() {
-                Ok((name, locked, latest)) => {
-                    self.crate_info.insert(name, (locked, latest));
-                    changed = true;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.crates_rx = None;
-                    break;
-                }
-            }
+        while let Ok((kind, name, current, latest)) = rx.try_recv() {
+            self.dep_info.insert((kind, name), (current, latest));
+            changed = true;
         }
         changed
     }
@@ -1861,6 +1908,14 @@ impl Editor {
     /// Handle a key while the completion menu is open. Returns true if the
     /// key was consumed.
     fn handle_completion_key(&mut self, key: Key) -> bool {
+        let consumed = self.completion_key_inner(key);
+        if consumed {
+            self.maybe_resolve_completion();
+        }
+        consumed
+    }
+
+    fn completion_key_inner(&mut self, key: Key) -> bool {
         let Some(completion) = self.completion.as_mut() else {
             return false;
         };
@@ -1959,6 +2014,34 @@ impl Editor {
         }
     }
 
+    /// The highlighted completion has no docs yet: ask the server to
+    /// resolve them, once. rust-analyzer and friends defer documentation to
+    /// `completionItem/resolve` so the initial list stays fast.
+    fn maybe_resolve_completion(&mut self) {
+        let Some(c) = self.completion.as_ref() else {
+            return;
+        };
+        if !c.navigated {
+            return;
+        }
+        let Some((label, _)) = c.items.get(c.selected) else {
+            return;
+        };
+        if c.docs.contains_key(label) {
+            return;
+        }
+        let label = label.clone();
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        lsp.resolve_completion(&label);
+        // A placeholder, so cycling back over the item doesn't re-request;
+        // the resolve response overwrites it.
+        if let Some(c) = self.completion.as_mut() {
+            c.docs.insert(label, String::new());
+        }
+    }
+
     fn completion_accept(&mut self) {
         let Some(completion) = self.completion.take() else {
             return;
@@ -2044,26 +2127,50 @@ impl Editor {
         for event in events {
             match event {
                 lsp::Event::Definition(path, line, col) => self.jump_to(path, line, col),
-                lsp::Event::Hover(text) => self.set_status(text),
+                lsp::Event::Hover(text) => self.open_hover(&text),
                 lsp::Event::Status(text) => self.set_status(text),
                 lsp::Event::Diagnostics(path, diags) => {
                     self.diagnostics.insert(path, diags);
                 }
                 lsp::Event::Completions(items) => self.show_completions(items),
+                lsp::Event::CompletionResolved(label, info) => {
+                    if let Some(c) = self.completion.as_mut() {
+                        if !info.is_empty() {
+                            c.docs.insert(label, info);
+                        }
+                    }
+                }
             }
         }
         changed
     }
 
-    fn show_completions(&mut self, items: Vec<(String, String)>) {
+    /// Open the hover docs popup — signature, description, examples — or
+    /// fall back to the status line when the buffer isn't in normal mode.
+    pub fn open_hover(&mut self, text: &str) {
+        if self.mode != Mode::Normal {
+            self.set_status(text.lines().next().unwrap_or("").to_string());
+            return;
+        }
+        self.hover = Some((text.lines().map(str::to_string).collect(), 0));
+    }
+
+    fn show_completions(&mut self, items: Vec<(String, String, String)>) {
         if self.mode != Mode::Insert {
             return; // the answer arrived after insert mode ended
         }
         let prefix = self.word_prefix();
         let lower = prefix.to_lowercase();
+        let mut docs = std::collections::HashMap::new();
         let mut items: Vec<(String, String)> = items
             .into_iter()
-            .filter(|(label, _)| label.to_lowercase().starts_with(&lower))
+            .filter(|(label, _, _)| label.to_lowercase().starts_with(&lower))
+            .map(|(label, text, info)| {
+                if !info.is_empty() {
+                    docs.insert(label.clone(), info);
+                }
+                (label, text)
+            })
             .collect();
         items.truncate(50);
         if items.is_empty() {
@@ -2077,7 +2184,10 @@ impl Editor {
                 // The server was asked (C-space or a `::`/`.` trigger):
                 // the list is the point, so Enter accepts right away.
                 navigated: true,
+                docs,
             });
+            // Docs for the item highlighted on open, if the server defers them.
+            self.maybe_resolve_completion();
         }
     }
 
@@ -2183,6 +2293,7 @@ impl Editor {
                 selected: 0,
                 prefix,
                 navigated: false,
+                docs: std::collections::HashMap::new(),
             });
         }
     }
@@ -2274,6 +2385,7 @@ impl Editor {
             selected: 0,
             prefix: prefix.to_string(),
             navigated: false,
+            docs: std::collections::HashMap::new(),
         })
     }
 
@@ -2520,7 +2632,7 @@ mod tests {
     #[test]
     fn count_prefix_repeats_a_command() {
         let mut editor = editor_with("abcdef");
-        press(&mut editor, "3d");
+        press(&mut editor, "v3ld");
         assert_eq!(editor.doc().text.to_string(), "def");
     }
 
@@ -2536,7 +2648,7 @@ mod tests {
     #[test]
     fn zero_is_a_count_digit_after_another_digit() {
         let mut editor = editor_with("abcdefghijklm");
-        press(&mut editor, "10d");
+        press(&mut editor, "v10ld");
         assert_eq!(editor.doc().text.to_string(), "klm");
     }
 
@@ -2564,8 +2676,9 @@ mod tests {
     #[test]
     fn motions_collapse_the_selection() {
         let mut editor = editor_with("foo bar");
+        // w selects "foo ", h collapses onto the space; vl reselects just it.
         press(&mut editor, "wh");
-        press(&mut editor, "d");
+        press(&mut editor, "vld");
         assert_eq!(editor.doc().text.to_string(), "foobar");
     }
 
@@ -2717,8 +2830,9 @@ mod tests {
         let mut editor = editor_with("foo bar baz");
         press(&mut editor, "vwwd");
         assert_eq!(editor.doc().text.to_string(), "baz");
-        // The delete dropped extend mode: plain motion, single-char delete.
-        press(&mut editor, "ld");
+        // The delete dropped extend mode: l is a plain motion again, so vl
+        // selects exactly one char.
+        press(&mut editor, "lvld");
         assert_eq!(editor.doc().text.to_string(), "bz");
     }
 
@@ -2734,8 +2848,9 @@ mod tests {
         let mut editor = editor_with("abcd");
         press(&mut editor, "v");
         press(&mut editor, "<esc>");
-        press(&mut editor, "ld");
-        assert_eq!(editor.doc().text.to_string(), "acd");
+        // With extend off, l collapses and w selects from there only.
+        press(&mut editor, "lwd");
+        assert_eq!(editor.doc().text.to_string(), "a");
     }
 
     #[test]
@@ -2758,7 +2873,7 @@ mod tests {
         let mut editor = editor_with("foo bar");
         press(&mut editor, "w"); // select "foo "
         press(&mut editor, "\"ay"); // into register a; cursor back to 0
-        press(&mut editor, "d"); // unnamed register = "f"
+        press(&mut editor, "vld"); // select "f", delete: unnamed register = "f"
         assert_eq!(editor.doc().text.to_string(), "oo bar");
         assert_eq!(editor.register, "f");
         press(&mut editor, "\"aP");
@@ -2843,8 +2958,8 @@ mod tests {
         press(&mut editor, "i");
         press(&mut editor, "pri");
         editor.show_completions(vec![
-            ("println!".into(), "println!".into()),
-            ("print!".into(), "print!".into()),
+            ("println!".into(), "println!".into(), String::new()),
+            ("print!".into(), "print!".into(), String::new()),
         ]);
         assert_eq!(editor.completion.as_ref().unwrap().items.len(), 2);
         press(&mut editor, "<enter>");
@@ -2853,13 +2968,66 @@ mod tests {
     }
 
     #[test]
+    fn dd_deletes_lines_into_the_register() {
+        let mut editor = editor_with("one\ntwo\nthree\nfour\n");
+        press(&mut editor, "dd");
+        assert_eq!(editor.doc().text.to_string(), "two\nthree\nfour\n");
+        assert_eq!(editor.register, "one\n");
+        // The register is linewise, so p pastes the line back below.
+        press(&mut editor, "p");
+        assert_eq!(editor.doc().text.to_string(), "two\none\nthree\nfour\n");
+        // A count deletes that many lines; u undoes the whole delete.
+        press(&mut editor, "gg 2dd");
+        assert_eq!(editor.doc().text.to_string(), "three\nfour\n");
+        press(&mut editor, "u");
+        assert_eq!(editor.doc().text.to_string(), "two\none\nthree\nfour\n");
+        // d followed by anything else cancels — nothing deleted.
+        press(&mut editor, "dj");
+        assert_eq!(editor.doc().text.to_string(), "two\none\nthree\nfour\n");
+    }
+
+    #[test]
+    fn hover_popup_scrolls_and_any_key_falls_through() {
+        let mut editor = editor_with("hello\n");
+        editor.open_hover("fn foo()\n\nDoes the thing.\n\nExample:\n    foo();");
+        assert!(editor.hover.is_some());
+        press(&mut editor, "j");
+        assert_eq!(editor.hover.as_ref().unwrap().1, 1);
+        press(&mut editor, "k");
+        assert_eq!(editor.hover.as_ref().unwrap().1, 0);
+        press(&mut editor, "<esc>");
+        assert!(editor.hover.is_none());
+        // Any non-scroll key closes the popup and still does its job.
+        editor.open_hover("docs");
+        press(&mut editor, "i");
+        assert!(editor.hover.is_none());
+        assert_eq!(editor.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn dep_upgrade_rewrites_the_cursor_lines_version() {
+        let mut editor = editor_with("[dependencies]\ncrossterm = \"0.27\"\n");
+        editor.doc_mut().path = Some("Cargo.toml".into());
+        editor.dep_info.insert(
+            (crate::deps::Kind::Cargo, "crossterm".into()),
+            (Some("0.27.0".into()), Some("0.29.0".into())),
+        );
+        press(&mut editor, "j"); // onto the crossterm line
+        (crate::commands::find("dep_upgrade").unwrap().func)(&mut editor);
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "[dependencies]\ncrossterm = \"0.29.0\"\n"
+        );
+    }
+
+    #[test]
     fn tab_and_shift_tab_cycle_the_completion_menu() {
         let mut editor = editor_with("");
         press(&mut editor, "i");
         press(&mut editor, "p");
         editor.show_completions(vec![
-            ("print!".into(), "print!".into()),
-            ("push".into(), "push".into()),
+            ("print!".into(), "print!".into(), String::new()),
+            ("push".into(), "push".into(), "Appends an element.".into()),
         ]);
         // An LSP menu starts navigated: Tab advances, S-Tab goes back.
         press(&mut editor, "<tab>");
@@ -2876,8 +3044,8 @@ mod tests {
         press(&mut editor, "i");
         press(&mut editor, "p");
         editor.show_completions(vec![
-            ("print!".into(), "print!".into()),
-            ("push".into(), "push".into()),
+            ("print!".into(), "print!".into(), String::new()),
+            ("push".into(), "push".into(), String::new()),
         ]);
         press(&mut editor, "u"); // types through the menu
         assert_eq!(editor.doc().text.to_string(), "pu");
@@ -3293,11 +3461,11 @@ mod tests {
 
     #[test]
     fn each_delete_is_its_own_undo_step() {
-        let mut editor = editor_with("abc");
-        press(&mut editor, "dd");
-        assert_eq!(editor.doc().text.to_string(), "c");
+        let mut editor = editor_with("a\nb\nc\n");
+        press(&mut editor, "dd dd");
+        assert_eq!(editor.doc().text.to_string(), "c\n");
         press(&mut editor, "u");
-        assert_eq!(editor.doc().text.to_string(), "bc");
+        assert_eq!(editor.doc().text.to_string(), "b\nc\n");
     }
 
     #[test]

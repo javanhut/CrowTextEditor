@@ -46,7 +46,7 @@ commands! {
     add_cursor_above => "add a cursor on the previous line",
     remove_extra_cursors => "keep only the primary cursor",
     goto_definition => "jump to the definition under the cursor (LSP)",
-    hover => "show type and docs for the symbol under the cursor (LSP)",
+    hover => "pop up docs and examples for the symbol under the cursor (LSP)",
     complete => "open the completion menu (LSP)",
     command_palette => "fuzzy-pick any command by name",
     find_files => "fuzzy-find a file under the current directory",
@@ -87,7 +87,7 @@ commands! {
     paste_after => "paste the register after the cursor",
     paste_before => "paste the register before the cursor",
     delete_char => "delete the character under the cursor",
-    delete_line => "delete the current line",
+    delete_line => "delete the current line into the register (dd)",
     delete_to_line_end => "delete to the end of the line",
     join_lines => "join this line with the next",
     undo => "undo the last change",
@@ -99,6 +99,7 @@ commands! {
     delete_forward => "delete the character under the cursor",
 
     format_buffer => "run the file's formatter over the buffer (:fmt)",
+    dep_upgrade => "rewrite this line's dependency to its latest version (package manifests)",
     next_buffer => "switch to the next buffer",
     prev_buffer => "switch to the previous buffer",
     split_vertical => "split the window side by side",
@@ -646,6 +647,12 @@ fn selection_range(doc: &Document) -> (usize, usize) {
 
 fn delete_selection(editor: &mut Editor) {
     let count = editor.take_count();
+    // Bare `d` with a single cursor and nothing selected: wait for a second
+    // `d` — vim's dd. With extra cursors it keeps deleting a char per cursor.
+    if editor.doc().anchor == editor.doc().cursor && editor.doc().extra.is_empty() {
+        editor.pending_dd = Some(count);
+        return;
+    }
     let (from, to) = {
         let doc = editor.doc();
         if doc.anchor == doc.cursor {
@@ -951,24 +958,34 @@ fn delete_char(editor: &mut Editor) {
 
 fn delete_line(editor: &mut Editor) {
     let count = editor.take_count();
+    let (from, to) = {
+        let doc = editor.doc();
+        let line = doc.cursor_line();
+        let last = doc.line_count().saturating_sub(1);
+        let end_line = (line + count - 1).min(last);
+
+        let from = doc.line_start(line);
+        let to = if end_line < last {
+            doc.line_start(end_line + 1)
+        } else {
+            // Last line: take the preceding newline instead so no blank line
+            // is left.
+            doc.text.len_chars()
+        };
+        let from = if end_line == last && line > 0 {
+            doc.line_end(line - 1)
+        } else {
+            from
+        };
+        (from, to)
+    };
+    if from >= to {
+        return;
+    }
+    // Into the register, so `dd p` moves a line like vim.
+    let text = editor.doc().text.slice(from..to).to_string();
+    push_register(editor, &text);
     let doc = editor.doc_mut();
-    let line = doc.cursor_line();
-    let last = doc.line_count().saturating_sub(1);
-    let end_line = (line + count - 1).min(last);
-
-    let from = doc.line_start(line);
-    let to = if end_line < last {
-        doc.line_start(end_line + 1)
-    } else {
-        // Last line: take the preceding newline instead so no blank line is left.
-        doc.text.len_chars()
-    };
-    let from = if end_line == last && line > 0 {
-        doc.line_end(line - 1)
-    } else {
-        from
-    };
-
     doc.delete_range(from, to);
     doc.clamp_cursor(false);
     doc.goal_col = None;
@@ -1078,6 +1095,55 @@ fn format_buffer(editor: &mut Editor) {
         None if editor.pending_install.is_some() => {}
         None => editor.set_status("no formatter for this buffer (see [fmt] in crow.toml)"),
     }
+}
+
+/// Rewrite the version on the cursor line of a package manifest to the
+/// latest its registry reported (the ↑ badge).
+fn dep_upgrade(editor: &mut Editor) {
+    let kind = editor
+        .doc()
+        .path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .and_then(crate::deps::manifest_kind);
+    let Some(kind) = kind else {
+        editor.set_status("not a package manifest");
+        return;
+    };
+    let line_idx = editor.doc().cursor_line();
+    let line: String = editor.doc().line(line_idx).chars().collect();
+    let Some(name) = crate::deps::line_dep(kind, &line) else {
+        editor.set_status("no dependency on this line");
+        return;
+    };
+    let latest = editor
+        .dep_info
+        .get(&(kind, name.clone()))
+        .and_then(|(_, latest)| latest.clone());
+    let Some(latest) = latest else {
+        editor.set_status(format!("no version info for {name} (still fetching?)"));
+        return;
+    };
+    let Some((from, to)) = crate::deps::version_span(kind, &line) else {
+        editor.set_status("no version number on this line to rewrite");
+        return;
+    };
+    let old: String = line.chars().skip(from).take(to - from).collect();
+    if old == latest {
+        editor.set_status(format!("{name} is already {latest}"));
+        return;
+    }
+    let doc = editor.doc_mut();
+    let start = doc.line_start(line_idx);
+    let tx = Transaction::change(
+        &doc.text,
+        [(start + from, start + to, Some(latest.clone()))],
+    );
+    let cursor = doc.cursor;
+    doc.apply(tx, cursor);
+    doc.clamp_cursor(false);
+    editor.set_status(format!("{name}: {old} → {latest} (reinstall to apply)"));
 }
 
 fn undo(editor: &mut Editor) {

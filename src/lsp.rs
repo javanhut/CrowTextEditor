@@ -30,7 +30,9 @@ pub enum Event {
     Hover(String),
     Diagnostics(PathBuf, Vec<Diagnostic>),
     /// Completion candidates as (label, insert text).
-    Completions(Vec<(String, String)>),
+    Completions(Vec<(String, String, String)>),
+    /// `completionItem/resolve` came back: (label, signature + docs).
+    CompletionResolved(String, String),
     Status(String),
 }
 
@@ -45,6 +47,9 @@ pub struct Client {
     queued: Vec<Value>,
     /// Per file: the LSP document version and the editor revision last synced.
     pub synced: HashMap<PathBuf, (i64, u64)>,
+    /// The raw items of the last completion response, by label — what
+    /// `completionItem/resolve` needs sent back to fetch the docs.
+    completion_items: HashMap<String, Value>,
     dead: bool,
 }
 
@@ -81,6 +86,7 @@ impl Client {
             ready: false,
             queued: Vec::new(),
             synced: HashMap::new(),
+            completion_items: HashMap::new(),
             dead: false,
         };
         client.send_request(
@@ -91,7 +97,11 @@ impl Client {
                 "capabilities": {
                     "textDocument": {
                         "publishDiagnostics": {},
-                        "hover": { "contentFormat": ["plaintext", "markdown"] }
+                        "hover": { "contentFormat": ["plaintext", "markdown"] },
+                        "completion": { "completionItem": {
+                            "documentationFormat": ["plaintext", "markdown"],
+                            "resolveSupport": { "properties": ["documentation", "detail"] }
+                        }}
                     }
                 }
             }),
@@ -180,6 +190,14 @@ impl Client {
         );
     }
 
+    /// Ask the server to fill in docs for a completion item from the last
+    /// response; the answer arrives as `Event::CompletionResolved`.
+    pub fn resolve_completion(&mut self, label: &str) {
+        if let Some(item) = self.completion_items.get(label).cloned() {
+            self.send_request("completionItem/resolve", item, "resolve");
+        }
+    }
+
     pub fn shutdown(mut self) {
         let body = json!({"jsonrpc": "2.0", "method": "exit"});
         self.write(&body);
@@ -265,7 +283,17 @@ impl Client {
                         None => events.push(Event::Status("no hover info".into())),
                     },
                     "completion" => {
+                        self.completion_items = raw_items(&msg["result"]);
                         events.push(Event::Completions(parse_completions(&msg["result"])))
+                    }
+                    "resolve" => {
+                        let item = &msg["result"];
+                        if let Some(label) = item["label"].as_str() {
+                            events.push(Event::CompletionResolved(
+                                label.trim().to_string(),
+                                item_info(item),
+                            ));
+                        }
                     }
                     _ => {}
                 }
@@ -307,7 +335,7 @@ fn parse_location(result: &Value) -> Option<(PathBuf, usize, usize)> {
 
 /// CompletionItem[] or CompletionList; text preference is
 /// textEdit.newText > insertText > label, with snippet placeholders stripped.
-fn parse_completions(result: &Value) -> Vec<(String, String)> {
+fn parse_completions(result: &Value) -> Vec<(String, String, String)> {
     let items = result
         .get("items")
         .and_then(Value::as_array)
@@ -325,9 +353,39 @@ fn parse_completions(result: &Value) -> Vec<(String, String)> {
                 .or_else(|| item["insertText"].as_str())
                 .map(strip_snippet)
                 .unwrap_or_else(|| label.clone());
-            Some((label, text))
+            Some((label, text, item_info(item)))
         })
         .collect()
+}
+
+/// The raw completion items by label, kept for `completionItem/resolve`.
+fn raw_items(result: &Value) -> HashMap<String, Value> {
+    let items = result
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| result.as_array());
+    items
+        .into_iter()
+        .flatten()
+        .take(100)
+        .filter_map(|item| Some((item["label"].as_str()?.trim().to_string(), item.clone())))
+        .collect()
+}
+
+/// Signature (`detail`) and documentation of a completion item, for the
+/// docs side panel. Empty when the server sent neither.
+fn item_info(item: &Value) -> String {
+    let detail = item["detail"].as_str().unwrap_or("").trim();
+    let doc = item["documentation"]
+        .as_str()
+        .or_else(|| item["documentation"]["value"].as_str())
+        .unwrap_or("");
+    let doc = strip_fences(doc);
+    match (detail.is_empty(), doc.is_empty()) {
+        (false, false) => format!("{detail}\n\n{doc}"),
+        (false, true) => detail.to_string(),
+        (true, _) => doc,
+    }
 }
 
 /// Drop `$0` / `${1:placeholder}` snippet syntax from an insert text.
@@ -364,7 +422,8 @@ fn strip_snippet(text: &str) -> String {
     out
 }
 
-/// First useful line out of the various shapes hover contents can take.
+/// The full hover text out of the various shapes hover contents can take:
+/// signature, description, and examples, with the markdown fences dropped.
 fn hover_text(result: &Value) -> Option<String> {
     let contents = result.get("contents")?;
     let raw = if let Some(s) = contents.as_str() {
@@ -378,10 +437,19 @@ fn hover_text(result: &Value) -> Option<String> {
             .map(str::to_string)
             .or_else(|| first.get("value")?.as_str().map(str::to_string))?
     };
-    raw.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("```"))
-        .map(str::to_string)
+    let text = strip_fences(&raw);
+    (!text.is_empty()).then_some(text)
+}
+
+/// Markdown without the ``` fence lines and horizontal rules; code inside
+/// the fences — the examples — stays.
+fn strip_fences(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim_start().starts_with("```") && l.trim() != "---")
+        .collect();
+    lines.join("\n").trim().to_string()
 }
 
 // ---- wire format -----------------------------------------------------------
