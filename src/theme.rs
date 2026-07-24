@@ -136,11 +136,7 @@ pub fn set(name: &str) -> bool {
 }
 
 pub fn names() -> String {
-    THEMES
-        .iter()
-        .map(|t| t.name)
-        .collect::<Vec<_>>()
-        .join(", ")
+    THEMES.iter().map(|t| t.name).collect::<Vec<_>>().join(", ")
 }
 
 /// Tests that touch the global theme take this lock, so parallel test

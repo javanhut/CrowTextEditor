@@ -32,9 +32,7 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn is_empty(&self) -> bool {
-        self.ops
-            .iter()
-            .all(|op| matches!(op, Operation::Retain(_)))
+        self.ops.iter().all(|op| matches!(op, Operation::Retain(_)))
     }
 
     /// Build a transaction from a set of changes over `text`.

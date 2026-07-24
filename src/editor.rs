@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::commands;
-use crate::lsp;
 use crate::document::Document;
 use crate::keymap::{Key, KeyCode, KeyTrie, KeymapResult};
+use crate::lsp;
 
 use crate::search;
 
@@ -62,7 +62,10 @@ pub struct Window {
 /// their children, side by side (`vertical`) or stacked.
 pub enum Layout {
     Leaf(Window),
-    Split { vertical: bool, children: Vec<Layout> },
+    Split {
+        vertical: bool,
+        children: Vec<Layout>,
+    },
 }
 
 /// (x, y, width, height) in terminal cells.
@@ -84,9 +87,7 @@ impl Layout {
         match self {
             Layout::Leaf(w) if w.id == id => Some(w),
             Layout::Leaf(_) => None,
-            Layout::Split { children, .. } => {
-                children.iter_mut().find_map(|c| c.find_mut(id))
-            }
+            Layout::Split { children, .. } => children.iter_mut().find_map(|c| c.find_mut(id)),
         }
     }
 
@@ -124,7 +125,10 @@ impl Layout {
                 true
             }
             Layout::Leaf(_) => false,
-            Layout::Split { vertical: v, children } => {
+            Layout::Split {
+                vertical: v,
+                children,
+            } => {
                 // Same-direction split of a direct child joins this row/column
                 // instead of nesting.
                 if *v == vertical {
@@ -149,9 +153,7 @@ impl Layout {
     /// Remove the leaf `id`, collapsing single-child splits.
     fn close(&mut self, id: usize) {
         if let Layout::Split { children, .. } = self {
-            children.retain(
-                |c| !matches!(c, Layout::Leaf(w) if w.id == id),
-            );
+            children.retain(|c| !matches!(c, Layout::Leaf(w) if w.id == id));
             for c in children.iter_mut() {
                 c.close(id);
             }
@@ -402,6 +404,10 @@ pub struct Editor {
     /// Terminal size as (columns, rows).
     pub size: (u16, u16),
     pub keymaps: Keymaps,
+    /// A "not installed — run `…`? (y/N)" offer; the next keypress answers it.
+    pub pending_install: Option<(String, String)>,
+    /// A background install in flight: (program, its result channel).
+    install: Option<(String, std::sync::mpsc::Receiver<Result<(), String>>)>,
 }
 
 impl Editor {
@@ -486,6 +492,8 @@ impl Editor {
             size,
             keymaps,
             lsp_table: config.lsp.clone(),
+            pending_install: None,
+            install: None,
         })
     }
 
@@ -519,6 +527,7 @@ impl Editor {
     /// Every window's rectangle plus the separators between them. The text
     /// area is everything but the status and command lines, minus the tree
     /// sidebar when it is visible.
+    #[allow(clippy::type_complexity)]
     pub fn window_rects(&self) -> (Vec<(usize, Rect)>, Vec<(Rect, bool)>) {
         let tree_w = self.tree_width();
         let area = (
@@ -564,7 +573,13 @@ impl Editor {
     fn save_focus_state(&mut self) {
         let current = self.current;
         let doc = &self.documents[current];
-        let snap = (doc.cursor, doc.anchor, doc.extra.clone(), doc.view_line, doc.view_col);
+        let snap = (
+            doc.cursor,
+            doc.anchor,
+            doc.extra.clone(),
+            doc.view_line,
+            doc.view_col,
+        );
         if let Some(w) = self.layout.find_mut(self.focused) {
             w.doc = current;
             (w.cursor, w.anchor, w.extra, w.view_line, w.view_col) = snap;
@@ -576,8 +591,14 @@ impl Editor {
         let Some(w) = self.layout.find(self.focused) else {
             return;
         };
-        let (doc_idx, c, a, extra, vl, vc) =
-            (w.doc, w.cursor, w.anchor, w.extra.clone(), w.view_line, w.view_col);
+        let (doc_idx, c, a, extra, vl, vc) = (
+            w.doc,
+            w.cursor,
+            w.anchor,
+            w.extra.clone(),
+            w.view_line,
+            w.view_col,
+        );
         self.current = doc_idx.min(self.documents.len() - 1);
         let doc = &mut self.documents[self.current];
         let len = doc.text.len_chars();
@@ -708,6 +729,19 @@ impl Editor {
     // ---- key handling ------------------------------------------------------
 
     pub fn handle_key(&mut self, key: Key) {
+        // An armed install offer eats exactly one key: y runs it, anything
+        // else declines and the key is not replayed.
+        if let Some((program, cmd)) = self.pending_install.take() {
+            self.status.clear();
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.start_install(&program, &cmd);
+            } else {
+                self.set_status(format!(
+                    "{program} not installed (:install {program} later)"
+                ));
+            }
+            return;
+        }
         self.status.clear();
 
         if let Some(scroll) = self.help_scroll {
@@ -784,9 +818,7 @@ impl Editor {
                 self.pending.clear();
                 self.keep_selection = false;
                 self.register_fresh = true;
-                if !self.doc().extra.is_empty()
-                    && commands::PER_CURSOR.contains(&command.name)
-                {
+                if !self.doc().extra.is_empty() && commands::PER_CURSOR.contains(&command.name) {
                     self.dispatch_per_cursor(command);
                 } else {
                     (command.func)(self);
@@ -855,7 +887,9 @@ impl Editor {
         let (_, _, _, h) = self.help_rect();
         // Minus the box: top border, hint row, separator, bottom border.
         let visible = (h as usize).saturating_sub(4).max(1);
-        let max = crate::commands::help_lines().len().saturating_sub(visible);
+        let max = crate::commands::help_lines(&self.keymaps.normal)
+            .len()
+            .saturating_sub(visible);
         let clamp = |s: usize| Some(s.min(max));
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.help_scroll = None,
@@ -937,15 +971,26 @@ impl Editor {
         if line.is_empty() || line.contains(' ') || line.chars().all(|c| c.is_ascii_digit()) {
             return Vec::new();
         }
-        const BUILTINS: &[&str] =
-            &["w", "q", "q!", "wq", "e", "fmt", "bn", "bp", "theme", "config", "help"];
+        const BUILTINS: &[&str] = &[
+            "w",
+            "q",
+            "q!",
+            "wq",
+            "e",
+            "fmt",
+            "bn",
+            "bp",
+            "theme",
+            "config",
+            "help",
+            "install",
+            "lsp-install",
+        ];
         let mut scored: Vec<(i64, String)> = BUILTINS
             .iter()
             .map(|s| s.to_string())
             .chain(crate::commands::COMMANDS.iter().map(|c| c.name.to_string()))
-            .filter_map(|name| {
-                crate::picker::fuzzy_score(line, &name).map(|score| (score, name))
-            })
+            .filter_map(|name| crate::picker::fuzzy_score(line, &name).map(|score| (score, name)))
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.truncate(8);
@@ -1117,6 +1162,16 @@ impl Editor {
                 }
                 None => self.set_status(format!("Themes: {}", crate::theme::names())),
             },
+            "install" => match arg {
+                Some(name) => self.install_named(name, false),
+                None => self.set_status(
+                    "Usage: :install <tool or extension>  e.g. :install prettier, :install yaml",
+                ),
+            },
+            "lsp-install" => match arg {
+                Some(name) => self.install_named(name, true),
+                None => self.set_status("Usage: :lsp-install <extension>  e.g. :lsp-install rs"),
+            },
             "config" => match Document::open(crate::config::path()) {
                 Ok(doc) => {
                     self.documents.push(doc);
@@ -1138,6 +1193,148 @@ impl Editor {
                     (command.func)(self);
                 } else {
                     self.set_status(format!("Not a command: {other}"));
+                }
+            }
+        }
+    }
+
+    // ---- tool installs -----------------------------------------------------
+
+    /// `:install x` — x is a tool name, or a file extension whose formatter
+    /// (or, with `lsp_only`, language server) gets resolved and installed.
+    fn install_named(&mut self, name: &str, lsp_only: bool) {
+        if self.install.is_some() {
+            self.set_status("an install is already running");
+            return;
+        }
+        let lsp_program = |table: &[(String, String)]| {
+            table
+                .iter()
+                .find(|(e, _)| e == name)
+                .and_then(|(_, c)| c.split_whitespace().next().map(str::to_string))
+        };
+        let program = if crate::config::installer(name).is_some() {
+            Some(name.to_string())
+        } else if lsp_only {
+            lsp_program(&self.lsp_table)
+        } else {
+            crate::config::formatter(name)
+                .and_then(|c| c.split_whitespace().next().map(str::to_string))
+                .or_else(|| lsp_program(&self.lsp_table))
+        };
+        match program {
+            Some(p) => match crate::config::installer(&p) {
+                Some(cmd) => self.start_install(&p, cmd),
+                None => self.set_status(format!("don't know how to install {p}")),
+            },
+            None => self.set_status(format!(
+                "nothing known for {name:?} — use a tool name or a file extension"
+            )),
+        }
+    }
+
+    /// Offer to install a missing `program` if we know how: arms the (y/N)
+    /// prompt and puts it in the status line. False when we can't help.
+    pub fn offer_install(&mut self, program: &str) -> bool {
+        let Some(cmd) = crate::config::installer(program) else {
+            return false;
+        };
+        if self.install.is_some() {
+            return false;
+        }
+        self.set_status(format!("{program} not installed — run `{cmd}`? (y/N)"));
+        self.pending_install = Some((program.to_string(), cmd.to_string()));
+        true
+    }
+
+    /// Run `cmd` in a background thread; `install_tick` picks up the result.
+    fn start_install(&mut self, program: &str, cmd: &str) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shell_cmd = cmd.to_string();
+        std::thread::spawn(move || {
+            let result = match std::process::Command::new("sh")
+                .args(["-c", &shell_cmd])
+                .output()
+            {
+                Ok(o) if o.status.success() => Ok(()),
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    Err(err
+                        .lines()
+                        .rev()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("failed")
+                        .to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            let _ = tx.send(result);
+        });
+        self.set_status(format!("installing {program}… (`{cmd}`)"));
+        self.install = Some((program.to_string(), rx));
+    }
+
+    /// Poll the background install from the main loop. True when the status
+    /// changed and a redraw is due.
+    pub fn install_tick(&mut self) -> bool {
+        let Some((_, rx)) = self.install.as_ref() else {
+            return false;
+        };
+        let result = match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(_) => Err("install process vanished".to_string()),
+            Ok(r) => r,
+        };
+        let (program, _) = self.install.take().unwrap();
+        match result {
+            Ok(()) => {
+                // A server that failed to spawn earlier can be retried now.
+                self.lsp_failed = false;
+                self.set_status(format!("{program} installed"));
+                // If it formats the current buffer, finish what :fmt started.
+                let formats_this = self
+                    .doc()
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.extension())
+                    .and_then(|e| e.to_str())
+                    .and_then(crate::config::formatter)
+                    .is_some_and(|c| c.split_whitespace().next() == Some(program.as_str()));
+                if formats_this {
+                    (commands::find("format_buffer").unwrap().func)(self);
+                }
+            }
+            Err(e) => self.set_status(format!("{program}: install failed — {e}")),
+        }
+        true
+    }
+
+    // ---- paste -------------------------------------------------------------
+
+    /// Bracketed paste: the text goes in verbatim — no auto-indent, no
+    /// autoclose, no per-key replay. That's the whole point of the bracket.
+    pub fn handle_paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        match self.mode {
+            Mode::Command | Mode::Search => {
+                // A path or a pattern: only the first line makes sense.
+                self.command_suggest = None;
+                self.command_line
+                    .push_str(text.lines().next().unwrap_or(""));
+                if self.mode == Mode::Search {
+                    self.update_search_preview();
+                }
+            }
+            Mode::Picker => {} // ponytail: paste into pickers when someone misses it
+            Mode::Insert | Mode::Normal => {
+                if self.tree_focused || self.help_scroll.is_some() {
+                    return;
+                }
+                self.doc_mut().insert_at_cursor(&text);
+                if self.mode == Mode::Normal {
+                    let doc = self.doc_mut();
+                    doc.anchor = doc.cursor;
+                    doc.commit_undo_group();
                 }
             }
         }
@@ -1259,8 +1456,9 @@ impl Editor {
             }
             Kind::Recent => {
                 let path = match label.strip_prefix("~/") {
-                    Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                        .join(rest),
+                    Some(rest) => {
+                        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest)
+                    }
                     None => PathBuf::from(label),
                 };
                 self.jump_to(path, 0, 0);
@@ -1347,6 +1545,9 @@ impl Editor {
             KeyCode::Down | KeyCode::Char('j') => tree.move_selection(1),
             KeyCode::Char('h') | KeyCode::Left => tree.collapse_or_parent(),
             KeyCode::Char('R') => tree.rebuild(),
+            KeyCode::Char('.') => {
+                (crate::commands::find("toggle_hidden").unwrap().func)(self);
+            }
             KeyCode::Char('r') => {
                 if let Some(row) = tree.selected_row() {
                     if row.path == tree.root {
@@ -1364,11 +1565,7 @@ impl Editor {
                 // selected file.
                 let dir = match tree.selected_row() {
                     Some(row) if row.is_dir => row.path.clone(),
-                    Some(row) => row
-                        .path
-                        .parent()
-                        .unwrap_or(&tree.root)
-                        .to_path_buf(),
+                    Some(row) => row.path.parent().unwrap_or(&tree.root).to_path_buf(),
                     None => tree.root.clone(),
                 };
                 self.tree_input = Some(TreeInput::Create {
@@ -1656,7 +1853,9 @@ impl Editor {
                 // Type through the menu: insert the char and narrow the list.
                 completion.prefix.push(c);
                 let prefix = completion.prefix.to_lowercase();
-                completion.items.retain(|(label, _)| label.to_lowercase().starts_with(&prefix));
+                completion
+                    .items
+                    .retain(|(label, _)| label.to_lowercase().starts_with(&prefix));
                 completion.selected = 0;
                 let empty = completion.items.is_empty();
                 self.doc_mut().insert_at_cursor(&c.to_string());
@@ -1683,7 +1882,10 @@ impl Editor {
         };
         let prefix_chars = completion.prefix.chars().count();
         let entered_dir = text.ends_with('/');
-        if text.to_lowercase().starts_with(&completion.prefix.to_lowercase()) {
+        if text
+            .to_lowercase()
+            .starts_with(&completion.prefix.to_lowercase())
+        {
             // The typed prefix stands; append the rest at every cursor.
             let suffix: String = text.chars().skip(prefix_chars).collect();
             self.doc_mut().insert_at_cursor(&suffix);
@@ -1982,7 +2184,10 @@ impl Editor {
                 Some(client) => self.lsp = Some(client),
                 None => {
                     self.lsp_failed = true;
-                    self.set_status(format!("could not start {command:?} — no LSP"));
+                    let program = command.split_whitespace().next().unwrap_or("");
+                    if !self.offer_install(program) {
+                        self.set_status(format!("could not start {command:?} — no LSP"));
+                    }
                     return;
                 }
             }
@@ -1990,8 +2195,7 @@ impl Editor {
         let table = &self.lsp_table;
         let lsp = self.lsp.as_mut().unwrap();
         for doc in &self.documents {
-            let Some(path) = doc.path.as_ref().filter(|p| server_for(table, p).is_some())
-            else {
+            let Some(path) = doc.path.as_ref().filter(|p| server_for(table, p).is_some()) else {
                 continue;
             };
             match lsp.synced.get(path.as_path()) {
@@ -2126,7 +2330,8 @@ impl Editor {
     pub fn cursor_indicator(&self) -> String {
         let doc = self.doc();
         let (line, col) = doc.cursor_line_col();
-        let display = crate::position::char_to_display_col(doc.line(line), col, crate::config::tab_width());
+        let display =
+            crate::position::char_to_display_col(doc.line(line), col, crate::config::tab_width());
         format!("{}:{}", line + 1, display + 1)
     }
 }
@@ -2146,8 +2351,7 @@ mod tests {
     use crate::keymap::Key;
 
     fn editor_with(text: &str) -> Editor {
-        let mut editor =
-            Editor::new(vec![], (80, 24), &crate::config::Config::default()).unwrap();
+        let mut editor = Editor::new(vec![], (80, 24), &crate::config::Config::default()).unwrap();
         editor.doc_mut().text = ropey::Rope::from_str(text);
         editor
     }
@@ -2170,6 +2374,20 @@ mod tests {
         press(&mut editor, "i");
         press(&mut editor, "hello");
         assert_eq!(editor.doc().text.to_string(), "hello");
+    }
+
+    #[test]
+    fn paste_goes_in_verbatim_no_autoindent_no_autoclose() {
+        // The ci.yml bug: pasted YAML must not pick up cumulative indent,
+        // and pasted brackets must not auto-close.
+        let mut editor = editor_with("    indented\n");
+        press(&mut editor, "i");
+        editor.doc_mut().cursor = 13; // after the indented line
+        editor.handle_paste("on:\r\n  push:\r\n    branches: [main]\n");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "    indented\non:\n  push:\n    branches: [main]\n"
+        );
     }
 
     #[test]
@@ -2421,9 +2639,9 @@ mod tests {
     #[test]
     fn named_registers_are_independent() {
         let mut editor = editor_with("foo bar");
-        press(&mut editor, "w");    // select "foo "
+        press(&mut editor, "w"); // select "foo "
         press(&mut editor, "\"ay"); // into register a; cursor back to 0
-        press(&mut editor, "d");    // unnamed register = "f"
+        press(&mut editor, "d"); // unnamed register = "f"
         assert_eq!(editor.doc().text.to_string(), "oo bar");
         assert_eq!(editor.register, "f");
         press(&mut editor, "\"aP");
@@ -2537,11 +2755,18 @@ mod tests {
     fn palette_rows_carry_the_shortest_binding() {
         let editor = editor_with("");
         let keymap = &editor.keymaps.normal;
-        assert_eq!(keymap.binding_of("find_files").as_deref(), Some("<space> f"));
+        assert_eq!(
+            keymap.binding_of("find_files").as_deref(),
+            Some("<space> f")
+        );
         assert_eq!(keymap.binding_of("save").as_deref(), Some("Ctrl-s")); // not <space> w
         assert_eq!(keymap.binding_of("format_buffer"), None); // `:fmt` only
         let picker = crate::picker::Picker::commands(keymap);
-        let item = picker.items.iter().find(|i| i.label == "find_files").unwrap();
+        let item = picker
+            .items
+            .iter()
+            .find(|i| i.label == "find_files")
+            .unwrap();
         assert!(item.detail.starts_with("<space> f  ·  "));
     }
 
@@ -2551,7 +2776,10 @@ mod tests {
         press(&mut editor, "<space>");
         let entries = editor.keymaps.normal.continuations(&editor.pending);
         assert!(entries.iter().any(|(k, n)| k == "e" && n == "tree_toggle"));
-        assert!(entries.iter().any(|(k, n)| k == "s" && n == "…"), "s is a group");
+        assert!(
+            entries.iter().any(|(k, n)| k == "s" && n == "…"),
+            "s is a group"
+        );
         assert!(entries.iter().any(|(k, n)| k == "w" && n == "save"));
         assert!(entries.iter().any(|(k, n)| k == "q" && n == "quit"));
         press(&mut editor, "s v");
@@ -2567,7 +2795,10 @@ mod tests {
         assert_eq!(editor.mode, Mode::Picker);
         press(&mut editor, "C-h");
         assert!(editor.picker.is_none());
-        assert!(editor.tree_focused, "C-h out of the picker crosses to the open sidebar");
+        assert!(
+            editor.tree_focused,
+            "C-h out of the picker crosses to the open sidebar"
+        );
     }
 
     #[test]
@@ -2577,7 +2808,10 @@ mod tests {
         press(&mut editor, "qui");
         let suggestions = editor.command_suggestions();
         assert_eq!(suggestions.first().map(String::as_str), Some("quit"));
-        assert_eq!(editor.command_suggest, None, "nothing highlighted until Tab");
+        assert_eq!(
+            editor.command_suggest, None,
+            "nothing highlighted until Tab"
+        );
         press(&mut editor, "<tab>");
         assert_eq!(editor.command_suggest, Some(0));
         press(&mut editor, "<enter>");
@@ -2703,7 +2937,10 @@ mod tests {
         }
         let completion = editor.completion.as_ref().expect("path menu popped");
         assert!(completion.items.iter().any(|(label, _)| label == "sub/"));
-        assert!(completion.items.iter().any(|(label, _)| label == "notes.txt"));
+        assert!(completion
+            .items
+            .iter()
+            .any(|(label, _)| label == "notes.txt"));
         press(&mut editor, "n");
         press(&mut editor, "<tab>");
         assert!(editor.doc().text.to_string().ends_with("/notes.txt"));
@@ -2909,7 +3146,9 @@ mod tests {
     fn config_keys_bind_registry_commands() {
         let mut config = crate::config::Config::default();
         config.keys_normal.push(("Q".into(), "quit".into()));
-        config.keys_normal.push(("Z".into(), "not_a_command".into()));
+        config
+            .keys_normal
+            .push(("Z".into(), "not_a_command".into()));
         let mut editor = Editor::new(vec![], (80, 24), &config).unwrap();
         assert!(editor.status.contains("not_a_command")); // bad bind reported
         press(&mut editor, "Q");

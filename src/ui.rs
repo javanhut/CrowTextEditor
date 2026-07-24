@@ -13,15 +13,20 @@ use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use crossterm::{cursor, queue};
 use ropey::RopeSlice;
 
-use crate::editor::{Editor, Mode};
 use crate::config::tab_width;
+use crate::editor::{Editor, Mode};
 use crate::position::{self};
 
 pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     // Synchronized updates make the terminal present the frame atomically
     // instead of painting it cell by cell as the bytes stream in; ignored by
     // terminals that don't support it.
-    queue!(out, BeginSynchronizedUpdate, cursor::Hide, cursor::MoveTo(0, 0))?;
+    queue!(
+        out,
+        BeginSynchronizedUpdate,
+        cursor::Hide,
+        cursor::MoveTo(0, 0)
+    )?;
 
     render_tree(editor, out)?;
     render_text(editor, out)?;
@@ -127,10 +132,24 @@ fn render_window(
     // from their stashed state.
     let (doc, cursor, anchor, extra, view_line, view_col) = if focused {
         let d = editor.doc();
-        (d, d.cursor, d.anchor, d.extra.clone(), d.view_line, d.view_col)
+        (
+            d,
+            d.cursor,
+            d.anchor,
+            d.extra.clone(),
+            d.view_line,
+            d.view_col,
+        )
     } else {
         let d = &editor.documents[win.doc.min(editor.documents.len() - 1)];
-        (d, win.cursor, win.anchor, win.extra.clone(), win.view_line, win.view_col)
+        (
+            d,
+            win.cursor,
+            win.anchor,
+            win.extra.clone(),
+            win.view_line,
+            win.view_col,
+        )
     };
 
     let diags: &[crate::lsp::Diagnostic] = doc
@@ -395,8 +414,12 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         (_, Some(c)) => format!("\"{c}"),
         _ => String::new(),
     };
-    let pending: String =
-        editor.pending.iter().map(|k| k.display()).collect::<Vec<_>>().join(" ");
+    let pending: String = editor
+        .pending
+        .iter()
+        .map(|k| k.display())
+        .collect::<Vec<_>>()
+        .join(" ");
     let count = editor.count.map(|n| n.to_string()).unwrap_or_default();
     let cursors = match doc.extra.len() {
         0 => String::new(),
@@ -414,14 +437,15 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         editor.documents.len()
     );
     let (line, _) = doc.cursor_line_col();
-    let pct = format!(" {}% ", ((line + 1) * 100 / doc.line_count().max(1)).min(100));
+    let pct = format!(
+        " {}% ",
+        ((line + 1) * 100 / doc.line_count().max(1)).min(100)
+    );
 
     let left_w = 2 + label.chars().count() + lsep.chars().count() + file.chars().count();
-    let right_w = info.chars().count()
-        + rsep.chars().count() * 2
-        + pos.chars().count()
-        + pct.chars().count();
-    if left_w + right_w + 1 <= width {
+    let right_w =
+        info.chars().count() + rsep.chars().count() * 2 + pos.chars().count() + pct.chars().count();
+    if left_w + right_w < width {
         queue!(
             out,
             cursor::MoveTo((width - right_w) as u16, row),
@@ -552,7 +576,14 @@ fn render_picker(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         return Ok(());
     };
     let (x, y, w, h) = editor.picker_rect();
-    draw_popup(out, x, y, w, &format!(" {} ", picker.title), &format!(" ▸ {}", picker.query))?;
+    draw_popup(
+        out,
+        x,
+        y,
+        w,
+        &format!(" {} ", picker.title),
+        &format!(" ▸ {}", picker.query),
+    )?;
 
     let list_h = (h as usize).saturating_sub(4).max(1);
     let start = picker
@@ -598,7 +629,11 @@ fn render_splash(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         ("Pick theme", "theme_picker"),
         ("Quit", "quit"),
     ];
-    let tagline = concat!("crow v", env!("CARGO_PKG_VERSION"), "  ·  :help for everything");
+    let tagline = concat!(
+        "crow v",
+        env!("CARGO_PKG_VERSION"),
+        "  ·  :help for everything"
+    );
 
     let (wx, wy, ww, wh) = editor.focused_rect();
     let total = LOGO.len() + 1 + ENTRIES.len() + 1 + 1;
@@ -626,9 +661,17 @@ fn render_splash(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     let entry_w = 32;
     let x = wx + ((ww as usize).saturating_sub(entry_w) / 2) as u16;
     for (label, command) in ENTRIES {
-        let keys = editor.keymaps.normal.binding_of(command).unwrap_or_default();
+        let keys = editor
+            .keymaps
+            .normal
+            .binding_of(command)
+            .unwrap_or_default();
         let (icon, color) = leader_hint(command);
-        let icon = if crate::config::icons() { format!("{icon} ") } else { String::new() };
+        let icon = if crate::config::icons() {
+            format!("{icon} ")
+        } else {
+            String::new()
+        };
         queue!(
             out,
             cursor::MoveTo(x, y),
@@ -687,7 +730,11 @@ fn render_pending_keys(editor: &Editor, out: &mut impl Write) -> std::io::Result
                 continue;
             };
             let (icon, color) = leader_hint(name);
-            let icon = if icons { format!("{icon} ") } else { String::new() };
+            let icon = if icons {
+                format!("{icon} ")
+            } else {
+                String::new()
+            };
             let name: String = name.chars().take(name_w).collect();
             queue!(
                 out,
@@ -716,28 +763,30 @@ fn leader_hint(name: &str) -> (&'static str, Color) {
     let theme = crate::theme::current();
     let syn = |i: usize, fallback: Color| theme.syntax[i].unwrap_or(fallback);
     match name {
-        "…" => ("\u{f101}", theme.border),                          //  group
-        "save" => ("\u{f0c7}", syn(2, Color::Green)),               //  floppy
-        "quit" => ("\u{f011}", Color::Red),                         //  power
-        "find_files" => ("\u{f002}", syn(4, Color::Cyan)),          //  search
-        "grep_text" => ("\u{f15c}", syn(2, Color::Green)),          //  file-text
-        "recent_files" => ("\u{f017}", syn(7, Color::Blue)),        //  clock
-        "file_explorer" => ("\u{f07b}", syn(5, Color::Yellow)),     //  folder
-        "tree_toggle" => ("\u{f07c}", syn(5, Color::Yellow)),       //  open folder
-        "command_palette" => ("\u{f489}", syn(3, Color::Magenta)),  //  terminal
-        "theme_picker" => ("\u{f043}", syn(7, Color::Blue)),        //  tint
+        "…" => ("\u{f101}", theme.border),                      //  group
+        "save" => ("\u{f0c7}", syn(2, Color::Green)),           //  floppy
+        "quit" => ("\u{f011}", Color::Red),                     //  power
+        "find_files" => ("\u{f002}", syn(4, Color::Cyan)),      //  search
+        "grep_text" => ("\u{f15c}", syn(2, Color::Green)),      //  file-text
+        "recent_files" => ("\u{f017}", syn(7, Color::Blue)),    //  clock
+        "file_explorer" => ("\u{f07b}", syn(5, Color::Yellow)), //  folder
+        "tree_toggle" => ("\u{f07c}", syn(5, Color::Yellow)),   //  open folder
+        "command_palette" => ("\u{f489}", syn(3, Color::Magenta)), //  terminal
+        "theme_picker" => ("\u{f043}", syn(7, Color::Blue)),    //  tint
         n if n.starts_with("split") => ("\u{f0db}", syn(4, Color::Cyan)), //  columns
-        _ => ("\u{f013}", syn(6, Color::DarkYellow)),               //  gear
+        _ => ("\u{f013}", syn(6, Color::DarkYellow)),           //  gear
     }
 }
 
-/// The `:help` window, in the same bordered box as the prompts and pickers.
+/// The `:help` window: the shared bordered box, with keys, command, and
+/// description in aligned, individually colored columns.
 fn render_help(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    use crate::commands::HelpLine;
     let Some(scroll) = editor.help_scroll else {
         return Ok(());
     };
     let (x, y, w, h) = editor.help_rect();
-    let lines = crate::commands::help_lines();
+    let lines = crate::commands::help_lines(&editor.keymaps.normal);
     let visible = (h as usize).saturating_sub(4).max(1);
     let hint = format!(
         " j/k scroll · esc close · {}–{}/{}",
@@ -746,8 +795,69 @@ fn render_help(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         lines.len()
     );
     draw_popup(out, x, y, w, " Help ", &hint)?;
-    let rows: Vec<String> = lines.iter().skip(scroll).take(visible).cloned().collect();
-    draw_box_list(out, x, y + 2, w, &rows, None)
+
+    let inner = (w as usize).saturating_sub(2);
+    let theme = crate::theme::current();
+    let fg = theme.fg.unwrap_or(Color::Reset);
+    queue!(
+        out,
+        cursor::MoveTo(x, y + 2),
+        SetBackgroundColor(theme.popup_bg),
+        SetForegroundColor(theme.border),
+        Print(format!("├{}┤", "─".repeat(inner)))
+    )?;
+    for (i, line) in lines.iter().skip(scroll).take(visible).enumerate() {
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 3 + i as u16),
+            SetForegroundColor(theme.border),
+            Print("│")
+        )?;
+        match line {
+            HelpLine::Header(title) => {
+                let text: String = format!(" {title}").chars().take(inner).collect();
+                queue!(
+                    out,
+                    SetAttribute(Attribute::Bold),
+                    SetForegroundColor(theme.border),
+                    Print(format!("{text:<inner$}")),
+                    SetAttribute(Attribute::Reset),
+                    SetBackgroundColor(theme.popup_bg)
+                )?;
+            }
+            HelpLine::Entry { keys, name, doc } => {
+                let mut budget = inner;
+                let take = |s: String, budget: &mut usize| -> String {
+                    let t: String = s.chars().take(*budget).collect();
+                    *budget -= t.chars().count();
+                    t
+                };
+                let keys = take(format!(" {keys:<14} "), &mut budget);
+                let name = take(format!("{name:<22} "), &mut budget);
+                let doc = take(doc.clone(), &mut budget);
+                queue!(
+                    out,
+                    SetForegroundColor(theme.gutter_cursor),
+                    Print(keys),
+                    SetForegroundColor(fg),
+                    Print(name),
+                    SetForegroundColor(theme.gutter),
+                    Print(doc),
+                    Print(" ".repeat(budget))
+                )?;
+            }
+        }
+        queue!(out, SetForegroundColor(theme.border), Print("│"))?;
+    }
+    queue!(
+        out,
+        cursor::MoveTo(
+            x,
+            y + 3 + visible.min(lines.len().saturating_sub(scroll)) as u16
+        ),
+        Print(format!("╰{}╯", "─".repeat(inner))),
+        ResetColor
+    )
 }
 
 /// The completion menu: a small list anchored at the cursor.
@@ -917,8 +1027,19 @@ fn render_prompt_popup(editor: &Editor, out: &mut impl Write) -> std::io::Result
         _ => return Ok(()),
     };
     let (x, y, w) = editor.prompt_rect();
-    let prefix = if editor.mode == Mode::Command { ':' } else { '/' };
-    draw_popup(out, x, y, w, title, &format!(" {prefix}{}", editor.command_line))?;
+    let prefix = if editor.mode == Mode::Command {
+        ':'
+    } else {
+        '/'
+    };
+    draw_popup(
+        out,
+        x,
+        y,
+        w,
+        title,
+        &format!(" {prefix}{}", editor.command_line),
+    )?;
 
     // Fuzzy command suggestions extend the prompt's box; Tab/arrows highlight.
     if editor.mode == Mode::Command {

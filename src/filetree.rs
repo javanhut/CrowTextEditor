@@ -63,7 +63,9 @@ impl FileTree {
         let mut files = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
+            if !crate::config::show_hidden()
+                && (name.starts_with('.') || name == "target" || name == "node_modules")
+            {
                 continue;
             }
             if entry.path().is_dir() {

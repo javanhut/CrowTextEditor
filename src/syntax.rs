@@ -101,34 +101,132 @@ macro_rules! lang {
     };
 }
 
-lang!(rust, tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY);
-lang!(toml, tree_sitter_toml_ng::LANGUAGE, tree_sitter_toml_ng::HIGHLIGHTS_QUERY);
-lang!(json, tree_sitter_json::LANGUAGE, tree_sitter_json::HIGHLIGHTS_QUERY);
-lang!(python, tree_sitter_python::LANGUAGE, tree_sitter_python::HIGHLIGHTS_QUERY);
-lang!(bash, tree_sitter_bash::LANGUAGE, tree_sitter_bash::HIGHLIGHT_QUERY);
-lang!(javascript, tree_sitter_javascript::LANGUAGE, tree_sitter_javascript::HIGHLIGHT_QUERY);
+lang!(
+    rust,
+    tree_sitter_rust::LANGUAGE,
+    tree_sitter_rust::HIGHLIGHTS_QUERY
+);
+lang!(
+    toml,
+    tree_sitter_toml_ng::LANGUAGE,
+    tree_sitter_toml_ng::HIGHLIGHTS_QUERY
+);
+lang!(
+    json,
+    tree_sitter_json::LANGUAGE,
+    tree_sitter_json::HIGHLIGHTS_QUERY
+);
+lang!(
+    python,
+    tree_sitter_python::LANGUAGE,
+    tree_sitter_python::HIGHLIGHTS_QUERY
+);
+lang!(
+    bash,
+    tree_sitter_bash::LANGUAGE,
+    tree_sitter_bash::HIGHLIGHT_QUERY
+);
+lang!(
+    javascript,
+    tree_sitter_javascript::LANGUAGE,
+    tree_sitter_javascript::HIGHLIGHT_QUERY
+);
 // The typescript crate's query is only the TS additions; prepend JS's.
-lang!(typescript, tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-    &[tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_typescript::HIGHLIGHTS_QUERY].concat());
-lang!(tsx, tree_sitter_typescript::LANGUAGE_TSX,
-    &[tree_sitter_javascript::HIGHLIGHT_QUERY, tree_sitter_typescript::HIGHLIGHTS_QUERY].concat());
-lang!(html, tree_sitter_html::LANGUAGE, tree_sitter_html::HIGHLIGHTS_QUERY);
-lang!(css, tree_sitter_css::LANGUAGE, tree_sitter_css::HIGHLIGHTS_QUERY);
+lang!(
+    typescript,
+    tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+    &[
+        tree_sitter_javascript::HIGHLIGHT_QUERY,
+        tree_sitter_typescript::HIGHLIGHTS_QUERY
+    ]
+    .concat()
+);
+lang!(
+    tsx,
+    tree_sitter_typescript::LANGUAGE_TSX,
+    &[
+        tree_sitter_javascript::HIGHLIGHT_QUERY,
+        tree_sitter_typescript::HIGHLIGHTS_QUERY
+    ]
+    .concat()
+);
+lang!(
+    html,
+    tree_sitter_html::LANGUAGE,
+    tree_sitter_html::HIGHLIGHTS_QUERY
+);
+lang!(
+    css,
+    tree_sitter_css::LANGUAGE,
+    tree_sitter_css::HIGHLIGHTS_QUERY
+);
 lang!(c, tree_sitter_c::LANGUAGE, tree_sitter_c::HIGHLIGHT_QUERY);
 // Likewise cpp's query is only the additions on top of C's.
-lang!(cpp, tree_sitter_cpp::LANGUAGE,
-    &[tree_sitter_c::HIGHLIGHT_QUERY, tree_sitter_cpp::HIGHLIGHT_QUERY].concat());
-lang!(go, tree_sitter_go::LANGUAGE, tree_sitter_go::HIGHLIGHTS_QUERY);
-lang!(java, tree_sitter_java::LANGUAGE, tree_sitter_java::HIGHLIGHTS_QUERY);
-lang!(ruby, tree_sitter_ruby::LANGUAGE, tree_sitter_ruby::HIGHLIGHTS_QUERY);
-lang!(php, tree_sitter_php::LANGUAGE_PHP, tree_sitter_php::HIGHLIGHTS_QUERY);
-lang!(csharp, tree_sitter_c_sharp::LANGUAGE, tree_sitter_c_sharp::HIGHLIGHTS_QUERY);
-lang!(yaml, tree_sitter_yaml::LANGUAGE, tree_sitter_yaml::HIGHLIGHTS_QUERY);
-lang!(markdown_inline, tree_sitter_md::INLINE_LANGUAGE, tree_sitter_md::HIGHLIGHT_QUERY_INLINE);
-lang!(markdown, tree_sitter_md::LANGUAGE, tree_sitter_md::HIGHLIGHT_QUERY_BLOCK, markdown_inline());
-lang!(odin, tree_sitter_odin::LANGUAGE, tree_sitter_odin::HIGHLIGHTS_QUERY);
-lang!(zig, tree_sitter_zig::LANGUAGE, tree_sitter_zig::HIGHLIGHTS_QUERY);
-lang!(lua, tree_sitter_lua::LANGUAGE, tree_sitter_lua::HIGHLIGHTS_QUERY);
+lang!(
+    cpp,
+    tree_sitter_cpp::LANGUAGE,
+    &[
+        tree_sitter_c::HIGHLIGHT_QUERY,
+        tree_sitter_cpp::HIGHLIGHT_QUERY
+    ]
+    .concat()
+);
+lang!(
+    go,
+    tree_sitter_go::LANGUAGE,
+    tree_sitter_go::HIGHLIGHTS_QUERY
+);
+lang!(
+    java,
+    tree_sitter_java::LANGUAGE,
+    tree_sitter_java::HIGHLIGHTS_QUERY
+);
+lang!(
+    ruby,
+    tree_sitter_ruby::LANGUAGE,
+    tree_sitter_ruby::HIGHLIGHTS_QUERY
+);
+lang!(
+    php,
+    tree_sitter_php::LANGUAGE_PHP,
+    tree_sitter_php::HIGHLIGHTS_QUERY
+);
+lang!(
+    csharp,
+    tree_sitter_c_sharp::LANGUAGE,
+    tree_sitter_c_sharp::HIGHLIGHTS_QUERY
+);
+lang!(
+    yaml,
+    tree_sitter_yaml::LANGUAGE,
+    tree_sitter_yaml::HIGHLIGHTS_QUERY
+);
+lang!(
+    markdown_inline,
+    tree_sitter_md::INLINE_LANGUAGE,
+    tree_sitter_md::HIGHLIGHT_QUERY_INLINE
+);
+lang!(
+    markdown,
+    tree_sitter_md::LANGUAGE,
+    tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+    markdown_inline()
+);
+lang!(
+    odin,
+    tree_sitter_odin::LANGUAGE,
+    tree_sitter_odin::HIGHLIGHTS_QUERY
+);
+lang!(
+    zig,
+    tree_sitter_zig::LANGUAGE,
+    tree_sitter_zig::HIGHLIGHTS_QUERY
+);
+lang!(
+    lua,
+    tree_sitter_lua::LANGUAGE,
+    tree_sitter_lua::HIGHLIGHTS_QUERY
+);
 
 pub fn config_for(path: Option<&Path>) -> Option<&'static Config> {
     match path?.extension()?.to_str()? {
@@ -181,7 +279,14 @@ pub fn parse(config: &'static Config, text: &Rope) -> Option<Syntax> {
                 if node.kind() == "inline" {
                     let range = node.byte_range();
                     if let Some(itree) = ip.parse(&src[range.clone()], None) {
-                        collect_spans(inline, itree.root_node(), &src[range.clone()], range.start, text, &mut spans);
+                        collect_spans(
+                            inline,
+                            itree.root_node(),
+                            &src[range.clone()],
+                            range.start,
+                            text,
+                            &mut spans,
+                        );
                     }
                 } else {
                     for i in 0..node.child_count() {
@@ -319,4 +424,3 @@ mod tests {
         assert_eq!(group_at(&spans, 10), 0);
     }
 }
-

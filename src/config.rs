@@ -19,6 +19,7 @@ pub struct Config {
     pub autoclose: bool,
     pub icons: bool,
     pub format_on_save: bool,
+    pub show_hidden: bool,
     /// Extra bindings per mode: (key sequence, command name).
     pub keys_normal: Vec<(String, String)>,
     pub keys_insert: Vec<(String, String)>,
@@ -38,6 +39,7 @@ impl Default for Config {
             autoclose: true,
             icons: true,
             format_on_save: true,
+            show_hidden: false,
             keys_normal: Vec::new(),
             keys_insert: Vec::new(),
             lsp: vec![("rs".into(), "rust-analyzer".into())],
@@ -51,6 +53,7 @@ static TAB_WIDTH: AtomicUsize = AtomicUsize::new(4);
 static SCROLLOFF: AtomicUsize = AtomicUsize::new(3);
 static AUTOCLOSE: AtomicBool = AtomicBool::new(true);
 static ICONS: AtomicBool = AtomicBool::new(true);
+static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false);
 static FORMAT_ON_SAVE: AtomicBool = AtomicBool::new(true);
 
 pub fn tab_width() -> usize {
@@ -69,6 +72,15 @@ pub fn icons() -> bool {
     ICONS.load(Ordering::Relaxed)
 }
 
+pub fn show_hidden() -> bool {
+    SHOW_HIDDEN.load(Ordering::Relaxed)
+}
+
+/// Flip dotfile visibility at runtime. Returns the new value.
+pub fn toggle_hidden() -> bool {
+    !SHOW_HIDDEN.fetch_xor(true, Ordering::Relaxed)
+}
+
 pub fn format_on_save() -> bool {
     FORMAT_ON_SAVE.load(Ordering::Relaxed)
 }
@@ -79,6 +91,7 @@ pub fn apply(config: &Config) {
     SCROLLOFF.store(config.scrolloff.min(50), Ordering::Relaxed);
     AUTOCLOSE.store(config.autoclose, Ordering::Relaxed);
     ICONS.store(config.icons, Ordering::Relaxed);
+    SHOW_HIDDEN.store(config.show_hidden, Ordering::Relaxed);
     FORMAT_ON_SAVE.store(config.format_on_save, Ordering::Relaxed);
     crate::theme::set(&config.theme);
     let _ = FMT.set(config.fmt.clone());
@@ -123,6 +136,60 @@ const BUILTIN_FMT: &[(&str, &str)] = &[
     ("yml", "prettier --stdin-filepath {file}"),
     ("yaml", "prettier --stdin-filepath {file}"),
 ];
+
+/// How to install a missing tool, keyed by the program :fmt or the LSP
+/// tries to spawn. Powers `:install` and the "install? (y/N)" offer.
+/// ponytail: macOS-first (brew/rustup/npm); add a Linux column when crow
+/// leaves this Mac.
+const INSTALLERS: &[(&str, &str)] = &[
+    ("prettier", "npm install -g prettier"),
+    ("rustfmt", "rustup component add rustfmt"),
+    ("rust-analyzer", "rustup component add rust-analyzer"),
+    ("gofmt", "brew install go"),
+    ("gopls", "brew install gopls"),
+    ("black", "brew install black"),
+    ("ruff", "brew install ruff"),
+    ("shfmt", "brew install shfmt"),
+    ("stylua", "brew install stylua"),
+    ("taplo", "brew install taplo"),
+    ("clang-format", "brew install clang-format"),
+    ("zig", "brew install zig"),
+    ("pyright-langserver", "npm install -g pyright"),
+    (
+        "typescript-language-server",
+        "npm install -g typescript typescript-language-server",
+    ),
+    (
+        "bash-language-server",
+        "npm install -g bash-language-server",
+    ),
+    (
+        "yaml-language-server",
+        "npm install -g yaml-language-server",
+    ),
+    (
+        "vscode-json-language-server",
+        "npm install -g vscode-langservers-extracted",
+    ),
+    (
+        "vscode-css-language-server",
+        "npm install -g vscode-langservers-extracted",
+    ),
+    (
+        "vscode-html-language-server",
+        "npm install -g vscode-langservers-extracted",
+    ),
+    ("lua-language-server", "brew install lua-language-server"),
+    ("zls", "brew install zls"),
+];
+
+/// The shell command that installs `program`, if we know one.
+pub fn installer(program: &str) -> Option<&'static str> {
+    INSTALLERS
+        .iter()
+        .find(|(p, _)| *p == program)
+        .map(|(_, c)| *c)
+}
 
 /// The formatter command line for a file extension: config entries first,
 /// then the built-in table.
@@ -196,6 +263,7 @@ scrolloff = 3
 autoclose = true         # type ( [ { " ' and the closer appears
 icons = true             # Nerd Font file icons in the tree (needs a Nerd Font)
 format_on_save = true    # pipe the buffer through its [fmt] formatter on :w
+show_hidden = false      # dotfiles, .git, and build dirs everywhere (toggle: . in the tree, :toggle_hidden)
 
 # Language servers: file extension = server command. crow starts the first
 # server whose extension matches an open file.
@@ -269,6 +337,7 @@ fn parse(text: &str) -> Config {
                 "scrolloff" => config.scrolloff = value.parse().unwrap_or(config.scrolloff),
                 "autoclose" => config.autoclose = value.parse().unwrap_or(config.autoclose),
                 "icons" => config.icons = value.parse().unwrap_or(config.icons),
+                "show_hidden" => config.show_hidden = value.parse().unwrap_or(config.show_hidden),
                 "format_on_save" => {
                     config.format_on_save = value.parse().unwrap_or(config.format_on_save)
                 }
@@ -360,12 +429,21 @@ py = "pyright-langserver --stdio"
         assert_eq!(config.theme, "gruvbox");
         assert_eq!(config.tab_width, 8);
         assert_eq!(config.scrolloff, 5);
-        assert_eq!(config.keys_normal, vec![
-            ("C-p".to_string(), "search".to_string()),
-            ("gq".to_string(), "quit".to_string()),
-        ]);
-        assert_eq!(config.keys_insert, vec![("C-s".to_string(), "save".to_string())]);
-        assert_eq!(config.lsp, vec![("py".to_string(), "pyright-langserver --stdio".to_string())]);
+        assert_eq!(
+            config.keys_normal,
+            vec![
+                ("C-p".to_string(), "search".to_string()),
+                ("gq".to_string(), "quit".to_string()),
+            ]
+        );
+        assert_eq!(
+            config.keys_insert,
+            vec![("C-s".to_string(), "save".to_string())]
+        );
+        assert_eq!(
+            config.lsp,
+            vec![("py".to_string(), "pyright-langserver --stdio".to_string())]
+        );
     }
 
     #[test]
@@ -398,7 +476,10 @@ py = "pyright-langserver --stdio"
     #[test]
     fn a_fmt_section_is_parsed() {
         let config = parse("[fmt]\npy = \"ruff format -\"\n");
-        assert_eq!(config.fmt, vec![("py".to_string(), "ruff format -".to_string())]);
+        assert_eq!(
+            config.fmt,
+            vec![("py".to_string(), "ruff format -".to_string())]
+        );
     }
 
     #[test]

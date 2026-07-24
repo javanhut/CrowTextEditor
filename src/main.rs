@@ -17,7 +17,7 @@ use std::io::{stdout, Write};
 use std::panic;
 use std::path::PathBuf;
 
-use crossterm::event::{self, Event};
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -102,6 +102,10 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
                         dirty = true;
                     }
                 }
+                Event::Paste(text) => {
+                    editor.handle_paste(&text);
+                    dirty = true;
+                }
                 Event::Resize(cols, rows) => {
                     editor.size = (cols, rows);
                     dirty = true;
@@ -110,6 +114,9 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
             }
         }
         if editor.lsp_tick() {
+            dirty = true;
+        }
+        if editor.install_tick() {
             dirty = true;
         }
 
@@ -126,7 +133,12 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
 
 fn setup_terminal() -> std::io::Result<()> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, cursor::Hide)
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        cursor::Hide
+    )
 }
 
 fn restore_terminal() -> std::io::Result<()> {
@@ -135,6 +147,7 @@ fn restore_terminal() -> std::io::Result<()> {
         out,
         cursor::SetCursorStyle::DefaultUserShape,
         cursor::Show,
+        DisableBracketedPaste,
         LeaveAlternateScreen
     );
     let _ = out.flush();

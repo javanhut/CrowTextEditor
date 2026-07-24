@@ -220,7 +220,9 @@ fn list_files(root: &Path) -> Vec<String> {
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+            if !crate::config::show_hidden()
+                && (name.starts_with('.') || SKIP.contains(&name.as_str()))
+            {
                 continue;
             }
             let path = entry.path();
@@ -276,7 +278,7 @@ fn list_dir(dir: &Path) -> Vec<Item> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
+            if name.starts_with('.') && !crate::config::show_hidden() {
                 continue;
             }
             if entry.path().is_dir() {
@@ -315,6 +317,19 @@ mod tests {
         let tight = fuzzy_score("word", "word_start").unwrap();
         let scattered = fuzzy_score("word", "w_o_r_d_x").unwrap();
         assert!(tight > scattered);
+    }
+
+    #[test]
+    fn hidden_files_follow_the_toggle() {
+        let dir = std::env::temp_dir().join("crow-hidden-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=1").unwrap();
+        std::fs::write(dir.join("main.rs"), "").unwrap();
+        assert!(!crate::config::show_hidden(), "hidden by default");
+        assert!(!list_files(&dir).iter().any(|f| f == ".env"));
+        crate::config::toggle_hidden();
+        assert!(list_files(&dir).iter().any(|f| f == ".env"));
+        crate::config::toggle_hidden(); // restore for other tests
     }
 
     #[test]

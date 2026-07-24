@@ -247,7 +247,9 @@ impl Client {
                 match tag {
                     "initialize" => {
                         self.ready = true;
-                        self.write(&json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+                        self.write(
+                            &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+                        );
                         for queued in std::mem::take(&mut self.queued) {
                             self.write(&queued);
                         }
@@ -292,7 +294,8 @@ fn parse_location(result: &Value) -> Option<(PathBuf, usize, usize)> {
         Some(u) => (u, loc.get("range")?),
         None => (
             loc.get("targetUri")?,
-            loc.get("targetSelectionRange").or_else(|| loc.get("targetRange"))?,
+            loc.get("targetSelectionRange")
+                .or_else(|| loc.get("targetRange"))?,
         ),
     };
     Some((
@@ -368,14 +371,12 @@ fn hover_text(result: &Value) -> Option<String> {
         s.to_string()
     } else if let Some(v) = contents.get("value").and_then(Value::as_str) {
         v.to_string()
-    } else if let Some(arr) = contents.as_array() {
-        let first = arr.first()?;
+    } else {
+        let first = contents.as_array()?.first()?;
         first
             .as_str()
             .map(str::to_string)
             .or_else(|| first.get("value")?.as_str().map(str::to_string))?
-    } else {
-        return None;
     };
     raw.lines()
         .map(str::trim)

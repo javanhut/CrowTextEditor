@@ -102,10 +102,15 @@ impl Key {
         let mut alt = false;
 
         loop {
-            if let Some(tail) = rest.strip_prefix("Ctrl-").or_else(|| rest.strip_prefix("C-")) {
+            if let Some(tail) = rest
+                .strip_prefix("Ctrl-")
+                .or_else(|| rest.strip_prefix("C-"))
+            {
                 ctrl = true;
                 rest = tail;
-            } else if let Some(tail) = rest.strip_prefix("Alt-").or_else(|| rest.strip_prefix("A-"))
+            } else if let Some(tail) = rest
+                .strip_prefix("Alt-")
+                .or_else(|| rest.strip_prefix("A-"))
             {
                 alt = true;
                 rest = tail;

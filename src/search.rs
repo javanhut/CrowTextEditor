@@ -69,7 +69,10 @@ mod tests {
 
     #[test]
     fn finds_all_matches() {
-        assert_eq!(find("foo x foo y foo", "foo"), vec![(0, 3), (6, 9), (12, 15)]);
+        assert_eq!(
+            find("foo x foo y foo", "foo"),
+            vec![(0, 3), (6, 9), (12, 15)]
+        );
     }
 
     #[test]

@@ -101,9 +101,10 @@ impl Document {
     }
 
     pub fn save(&mut self) -> std::io::Result<()> {
-        let path = self.path.clone().ok_or_else(|| {
-            std::io::Error::other("buffer has no filename")
-        })?;
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| std::io::Error::other("buffer has no filename"))?;
         self.text.write_to(BufWriter::new(File::create(&path)?))?;
         self.modified = false;
         Ok(())
@@ -149,7 +150,9 @@ impl Document {
     }
 
     pub fn cursor_line(&self) -> usize {
-        let idx = self.text.char_to_line(self.cursor.min(self.text.len_chars()));
+        let idx = self
+            .text
+            .char_to_line(self.cursor.min(self.text.len_chars()));
         // A cursor sitting just past a trailing newline lands on the phantom
         // final line ropey reports; pull it back onto a real one.
         idx.min(self.line_count().saturating_sub(1))

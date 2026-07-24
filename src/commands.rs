@@ -4,9 +4,9 @@
 //! borrowing the editor, and so bindings can be looked up by name — which is
 //! what a config file will need.
 
+use crate::config::tab_width;
 use crate::document::Document;
 use crate::editor::{Editor, Mode};
-use crate::config::tab_width;
 use crate::position::{self, CharClass};
 use crate::transaction::Transaction;
 
@@ -54,6 +54,7 @@ commands! {
     recent_files => "reopen a recently opened file",
     file_explorer => "browse the current directory in a picker",
     tree_toggle => "toggle the file tree sidebar",
+    toggle_hidden => "show or hide dotfiles and build dirs in the tree, finder, and grep",
     focus_left => "focus the window to the left, or the open file tree",
     focus_right => "focus the window to the right",
     focus_down => "focus the window below",
@@ -107,30 +108,52 @@ commands! {
     quit => "close the window, or the editor with the last one",
 }
 
-/// The `:help` window's text: the `:` commands, then every named command.
-pub fn help_lines() -> Vec<String> {
-    let mut out: Vec<String> = [
-        (":w [path], :write", "write the buffer (optionally to path)"),
-        (":q, :quit", "close the window, or the editor with the last one"),
-        (":q!", "quit without saving"),
-        (":wq, :x", "write, then quit"),
-        (":e <file>, :edit", "open a file"),
-        (":fmt, :format", "run the file's formatter over the buffer"),
-        (":bn / :bp", "next / previous buffer"),
+/// One row of the `:help` window.
+pub enum HelpLine {
+    Header(&'static str),
+    Entry {
+        keys: String,
+        name: String,
+        doc: String,
+    },
+}
+
+/// The `:help` window's rows: the `:` commands, then every named command
+/// with its live key binding.
+pub fn help_lines(keymap: &crate::keymap::KeyTrie) -> Vec<HelpLine> {
+    let mut out = vec![HelpLine::Header("Command line — press :")];
+    for (cmd, doc) in [
+        (":w [path]", "write the buffer (:write; to a path if given)"),
+        (":q  :q!", "close the window / quit without saving"),
+        (":wq  :x", "write, then quit"),
+        (":e <file>", "open a file (:edit)"),
+        (":fmt", "run the file's formatter over the buffer"),
+        (
+            ":install <x>",
+            "install the tool for a name or extension (:lsp-install <ext> for servers)",
+        ),
+        (":bn  :bp", "next / previous buffer"),
         (":theme [name]", "list themes, or switch to one"),
         (":config", "edit crow.toml"),
         (":<number>", "jump to that line"),
-        (":help, :h", "this window"),
+        (":help  :h", "this window"),
         (":<command>", "run any command below by name"),
-    ]
-    .iter()
-    .map(|(cmd, doc)| format!(" {cmd:<26} {doc}"))
-    .collect();
-    out.push(String::new());
-    out.push(" Commands (also in the palette, <space> c):".to_string());
-    out.push(String::new());
+    ] {
+        out.push(HelpLine::Entry {
+            keys: cmd.to_string(),
+            name: String::new(),
+            doc: doc.to_string(),
+        });
+    }
+    out.push(HelpLine::Header(
+        "Commands — also in the palette (<space> c)",
+    ));
     for c in COMMANDS {
-        out.push(format!(" {:<26} {}", c.name, c.doc));
+        out.push(HelpLine::Entry {
+            keys: keymap.binding_of(c.name).unwrap_or_default(),
+            name: c.name.to_string(),
+            doc: c.doc.to_string(),
+        });
     }
     out
 }
@@ -411,7 +434,8 @@ fn add_cursor(editor: &mut Editor, dir: isize) {
             position::char_to_display_col(doc.line(line), pos - doc.line_start(line), tab_width())
         };
         let to_target = |doc: &Document, col: usize| {
-            doc.line_start(target) + position::display_col_to_char(doc.line(target), col, tab_width())
+            doc.line_start(target)
+                + position::display_col_to_char(doc.line(target), col, tab_width())
         };
 
         let new_c = to_target(doc, col_on(doc, cline, c));
@@ -462,6 +486,18 @@ fn file_explorer(editor: &mut Editor) {
 
 fn tree_toggle(editor: &mut Editor) {
     editor.tree_toggle();
+}
+
+fn toggle_hidden(editor: &mut Editor) {
+    let shown = crate::config::toggle_hidden();
+    if let Some(tree) = editor.tree.as_mut() {
+        tree.rebuild();
+    }
+    editor.set_status(if shown {
+        "dotfiles shown"
+    } else {
+        "dotfiles hidden"
+    });
 }
 
 fn focus_left(editor: &mut Editor) {
@@ -785,7 +821,11 @@ fn goto_file_end(editor: &mut Editor) {
 /// `gg`/`G` go to their end of the file — unless a count names a line, so
 /// `42gg` and `42G` both jump to line 42.
 fn goto_line(editor: &mut Editor, default: usize) {
-    let line = editor.count.take().map(|n| n.saturating_sub(1)).unwrap_or(default);
+    let line = editor
+        .count
+        .take()
+        .map(|n| n.saturating_sub(1))
+        .unwrap_or(default);
     let doc = editor.doc_mut();
     doc.cursor = doc.line_start(line.min(doc.line_count().saturating_sub(1)));
     doc.goal_col = None;
@@ -993,6 +1033,12 @@ fn run_formatter(editor: &mut Editor) -> Option<Result<&'static str, String>> {
         .spawn();
     let mut child = match spawned {
         Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if editor.offer_install(program) {
+                return None; // the status line is now the install prompt
+            }
+            return Some(Err(format!("{program}: not installed")));
+        }
         Err(e) => return Some(Err(format!("{program}: {e}"))),
     };
     let _ = child.stdin.take().unwrap().write_all(src.as_bytes());
@@ -1002,7 +1048,10 @@ fn run_formatter(editor: &mut Editor) -> Option<Result<&'static str, String>> {
     };
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("failed");
+        let first = err
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("failed");
         return Some(Err(format!("{program}: {first}")));
     }
 
@@ -1025,6 +1074,8 @@ fn format_buffer(editor: &mut Editor) {
     match run_formatter(editor) {
         Some(Ok(what)) => editor.set_status(what),
         Some(Err(e)) => editor.set_status(e),
+        // An armed install offer already owns the status line.
+        None if editor.pending_install.is_some() => {}
         None => editor.set_status("no formatter for this buffer (see [fmt] in crow.toml)"),
     }
 }
@@ -1108,7 +1159,11 @@ fn delete_backward(editor: &mut Editor) {
     let next = (doc.cursor < doc.text.len_chars()).then(|| doc.text.char(doc.cursor));
     let empty_pair = matches!(
         (prev, next),
-        ('(', Some(')')) | ('[', Some(']')) | ('{', Some('}')) | ('"', Some('"')) | ('\'', Some('\''))
+        ('(', Some(')'))
+            | ('[', Some(']'))
+            | ('{', Some('}'))
+            | ('"', Some('"'))
+            | ('\'', Some('\''))
     );
     let to = if empty_pair && crate::config::autoclose() {
         doc.cursor + 1
@@ -1153,6 +1208,9 @@ fn save(editor: &mut Editor) {
     // Format first; a broken formatter never blocks the write.
     let fmt_err = match crate::config::format_on_save().then(|| run_formatter(editor)) {
         Some(Some(Err(e))) => Some(e),
+        // A missing formatter armed the install offer: carry its prompt into
+        // the "written" message so the (y/N) stays visible.
+        Some(None) if editor.pending_install.is_some() => Some(editor.status.clone()),
         _ => None,
     };
     match editor.doc_mut().save() {
