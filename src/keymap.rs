@@ -102,10 +102,11 @@ impl Key {
         let mut alt = false;
 
         loop {
-            if let Some(tail) = rest.strip_prefix("C-") {
+            if let Some(tail) = rest.strip_prefix("Ctrl-").or_else(|| rest.strip_prefix("C-")) {
                 ctrl = true;
                 rest = tail;
-            } else if let Some(tail) = rest.strip_prefix("A-") {
+            } else if let Some(tail) = rest.strip_prefix("Alt-").or_else(|| rest.strip_prefix("A-"))
+            {
                 alt = true;
                 rest = tail;
             } else {
@@ -146,10 +147,10 @@ impl Key {
     pub fn display(&self) -> String {
         let mut s = String::new();
         if self.ctrl {
-            s.push_str("C-");
+            s.push_str("Ctrl-");
         }
         if self.alt {
-            s.push_str("A-");
+            s.push_str("Alt-");
         }
         match self.code {
             KeyCode::Char(' ') => s.push_str("<space>"),
@@ -325,6 +326,8 @@ mod tests {
                 alt: false
             })
         );
+        assert_eq!(Key::parse("Ctrl-d"), Key::parse("C-d"));
+        assert_eq!(Key::parse("Alt-x"), Key::parse("A-x"));
         assert_eq!(Key::parse("<esc>"), Some(Key::new(KeyCode::Esc)));
         assert_eq!(
             Key::parse("A-x"),

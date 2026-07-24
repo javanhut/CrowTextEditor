@@ -9,9 +9,7 @@ use std::io::Write;
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
-use crossterm::terminal::{
-    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate,
-};
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use crossterm::{cursor, queue};
 use ropey::RopeSlice;
 
@@ -27,6 +25,7 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
 
     render_tree(editor, out)?;
     render_text(editor, out)?;
+    render_splash(editor, out)?;
     render_status_line(editor, out)?;
     render_command_line(editor, out)?;
     render_prompt_popup(editor, out)?;
@@ -79,7 +78,18 @@ type Style = (u8, Option<Color>, u8);
 fn render_text(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     let (wins, seps) = editor.window_rects();
     for &(id, rect) in &wins {
-        render_window(editor, id, rect, out)?;
+        if editor.show_splash() {
+            // The splash owns the whole area: no gutter, no `~` rows.
+            let (x, y, w, h) = rect;
+            let theme = crate::theme::current();
+            queue!(out, SetBackgroundColor(theme.bg.unwrap_or(Color::Reset)))?;
+            for row in y..y + h {
+                queue!(out, cursor::MoveTo(x, row), Print(" ".repeat(w as usize)))?;
+            }
+            queue!(out, ResetColor)?;
+        } else {
+            render_window(editor, id, rect, out)?;
+        }
     }
     for &((x, y, w, h), vertical) in &seps {
         let theme = crate::theme::current();
@@ -325,57 +335,114 @@ fn styled_visible(
     runs
 }
 
+/// The status line, NvCrow-style: a colored mode segment with a powerline
+/// chevron on the left, the file beside it, and chevroned pills for cursor
+/// position and progress on the right. Without icons the chevrons vanish
+/// and the segments stand on their colors alone.
 fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     let row = editor.size.1.saturating_sub(2);
     let width = editor.size.0 as usize;
     let doc = editor.doc();
+    let theme = crate::theme::current();
 
-    let label = if editor.extend && editor.mode == Mode::Normal {
-        "SEL"
+    let (label, accent) = if editor.extend && editor.mode == Mode::Normal {
+        ("SELECT", Color::Magenta)
     } else {
-        editor.mode.label()
+        match editor.mode {
+            Mode::Normal => ("NORMAL", Color::Blue),
+            Mode::Insert => ("INSERT", Color::Green),
+            Mode::Command => ("COMMAND", Color::Yellow),
+            Mode::Search => ("SEARCH", Color::Yellow),
+            Mode::Picker => ("PICKER", Color::Yellow),
+        }
     };
-    let left = format!(
-        " {}  {}{} ",
-        label,
-        doc.name(),
-        if doc.modified { " [+]" } else { "" }
-    );
+    let (lsep, rsep) = if crate::config::icons() {
+        ("\u{e0b0}", "\u{e0b2}")
+    } else {
+        ("", "")
+    };
+    let bar_bg = theme.popup_bg;
+    let fg = theme.fg.unwrap_or(Color::Reset);
 
+    // Base coat, then segments over it.
+    queue!(
+        out,
+        cursor::MoveTo(0, row),
+        ResetColor,
+        SetBackgroundColor(bar_bg),
+        Print(" ".repeat(width))
+    )?;
+
+    let file = format!(" {}{}", doc.name(), if doc.modified { " [+]" } else { "" });
+    queue!(
+        out,
+        cursor::MoveTo(0, row),
+        SetAttribute(Attribute::Bold),
+        SetBackgroundColor(accent),
+        SetForegroundColor(Color::Black),
+        Print(format!(" {label} ")),
+        SetAttribute(Attribute::Reset),
+        SetBackgroundColor(bar_bg),
+        SetForegroundColor(accent),
+        Print(lsep),
+        SetForegroundColor(fg),
+        Print(&file)
+    )?;
+
+    // Right side: transient input state, then the pills.
     let reg = match (editor.awaiting_register, editor.active_register) {
         (true, _) => "\"".to_string(),
         (_, Some(c)) => format!("\"{c}"),
         _ => String::new(),
     };
-    let pending: String = editor.pending.iter().map(|k| k.display()).collect();
-    let count = format!("{}{}", reg, editor.count.map(|n| n.to_string()).unwrap_or_default());
+    let pending: String =
+        editor.pending.iter().map(|k| k.display()).collect::<Vec<_>>().join(" ");
+    let count = editor.count.map(|n| n.to_string()).unwrap_or_default();
     let cursors = match doc.extra.len() {
         0 => String::new(),
         n => format!("{} cursors  ", n + 1),
     };
+    let mut info = format!("{cursors}{reg}{count}{pending}");
+    if !info.is_empty() {
+        info.push_str("  ");
+    }
 
-    let right = format!(
-        " {}{}  {}{}  {}/{} ",
-        count,
-        pending,
-        cursors,
+    let pos = format!(
+        " {}  {}/{} ",
         editor.cursor_indicator(),
         editor.current + 1,
         editor.documents.len()
     );
+    let (line, _) = doc.cursor_line_col();
+    let pct = format!(" {}% ", ((line + 1) * 100 / doc.line_count().max(1)).min(100));
 
-    let padding = width.saturating_sub(left.chars().count() + right.chars().count());
-    let line = format!("{left}{}{right}", " ".repeat(padding));
-    let line: String = line.chars().take(width).collect();
-
-    queue!(
-        out,
-        cursor::MoveTo(0, row),
-        SetAttribute(Attribute::Reverse),
-        Print(line),
-        SetAttribute(Attribute::Reset),
-        Clear(ClearType::UntilNewLine)
-    )
+    let left_w = 2 + label.chars().count() + lsep.chars().count() + file.chars().count();
+    let right_w = info.chars().count()
+        + rsep.chars().count() * 2
+        + pos.chars().count()
+        + pct.chars().count();
+    if left_w + right_w + 1 <= width {
+        queue!(
+            out,
+            cursor::MoveTo((width - right_w) as u16, row),
+            SetBackgroundColor(bar_bg),
+            SetForegroundColor(fg),
+            Print(&info),
+            SetForegroundColor(theme.selection),
+            Print(rsep),
+            SetBackgroundColor(theme.selection),
+            SetForegroundColor(fg),
+            Print(&pos),
+            SetForegroundColor(accent),
+            Print(rsep),
+            SetAttribute(Attribute::Bold),
+            SetBackgroundColor(accent),
+            SetForegroundColor(Color::Black),
+            Print(&pct),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+    queue!(out, ResetColor)
 }
 
 /// The file tree sidebar: indented rows, `▸`/`▾` on directories, the
@@ -402,47 +469,73 @@ fn render_tree(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
             ResetColor,
             SetBackgroundColor(theme.bg.unwrap_or(Color::Reset))
         )?;
-        let line = match tree.rows.get(start + row) {
-            Some(r) => {
-                let marker = if r.is_dir {
-                    if r.expanded {
-                        "▾ "
-                    } else {
-                        "▸ "
-                    }
+        let mut printed = 0usize;
+        if let Some(r) = tree.rows.get(start + row) {
+            let idx = start + row;
+            let indent = " ".repeat(r.depth);
+            let marker = if r.is_dir {
+                match (crate::config::icons(), r.expanded) {
+                    (true, true) => "\u{f107} ",  //  angle-down
+                    (true, false) => "\u{f105} ", //  angle-right
+                    (false, true) => "▾ ",
+                    (false, false) => "▸ ",
+                }
+            } else {
+                "  "
+            };
+            let (icon, icon_color) = file_icon(&r.name, r.is_dir, r.expanded);
+            let icon = if crate::config::icons() {
+                format!("{icon} ")
+            } else {
+                String::new()
+            };
+            if idx == tree.selected && editor.tree_focused {
+                let line: String = format!("{indent}{marker}{icon}{}", r.name)
+                    .chars()
+                    .take(inner)
+                    .collect();
+                queue!(
+                    out,
+                    SetAttribute(Attribute::Reverse),
+                    Print(format!("{line:<inner$}")),
+                    SetAttribute(Attribute::Reset),
+                    SetBackgroundColor(theme.bg.unwrap_or(Color::Reset))
+                )?;
+                printed = inner;
+            } else {
+                // Root header in the accent, directories highlighted, files
+                // plain — with the icon in its filetype color.
+                let name_color = if idx == 0 {
+                    theme.border
+                } else if r.is_dir {
+                    theme.gutter_cursor
                 } else {
-                    "  "
+                    theme.fg.unwrap_or(Color::Reset)
                 };
-                let icon = if crate::config::icons() {
-                    format!("{} ", file_icon(&r.name, r.is_dir, r.expanded))
-                } else {
-                    String::new()
+                let mut budget = inner;
+                let take = |s: &str, budget: &mut usize| -> String {
+                    let t: String = s.chars().take(*budget).collect();
+                    *budget -= t.chars().count();
+                    t
                 };
-                format!("{}{}{}{}", " ".repeat(r.depth), marker, icon, r.name)
+                let lead = take(&format!("{indent}{marker}"), &mut budget);
+                let icon = take(&icon, &mut budget);
+                let name = take(&r.name, &mut budget);
+                queue!(
+                    out,
+                    SetForegroundColor(theme.gutter),
+                    Print(lead),
+                    SetForegroundColor(icon_color),
+                    Print(icon),
+                    SetForegroundColor(name_color),
+                    Print(name)
+                )?;
+                printed = inner - budget;
             }
-            None => String::new(),
-        };
-        let line: String = line.chars().take(inner).collect();
-        if start + row == tree.selected && editor.tree_focused {
-            queue!(
-                out,
-                SetAttribute(Attribute::Reverse),
-                Print(format!("{line:<inner$}")),
-                SetAttribute(Attribute::Reset)
-            )?;
-        } else {
-            // The root header gets the accent color; other dirs the gutter
-            // highlight.
-            if start + row == 0 {
-                queue!(out, SetForegroundColor(theme.border))?;
-            } else if tree.rows.get(start + row).is_some_and(|r| r.is_dir) {
-                queue!(out, SetForegroundColor(theme.gutter_cursor))?;
-            }
-            queue!(out, Print(format!("{line:<inner$}")), ResetColor)?;
         }
         queue!(
             out,
-            SetBackgroundColor(theme.bg.unwrap_or(Color::Reset)),
+            Print(" ".repeat(inner - printed)),
             SetForegroundColor(theme.gutter),
             Print("│"),
             ResetColor
@@ -480,6 +573,86 @@ fn render_picker(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         .collect();
     let selected = (!picker.filtered.is_empty()).then(|| picker.selected - start);
     draw_box_list(out, x, y + 2, w, &rows, selected)
+}
+
+/// The start screen: a logo and the keys worth knowing, drawn over the
+/// untouched startup buffer. Purely informative — every key acts normally.
+fn render_splash(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    if !editor.show_splash() {
+        return Ok(());
+    }
+    const LOGO: &[&str] = &[
+        " ██████╗██████╗  ██████╗ ██╗    ██╗",
+        "██╔════╝██╔══██╗██╔═══██╗██║    ██║",
+        "██║     ██████╔╝██║   ██║██║ █╗ ██║",
+        "██║     ██╔══██╗██║   ██║██║███╗██║",
+        "╚██████╗██║  ██║╚██████╔╝╚███╔███╔╝",
+        " ╚═════╝╚═╝  ╚═╝ ╚═════╝  ╚══╝╚══╝ ",
+    ];
+    const ENTRIES: &[(&str, &str)] = &[
+        ("Find file", "find_files"),
+        ("Recent files", "recent_files"),
+        ("Grep text", "grep_text"),
+        ("File tree", "tree_toggle"),
+        ("Command palette", "command_palette"),
+        ("Pick theme", "theme_picker"),
+        ("Quit", "quit"),
+    ];
+    let tagline = concat!("crow v", env!("CARGO_PKG_VERSION"), "  ·  :help for everything");
+
+    let (wx, wy, ww, wh) = editor.focused_rect();
+    let total = LOGO.len() + 1 + ENTRIES.len() + 1 + 1;
+    let logo_w = LOGO[0].chars().count();
+    if (wh as usize) < total + 2 || (ww as usize) < logo_w + 2 {
+        return Ok(()); // window too small for decoration
+    }
+    let theme = crate::theme::current();
+    // Text cells must sit on the same background the area was filled with.
+    queue!(out, SetBackgroundColor(theme.bg.unwrap_or(Color::Reset)))?;
+    let mut y = wy + ((wh as usize - total) / 2) as u16;
+
+    for row in LOGO {
+        let x = wx + ((ww as usize - logo_w) / 2) as u16;
+        queue!(
+            out,
+            cursor::MoveTo(x, y),
+            SetForegroundColor(theme.border),
+            Print(row)
+        )?;
+        y += 1;
+    }
+    y += 1;
+
+    let entry_w = 32;
+    let x = wx + ((ww as usize).saturating_sub(entry_w) / 2) as u16;
+    for (label, command) in ENTRIES {
+        let keys = editor.keymaps.normal.binding_of(command).unwrap_or_default();
+        let (icon, color) = leader_hint(command);
+        let icon = if crate::config::icons() { format!("{icon} ") } else { String::new() };
+        queue!(
+            out,
+            cursor::MoveTo(x, y),
+            SetForegroundColor(color),
+            Print(icon),
+            SetForegroundColor(theme.fg.unwrap_or(Color::Reset)),
+            Print(format!("{label:<17}")),
+            SetForegroundColor(color),
+            Print(format!("{keys:>12}"))
+        )?;
+        y += 1;
+    }
+    y += 1;
+
+    let x = wx + ((ww as usize).saturating_sub(tagline.chars().count()) / 2) as u16;
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        SetForegroundColor(theme.gutter),
+        SetAttribute(Attribute::Italic),
+        Print(tagline),
+        SetAttribute(Attribute::Reset),
+        ResetColor
+    )
 }
 
 /// Which-key: a pending multi-key sequence (the space leader, C-w, g…)
@@ -673,28 +846,33 @@ fn render_command_line(editor: &Editor, out: &mut impl Write) -> std::io::Result
 
 /// Nerd Font glyph for a tree row. Needs a Nerd Font in the terminal
 /// (`icons = false` in crow.toml otherwise).
-fn file_icon(name: &str, is_dir: bool, expanded: bool) -> &'static str {
+/// Nerd Font icon and filetype color for a tree entry, nvim-tree-style.
+fn file_icon(name: &str, is_dir: bool, expanded: bool) -> (&'static str, Color) {
+    const fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color::Rgb { r, g, b }
+    }
     if is_dir {
-        return if expanded { "\u{f07c}" } else { "\u{f07b}" }; // open/closed folder
+        let icon = if expanded { "\u{f07c}" } else { "\u{f07b}" }; // open/closed folder
+        return (icon, rgb(122, 162, 247));
     }
     match name.rsplit('.').next().unwrap_or("") {
-        "rs" => "\u{e7a8}",
-        "toml" => "\u{e615}",
-        "md" => "\u{f48a}",
-        "json" => "\u{e60b}",
-        "sh" | "bash" | "zsh" => "\u{f489}",
-        "py" => "\u{e73c}",
-        "js" | "jsx" | "mjs" => "\u{e74e}",
-        "ts" | "tsx" => "\u{e628}",
-        "c" | "h" => "\u{e61e}",
-        "cc" | "cpp" | "hpp" => "\u{e61d}",
-        "go" => "\u{e626}",
-        "html" => "\u{e736}",
-        "css" => "\u{e749}",
-        "yml" | "yaml" => "\u{e615}",
-        "lock" => "\u{f023}",
-        "txt" => "\u{f15c}",
-        _ => "\u{f15b}", // generic file
+        "rs" => ("\u{e7a8}", rgb(222, 165, 132)),
+        "toml" => ("\u{e615}", rgb(228, 104, 118)),
+        "md" => ("\u{f48a}", rgb(130, 170, 255)),
+        "json" => ("\u{e60b}", rgb(224, 175, 104)),
+        "sh" | "bash" | "zsh" => ("\u{f489}", rgb(158, 206, 106)),
+        "py" => ("\u{e73c}", rgb(224, 175, 104)),
+        "js" | "jsx" | "mjs" => ("\u{e74e}", rgb(224, 175, 104)),
+        "ts" | "tsx" => ("\u{e628}", rgb(86, 156, 214)),
+        "c" | "h" => ("\u{e61e}", rgb(86, 156, 214)),
+        "cc" | "cpp" | "hpp" => ("\u{e61d}", rgb(86, 156, 214)),
+        "go" => ("\u{e626}", rgb(86, 192, 230)),
+        "html" => ("\u{e736}", rgb(225, 140, 84)),
+        "css" => ("\u{e749}", rgb(86, 156, 214)),
+        "yml" | "yaml" => ("\u{e615}", rgb(187, 154, 247)),
+        "lock" => ("\u{f023}", rgb(150, 150, 150)),
+        "txt" => ("\u{f15c}", rgb(160, 170, 190)),
+        _ => ("\u{f15b}", rgb(160, 170, 190)), // generic file
     }
 }
 

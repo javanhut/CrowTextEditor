@@ -206,9 +206,10 @@ rs = "rust-analyzer"
 
 # Extra keybindings: "sequence" = "command". Any command callable with
 # `:name` can be bound. Later bindings win over defaults.
+# Modifiers: "Ctrl-" and "Alt-" (the short "C-"/"A-" forms also work).
 [keys.normal]
 # "gq" = "quit"
-# "C-p" = "search"
+# "Ctrl-p" = "search"
 
 [keys.insert]
 

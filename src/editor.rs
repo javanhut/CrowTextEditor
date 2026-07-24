@@ -19,18 +19,6 @@ pub enum Mode {
     Picker,
 }
 
-impl Mode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Mode::Normal => "NOR",
-            Mode::Insert => "INS",
-            Mode::Command => "CMD",
-            Mode::Search => "FND",
-            Mode::Picker => "PCK",
-        }
-    }
-}
-
 /// A pending file operation started from the tree sidebar.
 pub enum TreeInput {
     /// Typing a name for a new entry inside `dir`; a trailing `/` makes a
@@ -299,18 +287,20 @@ impl Default for Keymaps {
         normal.bind_str("<space> g", "grep_text");
         normal.bind_str("<space> r", "recent_files");
         normal.bind_str("<space> e", "tree_toggle");
+        normal.bind_str("C-t", "tree_toggle");
         normal.bind_str("C-h", "focus_left");
         normal.bind_str("C-<left>", "focus_left");
         normal.bind_str("C-<bs>", "focus_left"); // terminals that send C-h as ^H
         normal.bind_str("C-l", "focus_right");
         normal.bind_str("C-<right>", "focus_right");
-        normal.bind_str("C-j", "focus_down");
+        // j/k deliberately flipped from vim: C-j up, C-k down.
+        normal.bind_str("C-j", "focus_up");
         normal.bind_str("C-<down>", "focus_down");
-        normal.bind_str("C-k", "focus_up");
+        normal.bind_str("C-k", "focus_down");
         normal.bind_str("C-<up>", "focus_up");
         normal.bind_str("C-w h", "focus_left");
-        normal.bind_str("C-w j", "focus_down");
-        normal.bind_str("C-w k", "focus_up");
+        normal.bind_str("C-w j", "focus_up");
+        normal.bind_str("C-w k", "focus_down");
         normal.bind_str("C-w l", "focus_right");
         normal.bind_str("<space> d", "file_explorer");
         normal.bind_str("<space> t", "theme_picker");
@@ -395,6 +385,8 @@ pub struct Editor {
     pub help_scroll: Option<usize>,
     /// Highlighted row of the `:` suggestion dropdown; None until Tab/arrows.
     pub command_suggest: Option<usize>,
+    /// Started with no files: the empty buffer shows the splash screen.
+    pub splash: bool,
     /// The file tree sidebar, when visible.
     pub tree: Option<crate::filetree::FileTree>,
     /// Keys go to the tree instead of the buffer.
@@ -418,6 +410,7 @@ impl Editor {
         size: (u16, u16),
         config: &crate::config::Config,
     ) -> std::io::Result<Self> {
+        let splash = paths.is_empty();
         let mut documents = Vec::new();
         for path in paths {
             crate::config::record_recent(&path);
@@ -483,6 +476,7 @@ impl Editor {
             completion: None,
             help_scroll: None,
             command_suggest: None,
+            splash,
             tree: None,
             tree_focused: false,
             tree_leader: false,
@@ -546,6 +540,16 @@ impl Editor {
         let h = self.size.1.saturating_sub(6).max(3);
         let x = (self.size.0.saturating_sub(w)) / 2;
         (x, 2, w, h)
+    }
+
+    /// The splash is pure decoration over the untouched startup buffer; the
+    /// moment anything real happens (typing, files, splits) it's gone.
+    pub fn show_splash(&self) -> bool {
+        self.splash
+            && self.mode == Mode::Normal
+            && self.window_count() == 1
+            && self.doc().path.is_none()
+            && self.doc().text.len_chars() == 0
     }
 
     pub fn focused_rect(&self) -> Rect {
@@ -1333,6 +1337,7 @@ impl Editor {
         };
         match key.code {
             KeyCode::Char('l') | KeyCode::Right if key.ctrl => self.tree_focused = false,
+            KeyCode::Char('t') if key.ctrl => self.tree_toggle(),
             KeyCode::Esc => self.tree_focused = false,
             KeyCode::Char('q') => {
                 self.tree = None;
@@ -2073,6 +2078,9 @@ impl Editor {
         if self.help_scroll.is_some() {
             return None; // the help window has no cursor
         }
+        if self.show_splash() {
+            return None; // nothing to edit yet
+        }
         if let Some(TreeInput::Create { name, .. } | TreeInput::Rename { name, .. }) =
             &self.tree_input
         {
@@ -2530,7 +2538,7 @@ mod tests {
         let editor = editor_with("");
         let keymap = &editor.keymaps.normal;
         assert_eq!(keymap.binding_of("find_files").as_deref(), Some("<space> f"));
-        assert_eq!(keymap.binding_of("save").as_deref(), Some("C-s")); // not <space> w
+        assert_eq!(keymap.binding_of("save").as_deref(), Some("Ctrl-s")); // not <space> w
         assert_eq!(keymap.binding_of("format_buffer"), None); // `:fmt` only
         let picker = crate::picker::Picker::commands(keymap);
         let item = picker.items.iter().find(|i| i.label == "find_files").unwrap();
@@ -2554,11 +2562,12 @@ mod tests {
     #[test]
     fn ctrl_h_closes_the_picker_and_moves_focus() {
         let mut editor = editor_with("hello");
+        press(&mut editor, "C-t C-l"); // open the sidebar, back to the text
         press(&mut editor, "<space> f");
         assert_eq!(editor.mode, Mode::Picker);
         press(&mut editor, "C-h");
         assert!(editor.picker.is_none());
-        assert!(editor.tree_focused);
+        assert!(editor.tree_focused, "C-h out of the picker crosses to the open sidebar");
     }
 
     #[test]
@@ -2600,11 +2609,11 @@ mod tests {
         assert_eq!(editor.help_scroll, None);
         assert_eq!(editor.mode, Mode::Normal);
 
-        // C-h closes the window and moves focus in one press.
+        // C-h closes the window in one press (no sidebar: focus stays put).
         press(&mut editor, ": help <enter>");
         press(&mut editor, "C-h");
         assert_eq!(editor.help_scroll, None);
-        assert!(editor.tree_focused);
+        assert!(editor.tree.is_none() && !editor.tree_focused);
     }
 
     #[test]
@@ -2619,11 +2628,16 @@ mod tests {
         press(&mut editor, "C-h");
         assert!(!editor.tree_focused, "split comes before the tree");
         assert_ne!(editor.focused, rightmost);
-        // …and only the leftmost window opens the tree.
+        // …at the leftmost window it stops — never opening the sidebar…
         press(&mut editor, "C-h");
-        assert!(editor.tree_focused);
+        assert!(editor.tree.is_none() && !editor.tree_focused);
+        // …but crosses into it when it's open.
+        press(&mut editor, "C-t");
         press(&mut editor, "C-l"); // back to the editor
         assert!(!editor.tree_focused);
+        press(&mut editor, "C-h");
+        assert!(editor.tree_focused);
+        press(&mut editor, "C-l");
         press(&mut editor, "C-l"); // and across to the right window
         assert_eq!(editor.focused, rightmost);
     }
@@ -2636,26 +2650,45 @@ mod tests {
         assert_eq!(wins.len(), 2);
         let top = wins.iter().min_by_key(|&&(_, (_, y, ..))| y).unwrap().0;
         let bottom = wins.iter().max_by_key(|&&(_, (_, y, ..))| y).unwrap().0;
+        // j/k are flipped by request: C-k descends, C-j ascends.
         editor.focused = top;
-        press(&mut editor, "C-j");
-        assert_eq!(editor.focused, bottom);
         press(&mut editor, "C-k");
+        assert_eq!(editor.focused, bottom);
+        press(&mut editor, "C-j");
         assert_eq!(editor.focused, top);
-        press(&mut editor, "C-k"); // topmost already: stays put
+        press(&mut editor, "C-j"); // topmost already: stays put
         assert_eq!(editor.focused, top);
         assert!(!editor.tree_focused);
     }
 
     #[test]
-    fn ctrl_h_focuses_the_tree_and_ctrl_l_returns() {
+    fn splash_shows_on_empty_start_and_leaves_when_work_begins() {
+        let mut editor = Editor::new(vec![], (80, 24), &crate::config::Config::default()).unwrap();
+        assert!(editor.show_splash());
+        press(&mut editor, "<space>"); // a pending leader doesn't dismiss it
+        assert!(editor.show_splash());
+        press(&mut editor, "<esc>");
+        press(&mut editor, "i");
+        assert!(!editor.show_splash(), "insert mode hides it");
+        press(&mut editor, "hi");
+        press(&mut editor, "<esc>");
+        assert!(!editor.show_splash(), "text in the buffer hides it");
+    }
+
+    #[test]
+    fn ctrl_t_toggles_the_tree_and_ctrl_h_l_only_navigate() {
         let mut editor = editor_with("hello");
-        press(&mut editor, "C-h");
+        press(&mut editor, "C-h"); // navigation never opens the sidebar
+        assert!(editor.tree.is_none() && !editor.tree_focused);
+        press(&mut editor, "C-t");
         assert!(editor.tree.is_some() && editor.tree_focused);
         press(&mut editor, "C-l");
         assert!(!editor.tree_focused);
         assert!(editor.tree.is_some(), "tree stays open, just unfocused");
-        press(&mut editor, "C-h"); // already open: just refocus
+        press(&mut editor, "C-h"); // open sidebar: C-h crosses into it
         assert!(editor.tree_focused);
+        press(&mut editor, "C-t"); // toggle from inside closes it
+        assert!(editor.tree.is_none());
     }
 
     #[test]

@@ -54,7 +54,7 @@ commands! {
     recent_files => "reopen a recently opened file",
     file_explorer => "browse the current directory in a picker",
     tree_toggle => "toggle the file tree sidebar",
-    focus_left => "focus the window to the left, or the file tree",
+    focus_left => "focus the window to the left, or the open file tree",
     focus_right => "focus the window to the right",
     focus_down => "focus the window below",
     focus_up => "focus the window above",
@@ -468,10 +468,8 @@ fn focus_left(editor: &mut Editor) {
     if editor.focus_window_dir(-1, 0) {
         return;
     }
-    // Leftmost window already: the tree is next (opened if hidden).
-    if editor.tree.is_none() {
-        editor.tree_toggle();
-    } else {
+    // Leftmost window: the sidebar is next — but navigation never opens it.
+    if editor.tree.is_some() {
         editor.tree_focused = true;
     }
 }
