@@ -9,7 +9,7 @@
 //! strings and integers, `#` comments. ponytail: swap in the `toml` crate if
 //! the config ever needs arrays or nesting.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct Config {
@@ -144,6 +144,45 @@ pub fn path() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_default()
         .join("crow/crow.toml")
+}
+
+/// The recent-files list, most recent first (XDG state, not config).
+fn recent_path() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_default()
+        .join("crow/recent")
+}
+
+/// Recently opened files that still exist, most recent first.
+pub fn recent_files() -> Vec<PathBuf> {
+    std::fs::read_to_string(recent_path())
+        .unwrap_or_default()
+        .lines()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+/// Move `path` to the front of the recent-files list.
+pub fn record_recent(path: &Path) {
+    let Ok(abs) = path.canonicalize() else {
+        return;
+    };
+    let mut lines = vec![abs.to_string_lossy().into_owned()];
+    lines.extend(
+        recent_files()
+            .into_iter()
+            .filter(|p| *p != abs)
+            .map(|p| p.to_string_lossy().into_owned()),
+    );
+    lines.truncate(50);
+    let file = recent_path();
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, lines.join("\n"));
 }
 
 const TEMPLATE: &str = r#"# crow.toml — crow's config. Everything here is optional;
@@ -369,5 +408,26 @@ py = "pyright-langserver --stdio"
         assert_eq!(config.scrolloff, 3);
         assert!(config.keys_normal.is_empty());
         assert_eq!(config.lsp, Config::default().lsp);
+    }
+
+    #[test]
+    fn recent_files_dedupe_most_recent_first() {
+        let state = std::env::temp_dir().join("crow-recent-test");
+        std::fs::create_dir_all(&state).unwrap();
+        std::env::set_var("XDG_STATE_HOME", &state);
+        let _ = std::fs::remove_file(state.join("crow/recent"));
+        let a = state.join("a.txt");
+        let b = state.join("b.txt");
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        record_recent(&a);
+        record_recent(&b);
+        record_recent(&a); // back to the front, not duplicated
+        let names: Vec<String> = recent_files()
+            .iter()
+            .filter_map(|p| Some(p.file_name()?.to_string_lossy().into_owned()))
+            .collect();
+        assert_eq!(names, ["a.txt", "b.txt"]);
+        std::env::remove_var("XDG_STATE_HOME");
     }
 }

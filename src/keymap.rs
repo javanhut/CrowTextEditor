@@ -152,6 +152,7 @@ impl Key {
             s.push_str("A-");
         }
         match self.code {
+            KeyCode::Char(' ') => s.push_str("<space>"),
             KeyCode::Char(c) => s.push(c),
             KeyCode::Esc => s.push_str("<esc>"),
             KeyCode::Enter => s.push_str("<enter>"),
@@ -229,6 +230,59 @@ impl KeyTrie {
         }
 
         self.bind(&keys, command);
+    }
+
+    /// The keys available after `prefix`: (key, command name), with `…` for
+    /// deeper groups. Sorted by key for a stable display.
+    pub fn continuations(&self, prefix: &[Key]) -> Vec<(String, String)> {
+        let mut node = self;
+        for key in prefix {
+            match node {
+                KeyTrie::Node(map) => match map.get(key) {
+                    Some(next) => node = next,
+                    None => return Vec::new(),
+                },
+                KeyTrie::Leaf(_) => return Vec::new(),
+            }
+        }
+        let KeyTrie::Node(map) = node else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = map
+            .iter()
+            .map(|(key, trie)| {
+                let target = match trie {
+                    KeyTrie::Leaf(command) => command.name.to_string(),
+                    KeyTrie::Node(_) => "…".to_string(),
+                };
+                (key.display(), target)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The shortest key sequence bound to `name`, e.g. `"<space> f"`.
+    pub fn binding_of(&self, name: &str) -> Option<String> {
+        fn walk(trie: &KeyTrie, name: &str, path: &mut Vec<String>, found: &mut Vec<String>) {
+            match trie {
+                KeyTrie::Leaf(command) => {
+                    if command.name == name {
+                        found.push(path.join(" "));
+                    }
+                }
+                KeyTrie::Node(map) => {
+                    for (key, next) in map {
+                        path.push(key.display());
+                        walk(next, name, path, found);
+                        path.pop();
+                    }
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(self, name, &mut Vec::new(), &mut found);
+        found.into_iter().min_by_key(|s| (s.len(), s.clone()))
     }
 
     pub fn lookup(&self, keys: &[Key]) -> KeymapResult {

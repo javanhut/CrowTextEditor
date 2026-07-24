@@ -50,10 +50,14 @@ commands! {
     complete => "open the completion menu (LSP)",
     command_palette => "fuzzy-pick any command by name",
     find_files => "fuzzy-find a file under the current directory",
+    grep_text => "search file contents across the project",
+    recent_files => "reopen a recently opened file",
     file_explorer => "browse the current directory in a picker",
     tree_toggle => "toggle the file tree sidebar",
     focus_left => "focus the window to the left, or the file tree",
     focus_right => "focus the window to the right",
+    focus_down => "focus the window below",
+    focus_up => "focus the window above",
     theme_picker => "pick a theme with live preview",
     search => "search forward, selecting the match",
     select_matches => "select every match of a pattern",
@@ -430,7 +434,7 @@ fn remove_extra_cursors(editor: &mut Editor) {
 // ---- pickers ---------------------------------------------------------------
 
 fn command_palette(editor: &mut Editor) {
-    editor.open_picker(crate::picker::Picker::commands());
+    editor.open_picker(crate::picker::Picker::commands(&editor.keymaps.normal));
 }
 
 fn theme_picker(editor: &mut Editor) {
@@ -440,6 +444,15 @@ fn theme_picker(editor: &mut Editor) {
 fn find_files(editor: &mut Editor) {
     let root = std::env::current_dir().unwrap_or_default();
     editor.open_picker(crate::picker::Picker::files(&root));
+}
+
+fn recent_files(editor: &mut Editor) {
+    editor.open_picker(crate::picker::Picker::recent());
+}
+
+fn grep_text(editor: &mut Editor) {
+    let root = std::env::current_dir().unwrap_or_default();
+    editor.open_picker(crate::picker::Picker::grep(&root));
 }
 
 fn file_explorer(editor: &mut Editor) {
@@ -452,7 +465,7 @@ fn tree_toggle(editor: &mut Editor) {
 }
 
 fn focus_left(editor: &mut Editor) {
-    if editor.focus_window_horizontal(true) {
+    if editor.focus_window_dir(-1, 0) {
         return;
     }
     // Leftmost window already: the tree is next (opened if hidden).
@@ -464,7 +477,15 @@ fn focus_left(editor: &mut Editor) {
 }
 
 fn focus_right(editor: &mut Editor) {
-    editor.focus_window_horizontal(false);
+    editor.focus_window_dir(1, 0);
+}
+
+fn focus_down(editor: &mut Editor) {
+    editor.focus_window_dir(0, 1);
+}
+
+fn focus_up(editor: &mut Editor) {
+    editor.focus_window_dir(0, -1);
 }
 
 // ---- lsp -------------------------------------------------------------------

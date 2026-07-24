@@ -33,6 +33,7 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     render_tree_prompt(editor, out)?;
     render_picker(editor, out)?;
     render_completion(editor, out)?;
+    render_pending_keys(editor, out)?;
     render_help(editor, out)?;
 
     match editor.screen_cursor() {
@@ -481,38 +482,99 @@ fn render_picker(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     draw_box_list(out, x, y + 2, w, &rows, selected)
 }
 
-/// The `:help` window: a scrollable command reference, picker-styled.
+/// Which-key: a pending multi-key sequence (the space leader, C-w, g…)
+/// shows its continuations in a panel above the status line, column-major
+/// like which-key: `key → command`.
+fn render_pending_keys(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    if editor.mode != Mode::Normal || editor.pending.is_empty() {
+        return Ok(());
+    }
+    let entries = editor.keymaps.normal.continuations(&editor.pending);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let (w, h) = editor.size;
+    let rows = entries.len().div_ceil(3);
+    let cols = entries.len().div_ceil(rows);
+    let col_w = (w as usize) / cols.max(1);
+    let icons = crate::config::icons();
+    let name_w = col_w.saturating_sub(if icons { 15 } else { 13 });
+    let theme = crate::theme::current();
+    let top = h.saturating_sub(2).saturating_sub(rows as u16);
+    for r in 0..rows {
+        let y = top + r as u16;
+        queue!(
+            out,
+            cursor::MoveTo(0, y),
+            SetBackgroundColor(theme.popup_bg),
+            Print(" ".repeat(w as usize))
+        )?;
+        for c in 0..cols {
+            let Some((key, name)) = entries.get(c * rows + r) else {
+                continue;
+            };
+            let (icon, color) = leader_hint(name);
+            let icon = if icons { format!("{icon} ") } else { String::new() };
+            let name: String = name.chars().take(name_w).collect();
+            queue!(
+                out,
+                cursor::MoveTo((c * col_w) as u16 + 1, y),
+                SetAttribute(Attribute::Bold),
+                SetForegroundColor(color),
+                Print(format!("{key:>8}")),
+                SetAttribute(Attribute::Reset),
+                SetBackgroundColor(theme.popup_bg),
+                SetForegroundColor(theme.gutter),
+                Print(" → "),
+                SetForegroundColor(color),
+                Print(icon),
+                SetForegroundColor(theme.fg.unwrap_or(Color::Reset)),
+                Print(name)
+            )?;
+        }
+        queue!(out, ResetColor)?;
+    }
+    Ok(())
+}
+
+/// Icon and accent color for a leader-bar entry. Colors come from the
+/// current theme's syntax palette so every theme keeps its own look.
+fn leader_hint(name: &str) -> (&'static str, Color) {
+    let theme = crate::theme::current();
+    let syn = |i: usize, fallback: Color| theme.syntax[i].unwrap_or(fallback);
+    match name {
+        "…" => ("\u{f101}", theme.border),                          //  group
+        "save" => ("\u{f0c7}", syn(2, Color::Green)),               //  floppy
+        "quit" => ("\u{f011}", Color::Red),                         //  power
+        "find_files" => ("\u{f002}", syn(4, Color::Cyan)),          //  search
+        "grep_text" => ("\u{f15c}", syn(2, Color::Green)),          //  file-text
+        "recent_files" => ("\u{f017}", syn(7, Color::Blue)),        //  clock
+        "file_explorer" => ("\u{f07b}", syn(5, Color::Yellow)),     //  folder
+        "tree_toggle" => ("\u{f07c}", syn(5, Color::Yellow)),       //  open folder
+        "command_palette" => ("\u{f489}", syn(3, Color::Magenta)),  //  terminal
+        "theme_picker" => ("\u{f043}", syn(7, Color::Blue)),        //  tint
+        n if n.starts_with("split") => ("\u{f0db}", syn(4, Color::Cyan)), //  columns
+        _ => ("\u{f013}", syn(6, Color::DarkYellow)),               //  gear
+    }
+}
+
+/// The `:help` window, in the same bordered box as the prompts and pickers.
 fn render_help(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     let Some(scroll) = editor.help_scroll else {
         return Ok(());
     };
     let (x, y, w, h) = editor.help_rect();
-    let w = w as usize;
     let lines = crate::commands::help_lines();
-
-    let title = format!(" Help — j/k scroll · esc close  ({}/{})", scroll + 1, lines.len());
-    let title: String = title.chars().take(w).collect();
-    queue!(
-        out,
-        cursor::MoveTo(x, y),
-        SetAttribute(Attribute::Reverse),
-        Print(format!("{title:<w$}")),
-        SetAttribute(Attribute::Reset)
-    )?;
-
-    let popup_bg = crate::theme::current().popup_bg;
-    for row in 0..(h as usize).saturating_sub(1) {
-        let line = lines.get(scroll + row).map(String::as_str).unwrap_or("");
-        let line: String = line.chars().take(w).collect();
-        queue!(
-            out,
-            cursor::MoveTo(x, y + 1 + row as u16),
-            SetBackgroundColor(popup_bg),
-            Print(format!("{line:<w$}")),
-            ResetColor
-        )?;
-    }
-    Ok(())
+    let visible = (h as usize).saturating_sub(4).max(1);
+    let hint = format!(
+        " j/k scroll · esc close · {}–{}/{}",
+        scroll + 1,
+        (scroll + visible).min(lines.len()),
+        lines.len()
+    );
+    draw_popup(out, x, y, w, " Help ", &hint)?;
+    let rows: Vec<String> = lines.iter().skip(scroll).take(visible).cloned().collect();
+    draw_box_list(out, x, y + 2, w, &rows, None)
 }
 
 /// The completion menu: a small list anchored at the cursor.

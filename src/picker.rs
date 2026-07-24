@@ -21,6 +21,10 @@ pub enum Kind {
     Files { root: PathBuf },
     /// Browse a directory: Enter descends into `dir/label` or opens a file.
     Explorer { dir: PathBuf },
+    /// Live content search: the query greps files, labels are `path:line`.
+    Grep { root: PathBuf },
+    /// Recently opened files; labels are absolute paths (`~`-shortened).
+    Recent,
 }
 
 pub struct Picker {
@@ -48,12 +52,15 @@ impl Picker {
         picker
     }
 
-    pub fn commands() -> Picker {
+    pub fn commands(keymap: &crate::keymap::KeyTrie) -> Picker {
         let items = crate::commands::COMMANDS
             .iter()
             .map(|c| Item {
                 label: c.name.to_string(),
-                detail: c.doc.to_string(),
+                detail: match keymap.binding_of(c.name) {
+                    Some(keys) => format!("{keys}  ·  {}", c.doc),
+                    None => c.doc.to_string(),
+                },
             })
             .collect();
         Picker::new("command", Kind::Command, items)
@@ -95,6 +102,47 @@ impl Picker {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.to_string_lossy().into_owned());
         Picker::new(title, Kind::Explorer { dir }, items)
+    }
+
+    pub fn recent() -> Picker {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let items = crate::config::recent_files()
+            .into_iter()
+            .map(|p| {
+                let s = p.to_string_lossy().into_owned();
+                let label = match s.strip_prefix(&home) {
+                    Some(rest) if !home.is_empty() => format!("~{rest}"),
+                    _ => s,
+                };
+                Item {
+                    label,
+                    detail: String::new(),
+                }
+            })
+            .collect();
+        Picker::new("recent", Kind::Recent, items)
+    }
+
+    pub fn grep(root: &Path) -> Picker {
+        Picker::new(
+            "grep",
+            Kind::Grep {
+                root: root.to_path_buf(),
+            },
+            Vec::new(),
+        )
+    }
+
+    /// React to a query change: Grep pickers re-search file contents, every
+    /// other kind fuzzy-refilters its fixed item list.
+    pub fn requery(&mut self) {
+        if let Kind::Grep { root } = &self.kind {
+            self.items = grep_files(root, &self.query);
+            self.filtered = (0..self.items.len()).collect();
+            self.selected = 0;
+        } else {
+            self.refilter();
+        }
     }
 
     pub fn refilter(&mut self) {
@@ -192,6 +240,34 @@ fn list_files(root: &Path) -> Vec<String> {
     out
 }
 
+/// Case-insensitive substring search over every project file.
+/// ponytail: a synchronous rescan per keystroke, capped at 100 hits; a
+/// background ripgrep-style walker when big repos itch.
+fn grep_files(root: &Path, query: &str) -> Vec<Item> {
+    if query.chars().count() < 2 {
+        return Vec::new(); // one char would light up the whole repo
+    }
+    let query = query.to_lowercase();
+    let mut out = Vec::new();
+    for rel in list_files(root) {
+        let Ok(text) = std::fs::read_to_string(root.join(&rel)) else {
+            continue; // binary or unreadable
+        };
+        for (i, line) in text.lines().enumerate() {
+            if line.to_lowercase().contains(&query) {
+                out.push(Item {
+                    label: format!("{rel}:{}", i + 1),
+                    detail: line.trim().to_string(),
+                });
+                if out.len() >= 100 {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One directory level: `../`, then subdirectories (marked with `/`), then
 /// files, each group sorted.
 fn list_dir(dir: &Path) -> Vec<Item> {
@@ -242,8 +318,24 @@ mod tests {
     }
 
     #[test]
+    fn grep_finds_matching_lines_by_path_and_number() {
+        let dir = std::env::temp_dir().join("crow-grep-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello\nthe needle is here\n").unwrap();
+        let mut picker = Picker::grep(&dir);
+        picker.query = "NEEDLE".into(); // case-insensitive
+        picker.requery();
+        let item = picker.selected_item().expect("one hit");
+        assert_eq!(item.label, "a.txt:2");
+        assert_eq!(item.detail, "the needle is here");
+        picker.query = "n".into(); // too short: no full-repo scan
+        picker.requery();
+        assert!(picker.selected_item().is_none());
+    }
+
+    #[test]
     fn filtering_ranks_and_narrows() {
-        let mut picker = Picker::commands();
+        let mut picker = Picker::commands(&crate::keymap::KeyTrie::new());
         let all = picker.filtered.len();
         picker.query = "quit".into();
         picker.refilter();

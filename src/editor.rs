@@ -296,13 +296,28 @@ impl Default for Keymaps {
         // space leader: pickers
         normal.bind_str("<space> c", "command_palette");
         normal.bind_str("<space> f", "find_files");
+        normal.bind_str("<space> g", "grep_text");
+        normal.bind_str("<space> r", "recent_files");
         normal.bind_str("<space> e", "tree_toggle");
         normal.bind_str("C-h", "focus_left");
         normal.bind_str("C-<left>", "focus_left");
+        normal.bind_str("C-<bs>", "focus_left"); // terminals that send C-h as ^H
         normal.bind_str("C-l", "focus_right");
         normal.bind_str("C-<right>", "focus_right");
+        normal.bind_str("C-j", "focus_down");
+        normal.bind_str("C-<down>", "focus_down");
+        normal.bind_str("C-k", "focus_up");
+        normal.bind_str("C-<up>", "focus_up");
+        normal.bind_str("C-w h", "focus_left");
+        normal.bind_str("C-w j", "focus_down");
+        normal.bind_str("C-w k", "focus_up");
+        normal.bind_str("C-w l", "focus_right");
         normal.bind_str("<space> d", "file_explorer");
         normal.bind_str("<space> t", "theme_picker");
+        normal.bind_str("<space> s v", "split_vertical");
+        normal.bind_str("<space> s h", "split_horizontal");
+        normal.bind_str("<space> w", "save");
+        normal.bind_str("<space> q", "quit");
         normal.bind_str("C-s", "save");
         normal.bind_str(":", "command_mode");
         normal.bind_str("<esc>", "normal_mode");
@@ -405,6 +420,7 @@ impl Editor {
     ) -> std::io::Result<Self> {
         let mut documents = Vec::new();
         for path in paths {
+            crate::config::record_recent(&path);
             documents.push(Document::open(path)?);
         }
         if documents.is_empty() {
@@ -602,18 +618,32 @@ impl Editor {
         self.layout.close(closing);
     }
 
-    /// Move focus to the nearest window left/right of the current one.
-    /// Returns false when there is none in that direction.
-    pub fn focus_window_horizontal(&mut self, left: bool) -> bool {
+    /// Move focus to the nearest window in one direction (one of dx/dy is
+    /// ±1, the other 0). Returns false when there is none that way.
+    pub fn focus_window_dir(&mut self, dx: i32, dy: i32) -> bool {
         let (wins, _) = self.window_rects();
-        let (fx, fy, _, fh) = self.focused_rect();
-        let fmid = fy as i32 + fh as i32 / 2;
+        let (fx, fy, fw, fh) = self.focused_rect();
+        let (fcx, fcy) = (fx as i32 + fw as i32 / 2, fy as i32 + fh as i32 / 2);
         let target = wins
             .iter()
-            .filter(|&&(id, (x, ..))| id != self.focused && if left { x < fx } else { x > fx })
-            .min_by_key(|&&(_, (x, y, _, h))| {
-                let dx = if left { fx - x } else { x - fx };
-                (dx, (y as i32 + h as i32 / 2 - fmid).abs())
+            .filter(|&&(id, (x, y, ..))| {
+                id != self.focused
+                    && match (dx, dy) {
+                        (-1, _) => x < fx,
+                        (1, _) => x > fx,
+                        (_, -1) => y < fy,
+                        _ => y > fy,
+                    }
+            })
+            .min_by_key(|&&(_, (x, y, w, h))| {
+                let cx = x as i32 + w as i32 / 2;
+                let cy = y as i32 + h as i32 / 2;
+                // Nearest along the axis of travel; ties break by alignment.
+                if dx != 0 {
+                    ((cx - fcx).abs(), (cy - fcy).abs())
+                } else {
+                    ((cy - fcy).abs(), (cx - fcx).abs())
+                }
             })
             .map(|&(id, _)| id);
         let Some(id) = target else {
@@ -819,7 +849,8 @@ impl Editor {
     /// Keys while the `:help` window is open: scroll or close.
     fn handle_help_key(&mut self, key: Key, scroll: usize) {
         let (_, _, _, h) = self.help_rect();
-        let visible = (h as usize).saturating_sub(1); // minus the title row
+        // Minus the box: top border, hint row, separator, bottom border.
+        let visible = (h as usize).saturating_sub(4).max(1);
         let max = crate::commands::help_lines().len().saturating_sub(visible);
         let clamp = |s: usize| Some(s.min(max));
         match key.code {
@@ -1056,6 +1087,7 @@ impl Editor {
             "e" | "edit" => match arg {
                 Some(path) => match Document::open(path) {
                     Ok(doc) => {
+                        crate::config::record_recent(Path::new(path));
                         self.documents.push(doc);
                         self.current = self.documents.len() - 1;
                         self.set_status(format!("\"{path}\""));
@@ -1143,7 +1175,7 @@ impl Editor {
             KeyCode::Char('p') if key.ctrl => self.picker_move(-1),
             KeyCode::Backspace => {
                 if picker.query.pop().is_some() {
-                    picker.refilter();
+                    picker.requery();
                     self.picker_preview();
                 } else if let Kind::Explorer { dir } = &picker.kind {
                     // Empty query: backspace climbs to the parent directory.
@@ -1155,7 +1187,7 @@ impl Editor {
             }
             KeyCode::Char(c) if !key.ctrl && !key.alt => {
                 picker.query.push(c);
-                picker.refilter();
+                picker.requery();
                 self.picker_preview();
             }
             _ => {}
@@ -1215,6 +1247,20 @@ impl Editor {
                 self.set_status(format!("theme: {label}"));
             }
             Kind::Files { root } => self.jump_to(root.join(label), 0, 0),
+            Kind::Grep { root } => {
+                if let Some((path, line)) = label.rsplit_once(':') {
+                    let line = line.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                    self.jump_to(root.join(path), line, 0);
+                }
+            }
+            Kind::Recent => {
+                let path = match label.strip_prefix("~/") {
+                    Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                        .join(rest),
+                    None => PathBuf::from(label),
+                };
+                self.jump_to(path, 0, 0);
+            }
             Kind::Explorer { dir } => {
                 if label == "../" {
                     if let Some(parent) = dir.parent() {
@@ -1976,6 +2022,7 @@ impl Editor {
                 }
             },
         };
+        crate::config::record_recent(&canon);
         self.current = idx;
         let doc = self.doc_mut();
         let line = line.min(doc.line_count().saturating_sub(1));
@@ -2479,6 +2526,32 @@ mod tests {
     }
 
     #[test]
+    fn palette_rows_carry_the_shortest_binding() {
+        let editor = editor_with("");
+        let keymap = &editor.keymaps.normal;
+        assert_eq!(keymap.binding_of("find_files").as_deref(), Some("<space> f"));
+        assert_eq!(keymap.binding_of("save").as_deref(), Some("C-s")); // not <space> w
+        assert_eq!(keymap.binding_of("format_buffer"), None); // `:fmt` only
+        let picker = crate::picker::Picker::commands(keymap);
+        let item = picker.items.iter().find(|i| i.label == "find_files").unwrap();
+        assert!(item.detail.starts_with("<space> f  ·  "));
+    }
+
+    #[test]
+    fn leader_shows_continuations_and_space_s_v_splits() {
+        let mut editor = editor_with("hello");
+        press(&mut editor, "<space>");
+        let entries = editor.keymaps.normal.continuations(&editor.pending);
+        assert!(entries.iter().any(|(k, n)| k == "e" && n == "tree_toggle"));
+        assert!(entries.iter().any(|(k, n)| k == "s" && n == "…"), "s is a group");
+        assert!(entries.iter().any(|(k, n)| k == "w" && n == "save"));
+        assert!(entries.iter().any(|(k, n)| k == "q" && n == "quit"));
+        press(&mut editor, "s v");
+        assert_eq!(editor.window_count(), 2);
+        assert!(editor.pending.is_empty());
+    }
+
+    #[test]
     fn ctrl_h_closes_the_picker_and_moves_focus() {
         let mut editor = editor_with("hello");
         press(&mut editor, "<space> f");
@@ -2553,6 +2626,24 @@ mod tests {
         assert!(!editor.tree_focused);
         press(&mut editor, "C-l"); // and across to the right window
         assert_eq!(editor.focused, rightmost);
+    }
+
+    #[test]
+    fn ctrl_j_k_move_between_stacked_splits() {
+        let mut editor = editor_with("hello");
+        press(&mut editor, "<space> s h"); // stacked split
+        let (wins, _) = editor.window_rects();
+        assert_eq!(wins.len(), 2);
+        let top = wins.iter().min_by_key(|&&(_, (_, y, ..))| y).unwrap().0;
+        let bottom = wins.iter().max_by_key(|&&(_, (_, y, ..))| y).unwrap().0;
+        editor.focused = top;
+        press(&mut editor, "C-j");
+        assert_eq!(editor.focused, bottom);
+        press(&mut editor, "C-k");
+        assert_eq!(editor.focused, top);
+        press(&mut editor, "C-k"); // topmost already: stays put
+        assert_eq!(editor.focused, top);
+        assert!(!editor.tree_focused);
     }
 
     #[test]
