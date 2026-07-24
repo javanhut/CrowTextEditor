@@ -37,6 +37,9 @@ pub enum Event {
 }
 
 pub struct Client {
+    /// The command line this server was spawned from — its identity, so
+    /// documents are routed only to their own language's server.
+    command: String,
     child: Child,
     stdin: ChildStdin,
     rx: Receiver<Value>,
@@ -78,6 +81,7 @@ impl Client {
         });
 
         let mut client = Client {
+            command: command.to_string(),
             child,
             stdin,
             rx,
@@ -209,6 +213,10 @@ impl Client {
 
     pub fn is_dead(&self) -> bool {
         self.dead
+    }
+
+    pub fn command(&self) -> &str {
+        &self.command
     }
 
     pub fn poll(&mut self) -> Vec<Event> {

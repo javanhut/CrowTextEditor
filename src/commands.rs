@@ -544,7 +544,7 @@ fn lsp_position_request(editor: &mut Editor, tag: &'static str, method: &str) {
     };
     let (line, col) = editor.doc().cursor_line_col();
     let utf16_col = position::char_to_utf16(editor.doc().line(line), col);
-    match editor.lsp.as_mut() {
+    match editor.current_client() {
         Some(lsp) => lsp.request_position(tag, method, &path, line, utf16_col),
         None => editor.set_status("language server not running"),
     }

@@ -374,12 +374,13 @@ pub struct Editor {
     pub keep_selection: bool,
     /// Extend mode (`v`): motions grow the selection instead of replacing it.
     pub extend: bool,
-    /// The language server, once one has started.
-    pub lsp: Option<lsp::Client>,
+    /// One running language server per distinct command; documents are
+    /// synced only to their own language's server.
+    lsps: Vec<lsp::Client>,
     /// From crow.toml: (file extension, server command).
     lsp_table: Vec<(String, String)>,
-    /// Set after a failed spawn so we don't retry every tick.
-    lsp_failed: bool,
+    /// Commands that failed to spawn or died, so we don't retry every tick.
+    lsp_failed: std::collections::HashSet<String>,
     /// Latest diagnostics per file (canonical paths, as the server sends them).
     pub diagnostics: HashMap<PathBuf, Vec<lsp::Diagnostic>>,
     /// The active popup picker, if any (mode == Picker).
@@ -492,8 +493,8 @@ impl Editor {
             search_origin: (0, 0),
             keep_selection: false,
             extend: false,
-            lsp: None,
-            lsp_failed: false,
+            lsps: Vec::new(),
+            lsp_failed: std::collections::HashSet::new(),
             diagnostics: HashMap::new(),
             picker: None,
             completion: None,
@@ -1362,7 +1363,7 @@ impl Editor {
         match result {
             Ok(()) => {
                 // A server that failed to spawn earlier can be retried now.
-                self.lsp_failed = false;
+                self.lsp_failed.clear();
                 self.set_status(format!("{program} installed"));
                 // If it formats the current buffer, finish what :fmt started.
                 let formats_this = self
@@ -2042,7 +2043,7 @@ impl Editor {
             return;
         }
         let label = label.clone();
-        let Some(lsp) = self.lsp.as_mut() else {
+        let Some(lsp) = self.current_client() else {
             return;
         };
         lsp.resolve_completion(&label);
@@ -2103,6 +2104,25 @@ impl Editor {
 
     // ---- lsp ---------------------------------------------------------------
 
+    /// The configured server command for the current buffer, if any.
+    fn current_server_command(&self) -> Option<String> {
+        let path = self.doc().path.as_deref()?;
+        server_for(&self.lsp_table, path).map(str::to_string)
+    }
+
+    /// The running client that serves the current buffer's language.
+    pub fn current_client(&mut self) -> Option<&mut lsp::Client> {
+        let command = self.current_server_command()?;
+        self.lsps.iter_mut().find(|c| c.command() == command)
+    }
+
+    /// Shut every language server down (quit path).
+    pub fn shutdown_lsps(&mut self) {
+        for lsp in self.lsps.drain(..) {
+            lsp.shutdown();
+        }
+    }
+
     /// Called from the main loop between keystrokes: keep the server in sync
     /// with edited buffers and apply anything it sent back.
     /// Drains language-server messages. Returns true when anything on screen
@@ -2113,7 +2133,7 @@ impl Editor {
             if let Some(path) = self.doc().path.clone() {
                 let (line, col) = self.doc().cursor_line_col();
                 let utf16_col = crate::position::char_to_utf16(self.doc().line(line), col);
-                if let Some(lsp) = self.lsp.as_mut() {
+                if let Some(lsp) = self.current_client() {
                     lsp.request_position(
                         "completion",
                         "textDocument/completion",
@@ -2124,15 +2144,18 @@ impl Editor {
                 }
             }
         }
-        let Some(lsp) = self.lsp.as_mut() else {
-            return false;
-        };
-        let events = lsp.poll();
-        if lsp.is_dead() {
-            // The server exited (crashed, or was a broken shim): stop syncing
-            // and don't respawn every tick.
-            self.lsp = None;
-            self.lsp_failed = true;
+        let mut events = Vec::new();
+        let mut i = 0;
+        while i < self.lsps.len() {
+            events.extend(self.lsps[i].poll());
+            if self.lsps[i].is_dead() {
+                // The server exited (crashed, or was a broken shim): stop
+                // syncing it and don't respawn every tick.
+                let dead = self.lsps.remove(i);
+                self.lsp_failed.insert(dead.command().to_string());
+            } else {
+                i += 1;
+            }
         }
         let changed = !events.is_empty();
         for event in events {
@@ -2276,7 +2299,9 @@ impl Editor {
         // Deferred to `lsp_tick` so the request follows this edit's didChange.
         // A digit before the dot is a float literal, not member access.
         let member_dot = c == '.' && !prev.is_some_and(|p| p.is_ascii_digit());
-        if self.lsp.is_some() && (member_dot || (c == ':' && prev == Some(':'))) {
+        if (member_dot || (c == ':' && prev == Some(':')))
+            && self.current_server_command().is_some()
+        {
             self.completion = None;
             self.lsp_completion_pending = true;
         }
@@ -2401,39 +2426,42 @@ impl Editor {
     }
 
     fn lsp_sync(&mut self) {
-        if self.lsp.is_none() {
-            if self.lsp_failed {
-                return;
+        // One client per distinct server command among the open files.
+        let needed: Vec<String> = self
+            .documents
+            .iter()
+            .filter_map(|d| d.path.as_deref())
+            .filter_map(|p| server_for(&self.lsp_table, p))
+            .map(str::to_string)
+            .collect();
+        for command in needed {
+            if self.lsps.iter().any(|c| c.command() == command)
+                || self.lsp_failed.contains(&command)
+            {
+                continue;
             }
-            // ponytail: one server per session — the first open file with a
-            // configured server picks it; a client per language when
-            // multi-language sessions itch.
-            let command = self
-                .documents
-                .iter()
-                .filter_map(|d| d.path.as_deref())
-                .find_map(|p| server_for(&self.lsp_table, p))
-                .map(str::to_string);
-            let Some(command) = command else {
-                return;
-            };
             let root = std::env::current_dir().unwrap_or_default();
             match lsp::Client::spawn(&root, &command) {
-                Some(client) => self.lsp = Some(client),
+                Some(client) => self.lsps.push(client),
                 None => {
-                    self.lsp_failed = true;
-                    let program = command.split_whitespace().next().unwrap_or("");
-                    if !self.offer_install(program) {
+                    let program = command.split_whitespace().next().unwrap_or("").to_string();
+                    self.lsp_failed.insert(command.clone());
+                    if !self.offer_install(&program) {
                         self.set_status(format!("could not start {command:?} — no LSP"));
                     }
-                    return;
                 }
             }
         }
-        let table = &self.lsp_table;
-        let lsp = self.lsp.as_mut().unwrap();
+        // Sync every document to its own language's server — never another's
+        // (taplo getting a .rs file marks it "excluded", and worse).
         for doc in &self.documents {
-            let Some(path) = doc.path.as_ref().filter(|p| server_for(table, p).is_some()) else {
+            let Some(path) = doc.path.as_ref() else {
+                continue;
+            };
+            let Some(command) = server_for(&self.lsp_table, path) else {
+                continue;
+            };
+            let Some(lsp) = self.lsps.iter_mut().find(|c| c.command() == command) else {
                 continue;
             };
             match lsp.synced.get(path.as_path()) {

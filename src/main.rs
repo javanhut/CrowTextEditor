@@ -130,9 +130,7 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
         }
     }
 
-    if let Some(lsp) = editor.lsp.take() {
-        lsp.shutdown();
-    }
+    editor.shutdown_lsps();
     Ok(())
 }
 
