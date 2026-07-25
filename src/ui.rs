@@ -523,10 +523,27 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         0 => String::new(),
         n => format!("{} cursors  ", n + 1),
     };
+    let ft = doc
+        .path
+        .as_deref()
+        .map(crate::lsp::language_id)
+        .unwrap_or("");
     let mut info = format!("{cursors}{reg}{count}{pending}");
     if !info.is_empty() {
         info.push_str("  ");
     }
+    // Filetype segment: the tree's icon and color, so both agree on what a
+    // file is. Empty for a scratch buffer or an extensionless file.
+    let (ft_seg, ft_color) = if ft.is_empty() {
+        (String::new(), fg)
+    } else {
+        let (icon, color) = file_icon(&doc.name(), false, false);
+        if crate::config::icons() {
+            (format!("{icon} {ft}  "), color)
+        } else {
+            (format!("{ft}  "), color)
+        }
+    };
 
     let pos = format!(
         " {}  {}/{} ",
@@ -541,8 +558,11 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
     );
 
     let left_w = 2 + label.chars().count() + lsep.chars().count() + file.chars().count() + diag_w;
-    let right_w =
-        info.chars().count() + rsep.chars().count() * 2 + pos.chars().count() + pct.chars().count();
+    let right_w = info.chars().count()
+        + ft_seg.chars().count()
+        + rsep.chars().count() * 2
+        + pos.chars().count()
+        + pct.chars().count();
     if left_w + right_w < width {
         queue!(
             out,
@@ -550,6 +570,8 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
             SetBackgroundColor(bar_bg),
             SetForegroundColor(fg),
             Print(&info),
+            SetForegroundColor(ft_color),
+            Print(&ft_seg),
             SetForegroundColor(theme.selection),
             Print(rsep),
             SetBackgroundColor(theme.selection),

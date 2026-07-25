@@ -488,7 +488,7 @@ fn read_message(r: &mut impl BufRead) -> Option<Value> {
 
 /// LSP languageId from a file extension; the extension itself is a decent
 /// fallback for anything not listed.
-fn language_id(path: &Path) -> &str {
+pub fn language_id(path: &Path) -> &str {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
         "rs" => "rust",

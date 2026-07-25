@@ -1,7 +1,8 @@
 # Crow
 
 A selection-first modal terminal text editor. One cursor is a crow; many are a
-murder.
+murder. It's a very opinionated text editor similar to a custom neovim config without
+configuration.
 
 ```
 ./install.sh          # builds and installs to ~/.local/bin
@@ -21,7 +22,7 @@ typing applies at every cursor. A multi-cursor edit is a single undo step, and
 a multi-cursor delete or yank captures every selection into the register.
 
 Search and multi-cursor are the same feature. `/` searches incrementally by
-regex and the match *is* a selection, so `d`, `c`, and `y` compose with it;
+regex and the match _is_ a selection, so `d`, `c`, and `y` compose with it;
 `n`/`N` walk the matches. `s` puts a selection on **every** match — inside the
 current selection if there is one, else the whole buffer — so interactive
 replace-all is just `s foo ⏎ c bar ⎋`, with every edit site visible before you
@@ -76,38 +77,38 @@ sensible grouping, multiple buffers, ex commands, vertical and horizontal
 scrolling, and grapheme-aware cursor movement — the cursor never lands inside
 an emoji ZWJ sequence or a combining stack.
 
-| | |
-|---|---|
-| `h` `j` `k` `l` | move, collapsing the selection (arrows work too) |
-| `w` `b` `e` | select to next word / previous word / word end |
-| `x` | select the line; repeat to extend |
-| `v` | extend mode: every motion grows the selection (status shows `SEL`) |
-| `;` | collapse the selection to the cursor |
-| `A-o` | expand the selection to the enclosing syntax node |
-| `C` `A-C` | add a cursor on the next / previous line |
-| `,` | drop the extra cursors (`Esc` in normal mode too) |
-| `/` `n` `N` | incremental regex search; next / previous match |
-| `s` | select every match within the selection (or buffer) |
-| `"x` | use register `x` for the next delete/yank/paste |
-| `d` `c` `y` | delete / change / yank the selection (`d` alone: char) |
-| `p` `P` | paste after / before (linewise if the yank was) |
-| `0` `^` `$` | line start / first non-blank / line end |
-| `gg` `G` | file start / end; `42gg` or `42G` jumps to line 42 (also `:42`) |
-| `C-d` `C-u` `C-f` `C-b` | half page / full page |
-| `C-w v` `C-w s` `C-w w` `C-w q` | split side-by-side / stacked, cycle, close |
-| `i` `I` `a` `A` `o` `O` | enter insert mode |
-| `D` `J` | delete to line end, join |
-| `u` `C-r` | undo / redo |
-| `gn` `gp` | next / previous buffer |
-| `gd` `K` | goto definition / hover (LSP) |
-| *(typing)* | intellisense pops itself from buffer words — Tab accepts, Enter stays Enter |
-| `C-space` (insert) | LSP completion menu — Tab/Enter accepts, type to narrow |
-| `space e` | file tree sidebar — same key focuses and closes; `j`/`k` move, Enter/`l` expand or open, `h` collapse, `a` add (trailing `/` = dir), `r` rename, `d` delete (y/n), `x`/`c`/`p` cut/copy/paste, `R` refresh, `Esc` back to editor, `q` close |
-| `space c` | command palette: fuzzy-run any command |
-| `space f` | fuzzy file finder |
-| `space d` | directory browser picker (Enter descends, Backspace goes up) |
-| `space t` | theme picker with live preview |
-| `:w` `:q` `:wq` `:q!` `:e f` `:42` | ex commands |
+|                                    |                                                                                                                                                                                                                                             |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `h` `j` `k` `l`                    | move, collapsing the selection (arrows work too)                                                                                                                                                                                            |
+| `w` `b` `e`                        | select to next word / previous word / word end                                                                                                                                                                                              |
+| `x`                                | select the line; repeat to extend                                                                                                                                                                                                           |
+| `v`                                | extend mode: every motion grows the selection (status shows `SEL`)                                                                                                                                                                          |
+| `;`                                | collapse the selection to the cursor                                                                                                                                                                                                        |
+| `A-o`                              | expand the selection to the enclosing syntax node                                                                                                                                                                                           |
+| `C` `A-C`                          | add a cursor on the next / previous line                                                                                                                                                                                                    |
+| `,`                                | drop the extra cursors (`Esc` in normal mode too)                                                                                                                                                                                           |
+| `/` `n` `N`                        | incremental regex search; next / previous match                                                                                                                                                                                             |
+| `s`                                | select every match within the selection (or buffer)                                                                                                                                                                                         |
+| `"x`                               | use register `x` for the next delete/yank/paste                                                                                                                                                                                             |
+| `d` `c` `y`                        | delete / change / yank the selection (`d` alone: char)                                                                                                                                                                                      |
+| `p` `P`                            | paste after / before (linewise if the yank was)                                                                                                                                                                                             |
+| `0` `^` `$`                        | line start / first non-blank / line end                                                                                                                                                                                                     |
+| `gg` `G`                           | file start / end; `42gg` or `42G` jumps to line 42 (also `:42`)                                                                                                                                                                             |
+| `C-d` `C-u` `C-f` `C-b`            | half page / full page                                                                                                                                                                                                                       |
+| `C-w v` `C-w s` `C-w w` `C-w q`    | split side-by-side / stacked, cycle, close                                                                                                                                                                                                  |
+| `i` `I` `a` `A` `o` `O`            | enter insert mode                                                                                                                                                                                                                           |
+| `D` `J`                            | delete to line end, join                                                                                                                                                                                                                    |
+| `u` `C-r`                          | undo / redo                                                                                                                                                                                                                                 |
+| `gn` `gp`                          | next / previous buffer                                                                                                                                                                                                                      |
+| `gd` `K`                           | goto definition / hover (LSP)                                                                                                                                                                                                               |
+| _(typing)_                         | intellisense pops itself from buffer words — Tab accepts, Enter stays Enter                                                                                                                                                                 |
+| `C-space` (insert)                 | LSP completion menu — Tab/Enter accepts, type to narrow                                                                                                                                                                                     |
+| `space e`                          | file tree sidebar — same key focuses and closes; `j`/`k` move, Enter/`l` expand or open, `h` collapse, `a` add (trailing `/` = dir), `r` rename, `d` delete (y/n), `x`/`c`/`p` cut/copy/paste, `R` refresh, `Esc` back to editor, `q` close |
+| `space c`                          | command palette: fuzzy-run any command                                                                                                                                                                                                      |
+| `space f`                          | fuzzy file finder                                                                                                                                                                                                                           |
+| `space d`                          | directory browser picker (Enter descends, Backspace goes up)                                                                                                                                                                                |
+| `space t`                          | theme picker with live preview                                                                                                                                                                                                              |
+| `:w` `:q` `:wq` `:q!` `:e f` `:42` | ex commands                                                                                                                                                                                                                                 |
 
 Any command in the registry is also callable by name, so `:join_lines` works.
 
