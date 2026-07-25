@@ -48,7 +48,9 @@ impl Default for Config {
     }
 }
 
-// Options read from hot paths live in statics, set once by `apply`.
+// Options read from hot paths live in statics, set by `apply`. Nothing
+// caches them, so `apply` running a second time (`:config!`) is all a
+// reload needs for this half of the config.
 static TAB_WIDTH: AtomicUsize = AtomicUsize::new(4);
 static SCROLLOFF: AtomicUsize = AtomicUsize::new(3);
 static AUTOCLOSE: AtomicBool = AtomicBool::new(true);
@@ -85,19 +87,25 @@ pub fn format_on_save() -> bool {
     FORMAT_ON_SAVE.load(Ordering::Relaxed)
 }
 
-/// Install the config's options and theme as the live values.
-pub fn apply(config: &Config) {
+/// Install the config's options and theme as the live values. False when the
+/// theme name was not recognised — startup ignores that, `:config!` reports it
+/// rather than looking like the reload did nothing.
+pub fn apply(config: &Config) -> bool {
     TAB_WIDTH.store(config.tab_width.clamp(1, 16), Ordering::Relaxed);
     SCROLLOFF.store(config.scrolloff.min(50), Ordering::Relaxed);
     AUTOCLOSE.store(config.autoclose, Ordering::Relaxed);
     ICONS.store(config.icons, Ordering::Relaxed);
     SHOW_HIDDEN.store(config.show_hidden, Ordering::Relaxed);
     FORMAT_ON_SAVE.store(config.format_on_save, Ordering::Relaxed);
-    crate::theme::set(&config.theme);
-    let _ = FMT.set(config.fmt.clone());
+    *FMT.lock().unwrap() = config.fmt.clone();
+    crate::theme::set(&config.theme)
 }
 
-static FMT: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+/// The `[fmt]` overrides. A `Mutex` rather than a `OnceLock` so a reload can
+/// replace them.
+/// ponytail: one lock taken on `:w` and `:fmt`, not per keystroke; an
+/// `RwLock` if a formatter ever ends up on a hot path.
+static FMT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
 
 /// Built-in formatters, all reading the buffer on stdin and writing the
 /// result to stdout. `{file}` becomes the buffer's path (for tools that
@@ -245,10 +253,8 @@ pub fn installer(program: &str) -> Option<&'static str> {
 /// The formatter command line for a file extension: config entries first,
 /// then the built-in table.
 pub fn formatter(ext: &str) -> Option<String> {
-    if let Some(user) = FMT.get() {
-        if let Some((_, command)) = user.iter().find(|(e, _)| e == ext) {
-            return Some(command.clone());
-        }
+    if let Some((_, command)) = FMT.lock().unwrap().iter().find(|(e, _)| e == ext) {
+        return Some(command.clone());
     }
     BUILTIN_FMT
         .iter()
@@ -531,6 +537,27 @@ py = "pyright-langserver --stdio"
             config.fmt,
             vec![("py".to_string(), "ruff format -".to_string())]
         );
+    }
+
+    /// The whole reason `FMT` is a `Mutex`: with a `OnceLock` the second
+    /// `apply` was silently discarded and `:config!` would keep formatting
+    /// with the config you just edited away.
+    #[test]
+    fn apply_replaces_the_fmt_overrides() {
+        let _guard = crate::theme::TEST_LOCK.lock().unwrap();
+        apply(&Config {
+            fmt: vec![("py".into(), "ruff format -".into())],
+            ..Config::default()
+        });
+        assert_eq!(formatter("py").as_deref(), Some("ruff format -"));
+        apply(&Config {
+            fmt: vec![("py".into(), "blue -".into())],
+            ..Config::default()
+        });
+        assert_eq!(formatter("py").as_deref(), Some("blue -"));
+        // Dropping the entry falls back to the built-in table.
+        apply(&Config::default());
+        assert_eq!(formatter("py").as_deref(), Some("black -q -"));
     }
 
     #[test]

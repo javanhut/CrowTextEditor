@@ -2,8 +2,9 @@
 //! scroll position.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use ropey::{Rope, RopeSlice};
 
@@ -43,6 +44,11 @@ pub struct Document {
     /// short line and back out does not lose the original column.
     pub goal_col: Option<usize>,
     pub modified: bool,
+    /// The file's mtime as we last saw it — stamped when we read it and again
+    /// after each of our own writes. `None` means there was no file, or the
+    /// filesystem would not say. A write refuses when disk disagrees, which is
+    /// how a `git checkout` under an open buffer stops being silent data loss.
+    pub disk_mtime: Option<SystemTime>,
 
     /// First visible line.
     pub view_line: usize,
@@ -66,6 +72,7 @@ impl Document {
             revision: 0,
             goal_col: None,
             modified: false,
+            disk_mtime: None,
             view_line: 0,
             view_col: 0,
             history: Vec::new(),
@@ -81,8 +88,12 @@ impl Document {
         } else {
             Rope::new()
         };
+        // Stamp after the read, never before: a write that lands in between
+        // then looks like a mismatch and gets caught, rather than being read
+        // over and silently blessed.
         let mut doc = Document {
             text,
+            disk_mtime: disk_mtime(&path),
             path: Some(path),
             ..Document::empty()
         };
@@ -100,20 +111,66 @@ impl Document {
         self.syntax = config.and_then(|c| crate::syntax::parse(c, &self.text));
     }
 
-    pub fn save(&mut self) -> std::io::Result<()> {
+    /// Write the buffer out, unless the file moved underneath us.
+    ///
+    /// Every write in the editor funnels through here — `:w`, `:wq`, `<space>w`,
+    /// `C-s` — so the staleness check lives here once instead of at each caller.
+    /// Format-on-save filters the rope through a subprocess without touching the
+    /// file, so our own formatting never trips the guard.
+    ///
+    /// `force` is the `:w!` escape hatch, for when the user has looked and
+    /// decided their buffer wins.
+    pub fn save(&mut self, force: bool) -> std::io::Result<()> {
         let path = self
             .path
             .clone()
             .ok_or_else(|| std::io::Error::other("buffer has no filename"))?;
-        self.text.write_to(BufWriter::new(File::create(&path)?))?;
+        // Only refuse when disk positively contradicts the stamp: a missing or
+        // unreadable file has nothing to clobber, and a false refusal traps a
+        // buffer just as badly as a clobber loses one.
+        let now = disk_mtime(&path);
+        if !force && now.is_some() && now != self.disk_mtime {
+            return Err(std::io::Error::other(
+                "file changed on disk since read — use :w! to overwrite",
+            ));
+        }
+        // `write_to` only `write_all`s its chunks, and a dropped BufWriter
+        // discards its flush error — so a truncated write would report success.
+        let mut out = BufWriter::new(File::create(&path)?);
+        let wrote = self.text.write_to(&mut out).and_then(|()| out.flush());
+        // Re-stamp either way. `File::create` truncated the file, so even a
+        // failed write is *our* mark on disk; leaving the old stamp would make
+        // every later save blame an external process for our own damage.
+        self.disk_mtime = disk_mtime(&path);
+        wrote?;
         self.modified = false;
         Ok(())
     }
 
-    pub fn save_as(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        self.path = Some(path.as_ref().to_path_buf());
+    /// `:w <path>`. Refusing has to happen *before* the buffer is retargeted:
+    /// a rejected save that already moved `path` would leave the buffer pointing
+    /// at a file it never wrote, and aim the `:w!` retry at the wrong one.
+    pub fn save_as(&mut self, path: impl AsRef<Path>, force: bool) -> std::io::Result<()> {
+        let path = path.as_ref().to_path_buf();
+        if same_file(self.path.as_deref(), &path) {
+            return self.save(force); // `:w ./notes.txt` on notes.txt is just `:w`
+        }
+        if !force && path.exists() {
+            return Err(std::io::Error::other(
+                "file exists — use :w! to overwrite",
+            ));
+        }
+        self.path = Some(path);
+        self.disk_mtime = None;
         self.refresh_syntax();
-        self.save()
+        self.save(force)
+    }
+
+    /// Re-read the mtime after something we ran rewrote the file in place — an
+    /// in-place `[fmt]` command, say. Ours, not an external edit, so the guard
+    /// must not flag it.
+    pub fn restamp(&mut self) {
+        self.disk_mtime = self.path.as_deref().and_then(disk_mtime);
     }
 
     pub fn name(&self) -> String {
@@ -354,6 +411,30 @@ impl Document {
     }
 }
 
+/// What the filesystem currently says about a file, or `None` if it is missing
+/// or unwilling to say. Both of those collapse to "we do not know", and the
+/// caller treats not-knowing as permission to write.
+///
+// ponytail: mtime only. Two writes inside one filesystem timestamp tick are
+// invisible to this; add `metadata.len()` to the comparison if that ever bites.
+fn disk_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// The same file spelled two ways — `notes.txt` vs `./notes.txt` vs an absolute
+/// path. `Path` compares component-wise, so `:w` on the file already open would
+/// otherwise look like a save-as onto an existing file and be refused.
+fn same_file(current: Option<&Path>, target: &Path) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    current == target
+        || matches!(
+            (current.canonicalize(), target.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +510,74 @@ mod tests {
         assert_eq!(d.cursor, 11);
         d.undo();
         assert_eq!(d.cursor, 5);
+    }
+
+    #[test]
+    fn save_refuses_a_file_that_changed_underneath_us() {
+        let path = std::env::temp_dir().join(format!("crow-mtime-test-{}", std::process::id()));
+        std::fs::write(&path, "original\n").unwrap();
+
+        // Unchanged file: the guard stays out of the way.
+        let mut d = Document::open(&path).unwrap();
+        d.insert_at_cursor("mine ");
+        assert!(d.save(false).is_ok());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine original\n");
+
+        // Somebody else writes it. Faking the stamp rather than sleeping keeps
+        // the test off the filesystem's timestamp resolution.
+        std::fs::write(&path, "theirs\n").unwrap();
+        d.disk_mtime = Some(SystemTime::UNIX_EPOCH);
+        d.insert_at_cursor("more ");
+        assert!(d.save(false).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs\n");
+        assert!(d.modified, "a refused write must not look saved");
+
+        // :w! goes through, and re-stamping means the next plain :w does too.
+        assert!(d.save(true).is_ok());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "mine more original\n"
+        );
+        assert!(d.save(false).is_ok());
+
+        // A buffer for a file that does not exist yet writes without a fight.
+        let fresh = path.with_extension("new");
+        let _ = std::fs::remove_file(&fresh);
+        let mut n = Document::open(&fresh).unwrap();
+        n.insert_at_cursor("hello");
+        assert!(n.save(false).is_ok());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&fresh);
+    }
+
+    #[test]
+    fn a_refused_save_as_leaves_the_buffer_on_its_own_file() {
+        let dir = std::env::temp_dir().join(format!("crow-saveas-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = dir.join("mine.txt");
+        let theirs = dir.join("theirs.txt");
+        std::fs::write(&mine, "mine\n").unwrap();
+        std::fs::write(&theirs, "theirs\n").unwrap();
+
+        let mut d = Document::open(&mine).unwrap();
+        d.insert_at_cursor("edited ");
+
+        // `:w theirs.txt` balks, and — the part that matters — does not drag
+        // the buffer onto theirs.txt on the way out.
+        assert!(d.save_as(&theirs, false).is_err());
+        assert_eq!(d.path.as_deref(), Some(mine.as_path()));
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "theirs\n");
+
+        // So a plain `:w` still writes the file we were actually editing.
+        assert!(d.save(false).is_ok());
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "edited mine\n");
+
+        // The same file spelled differently is a save, not a save-as.
+        assert!(d.save_as(dir.join(".").join("mine.txt"), false).is_ok());
+        assert_eq!(d.path.as_deref(), Some(mine.as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

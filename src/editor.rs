@@ -337,6 +337,31 @@ impl Default for Keymaps {
     }
 }
 
+/// The defaults with crow.toml's `[keys.*]` layered on top, plus the names of
+/// any bindings pointing at a command that doesn't exist.
+///
+/// Always a full rebuild from `Keymaps::default()`, never a patch of the live
+/// maps — that's what makes deleting a line from `[keys.normal]` and
+/// reloading restore the default binding instead of leaving your override in
+/// place.
+fn keymaps_from(config: &crate::config::Config) -> (Keymaps, Vec<String>) {
+    let mut keymaps = Keymaps::default();
+    let mut bad_binds = Vec::new();
+    for (mode_keys, trie) in [
+        (&config.keys_normal, &mut keymaps.normal),
+        (&config.keys_insert, &mut keymaps.insert),
+    ] {
+        for (seq, command) in mode_keys {
+            if commands::find(command).is_some() {
+                trie.bind_str(seq, command);
+            } else {
+                bad_binds.push(command.clone());
+            }
+        }
+    }
+    (keymaps, bad_binds)
+}
+
 pub struct Editor {
     pub documents: Vec<Document>,
     pub current: usize,
@@ -444,20 +469,7 @@ impl Editor {
             documents.push(Document::empty());
         }
 
-        let mut keymaps = Keymaps::default();
-        let mut bad_binds = Vec::new();
-        for (mode_keys, trie) in [
-            (&config.keys_normal, &mut keymaps.normal),
-            (&config.keys_insert, &mut keymaps.insert),
-        ] {
-            for (seq, command) in mode_keys {
-                if commands::find(command).is_some() {
-                    trie.bind_str(seq, command);
-                } else {
-                    bad_binds.push(command.clone());
-                }
-            }
-        }
+        let (keymaps, bad_binds) = keymaps_from(config);
         let status = if bad_binds.is_empty() {
             String::new()
         } else {
@@ -1036,6 +1048,28 @@ impl Editor {
         }
     }
 
+    /// The ex-commands `execute_command` handles itself, as opposed to the ones
+    /// it forwards to the `commands` registry. Only the primary name of each
+    /// arm lives here — the aliases (`write`, `edit`, `format`, …) exist for
+    /// muscle memory and would only pad the suggestion list. Hand-typed, and
+    /// kept honest by `builtins_match_the_ex_command_dispatch` below.
+    const BUILTINS: &'static [&'static str] = &[
+        "w",
+        "q",
+        "q!",
+        "wq",
+        "e",
+        "help",
+        "fmt",
+        "bn",
+        "bp",
+        "theme",
+        "install",
+        "lsp-install",
+        "config",
+        "config!",
+    ];
+
     /// Fuzzy matches for the command word being typed at the `:` prompt.
     /// Empty once an argument starts — only the command itself completes.
     pub fn command_suggestions(&self) -> Vec<String> {
@@ -1043,22 +1077,7 @@ impl Editor {
         if line.is_empty() || line.contains(' ') || line.chars().all(|c| c.is_ascii_digit()) {
             return Vec::new();
         }
-        const BUILTINS: &[&str] = &[
-            "w",
-            "q",
-            "q!",
-            "wq",
-            "e",
-            "fmt",
-            "bn",
-            "bp",
-            "theme",
-            "config",
-            "help",
-            "install",
-            "lsp-install",
-        ];
-        let mut scored: Vec<(i64, String)> = BUILTINS
+        let mut scored: Vec<(i64, String)> = Self::BUILTINS
             .iter()
             .map(|s| s.to_string())
             .chain(crate::commands::COMMANDS.iter().map(|c| c.name.to_string()))
@@ -1190,17 +1209,24 @@ impl Editor {
         let arg = parts.next();
 
         match cmd {
-            "w" | "write" => match arg {
-                Some(path) => match self.doc_mut().save_as(path) {
-                    Ok(()) => self.set_status(format!("\"{path}\" written")),
-                    Err(e) => self.set_status(format!("Error: {e}")),
-                },
-                None => (commands::find("save").unwrap().func)(self),
-            },
+            // The bang on a write means "the file moved under me and I still
+            // want my version", the same override `q!` is for unsaved changes.
+            "w" | "write" | "w!" | "write!" => {
+                let force = cmd.ends_with('!');
+                match arg {
+                    Some(path) => match self.doc_mut().save_as(path, force) {
+                        Ok(()) => self.set_status(format!("\"{path}\" written")),
+                        Err(e) => self.set_status(format!("Error: {e}")),
+                    },
+                    None => commands::save_with(self, force),
+                }
+            }
             "q" | "quit" => (commands::find("quit").unwrap().func)(self),
             "q!" | "quit!" => self.should_quit = true,
-            "wq" | "x" => {
-                (commands::find("save").unwrap().func)(self);
+            "wq" | "x" | "wq!" | "x!" => {
+                commands::save_with(self, cmd.ends_with('!'));
+                // A refused write leaves `modified` set, so a stale-file :wq
+                // keeps you in the editor instead of dropping your edits.
                 if !self.doc().modified {
                     self.should_quit = true;
                 }
@@ -1248,10 +1274,11 @@ impl Editor {
                 Ok(doc) => {
                     self.documents.push(doc);
                     self.current = self.documents.len() - 1;
-                    self.set_status("editing crow.toml — changes apply on restart");
+                    self.set_status("editing crow.toml — :config! to reload it");
                 }
                 Err(e) => self.set_status(format!("Error: {e}")),
             },
+            "config!" => self.reload_config(),
             other => {
                 // `:42` jumps to a line.
                 if let Ok(n) = other.parse::<usize>() {
@@ -1268,6 +1295,49 @@ impl Editor {
                 }
             }
         }
+    }
+
+    /// `:config!` — re-read crow.toml and install as much of it as can be
+    /// installed into a running editor.
+    ///
+    /// Language servers are the one thing a reload can't do politely. A
+    /// client is matched to a buffer by its command string, so an `[lsp]`
+    /// entry you edited or deleted would otherwise leave its old server
+    /// running and writing diagnostics for the rest of the session. When the
+    /// table actually changed we kill them all and let `lsp_sync` respawn
+    /// what's still wanted on the next tick — which means a rust-analyzer
+    /// reindex, so the status line says so instead of pretending the reload
+    /// was free. Leaving `[lsp]` alone costs nothing.
+    ///
+    /// ponytail: shutdown-and-respawn is the blunt version; teach lsp::Client
+    /// to compare command lines and restart only the entries that moved if
+    /// the reindex ever becomes annoying.
+    fn reload_config(&mut self) {
+        let config = crate::config::load();
+        let theme_ok = crate::config::apply(&config);
+        let (keymaps, bad_binds) = keymaps_from(&config);
+        self.keymaps = keymaps;
+        // A command whose typo you just fixed deserves another spawn attempt.
+        self.lsp_failed.clear();
+        let lsp_changed = self.lsp_table != config.lsp;
+        let lsps_restarted = lsp_changed && !self.lsps.is_empty();
+        if lsp_changed {
+            self.shutdown_lsps();
+            self.diagnostics.clear();
+            self.lsp_table = config.lsp;
+        }
+
+        let mut status = String::from("crow.toml reloaded");
+        if !theme_ok {
+            status.push_str(&format!("; unknown theme {:?}", config.theme));
+        }
+        if !bad_binds.is_empty() {
+            status.push_str(&format!("; unknown command(s): {}", bad_binds.join(", ")));
+        }
+        if lsps_restarted {
+            status.push_str("; language servers restarting");
+        }
+        self.set_status(status);
     }
 
     // ---- tool installs -----------------------------------------------------
@@ -2620,17 +2690,17 @@ fn server_for<'a>(table: &'a [(String, String)], path: &Path) -> Option<&'a str>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::keymap::Key;
 
-    fn editor_with(text: &str) -> Editor {
+    pub(crate) fn editor_with(text: &str) -> Editor {
         let mut editor = Editor::new(vec![], (80, 24), &crate::config::Config::default()).unwrap();
         editor.doc_mut().text = ropey::Rope::from_str(text);
         editor
     }
 
-    fn press(editor: &mut Editor, keys: &str) {
+    pub(crate) fn press(editor: &mut Editor, keys: &str) {
         for token in keys.split(' ').filter(|t| !t.is_empty()) {
             if token.len() > 1 && !token.contains('-') && !token.starts_with('<') {
                 for c in token.chars() {
@@ -3146,6 +3216,40 @@ mod tests {
         assert!(
             editor.tree_focused,
             "C-h out of the picker crosses to the open sidebar"
+        );
+    }
+
+    /// `BUILTINS` is a second copy of the `match cmd` in `execute_command`, and
+    /// the compiler has no opinion about the two agreeing: add an arm and the
+    /// command silently stops Tab-completing, delete one and Tab-completion
+    /// offers a name that answers "Not a command". Rather than generate the
+    /// arms from a macro — which would have to thread `self` and `arg` through
+    /// macro hygiene to buy this one assertion — read our own source back and
+    /// diff the two lists. Only each arm's first name counts; the aliases after
+    /// `|` are deliberately absent from `BUILTINS`.
+    // ponytail: text-scrapes the arms, so it only sees `"name" | ... =>` written
+    // on one line. If an arm ever needs a real parse, that is the day for one.
+    #[test]
+    fn builtins_match_the_ex_command_dispatch() {
+        let arms = include_str!("editor.rs")
+            .split_once("        match cmd {")
+            .expect("execute_command's dispatch")
+            .1
+            .split_once("other => {")
+            .expect("the fallback arm ends the literal ones")
+            .0;
+        let mut dispatched: Vec<&str> = arms
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('"') && line.contains("=>"))
+            .map(|line| line[1..].split('"').next().unwrap())
+            .collect();
+        let mut suggested: Vec<&str> = Editor::BUILTINS.to_vec();
+        dispatched.sort_unstable();
+        suggested.sort_unstable();
+        assert_eq!(
+            dispatched, suggested,
+            "BUILTINS has drifted from the `match cmd` arms in execute_command"
         );
     }
 

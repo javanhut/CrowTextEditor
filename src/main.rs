@@ -55,8 +55,9 @@ KEYS (normal mode):
 
 CONFIG:
     ~/.config/crow/crow.toml — theme, options, keybindings, language
-    servers. Created with comments on first run; :config opens it,
-    :theme <name> switches themes live.
+    servers. Created with comments on first run; :config opens it and
+    :config! reloads it without a restart (an edited [lsp] section
+    restarts your language servers). :theme <name> switches themes live.
 ";
 
 fn main() -> std::io::Result<()> {

@@ -135,7 +135,10 @@ pub fn help_lines(keymap: &crate::keymap::KeyTrie) -> Vec<HelpLine> {
         ),
         (":bn  :bp", "next / previous buffer"),
         (":theme [name]", "list themes, or switch to one"),
-        (":config", "edit crow.toml"),
+        (
+            ":config  :config!",
+            "edit crow.toml / reload it (restarts language servers if [lsp] changed)",
+        ),
         (":<number>", "jump to that line"),
         (":help  :h", "this window"),
         (":<command>", "run any command below by name"),
@@ -1037,6 +1040,10 @@ fn run_formatter(editor: &mut Editor) -> Option<Result<&'static str, String>> {
     let path = editor.doc().path.clone()?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let command = crate::config::formatter(ext)?;
+    // A `{file}` command was handed the path, so it may rewrite the file itself
+    // (`rustfmt {file}`) instead of filtering stdin. That is still our write —
+    // re-stamp below so the save guard does not read it as an external edit.
+    let in_place = command.contains("{file}");
     let command = command.replace("{file}", &path.to_string_lossy());
     let mut words = command.split_whitespace();
     let program = words.next().unwrap_or("");
@@ -1072,6 +1079,9 @@ fn run_formatter(editor: &mut Editor) -> Option<Result<&'static str, String>> {
         return Some(Err(format!("{program}: {first}")));
     }
 
+    if in_place {
+        editor.doc_mut().restamp();
+    }
     let new = String::from_utf8_lossy(&out.stdout).into_owned();
     if new.is_empty() || new == src {
         return Some(Ok("already formatted"));
@@ -1271,6 +1281,12 @@ fn next_window(editor: &mut Editor) {
 }
 
 fn save(editor: &mut Editor) {
+    save_with(editor, false);
+}
+
+/// `force` waives the external-modification guard — that is `:w!`, which cannot
+/// be a registry entry because command names have to be Rust idents.
+pub fn save_with(editor: &mut Editor, force: bool) {
     // Format first; a broken formatter never blocks the write.
     let fmt_err = match crate::config::format_on_save().then(|| run_formatter(editor)) {
         Some(Some(Err(e))) => Some(e),
@@ -1279,7 +1295,7 @@ fn save(editor: &mut Editor) {
         Some(None) if editor.pending_install.is_some() => Some(editor.status.clone()),
         _ => None,
     };
-    match editor.doc_mut().save() {
+    match editor.doc_mut().save(force) {
         Ok(()) => {
             let name = editor.doc().name();
             let lines = editor.doc().line_count();
@@ -1304,4 +1320,240 @@ fn quit(editor: &mut Editor) {
         return;
     }
     editor.should_quit = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::tests::{editor_with, press};
+
+    #[test]
+    fn vertical_motion_follows_the_display_column_not_the_char_index() {
+        // A tab is one character but four columns wide: `j` off a tab-indented
+        // line has to land under where the cursor looked, not under char 2.
+        let mut editor = editor_with("\tabc\nabcdefgh");
+        editor.doc_mut().cursor = 2; // 'b', display column 5
+        press(&mut editor, "j");
+        assert_eq!(editor.doc().cursor_line_col(), (1, 5));
+        press(&mut editor, "k");
+        assert_eq!(editor.doc().cursor, 2);
+    }
+
+    #[test]
+    fn the_goal_column_survives_a_short_line_and_a_count() {
+        // Crossing a short line clamps the cursor but must not forget where the
+        // column was, or coming back lands in the wrong place.
+        let mut editor = editor_with("abcdefgh\nxy\nabcdefgh\nq");
+        press(&mut editor, "$ 3j");
+        assert_eq!(editor.doc().cursor_line_col(), (3, 0));
+        press(&mut editor, "3k");
+        assert_eq!(editor.doc().cursor_line_col(), (0, 7));
+    }
+
+    #[test]
+    fn yank_gathers_every_cursor_and_rewinds_to_the_selection_start() {
+        // The extra cursors run before the primary, and the register gets no
+        // blank line between two line selections — that is what makes a
+        // multi-cursor yank paste back as clean lines.
+        let mut editor = editor_with("one\ntwo\nthree");
+        press(&mut editor, "C x y");
+        assert_eq!(editor.register, "two\none\n");
+        assert_eq!(editor.doc().cursor, 0); // rewound, so `xyp` duplicates
+        assert!(!editor.extend);
+    }
+
+    #[test]
+    fn a_second_yank_replaces_the_register() {
+        let mut editor = editor_with("abc");
+        press(&mut editor, "y");
+        assert_eq!(editor.register, "a");
+        press(&mut editor, "l y");
+        assert_eq!(editor.register, "b");
+        assert_eq!(editor.status, "yanked 1 chars");
+    }
+
+    #[test]
+    fn dd_on_the_last_line_takes_the_newline_in_front_of_it() {
+        // Every other line takes its trailing newline; the last one has none,
+        // so it takes the preceding one instead or leaves a blank line behind.
+        let mut editor = editor_with("one\ntwo");
+        press(&mut editor, "j dd");
+        assert_eq!(editor.doc().text.to_string(), "one");
+        assert_eq!(editor.register, "\ntwo");
+        press(&mut editor, "p");
+        assert_eq!(editor.doc().text.to_string(), "one\ntwo"); // and it round-trips
+        // A count past the end of the buffer clamps rather than panicking.
+        let mut editor = editor_with("a\nb\nc\n");
+        press(&mut editor, "j 5dd");
+        assert_eq!(editor.doc().text.to_string(), "a");
+    }
+
+    #[test]
+    fn paste_puts_the_text_where_the_register_says() {
+        // Linewise on the last line: the break goes in front of the pasted
+        // text, because there is no trailing newline to paste behind.
+        let mut editor = editor_with("ab");
+        editor.register = "X\n".into();
+        press(&mut editor, "p");
+        assert_eq!(editor.doc().text.to_string(), "ab\nX");
+        assert_eq!(editor.doc().cursor, 3);
+        // Charwise after the last character of a line lands before the newline.
+        let mut editor = editor_with("ab\ncd");
+        editor.register = "XY".into();
+        press(&mut editor, "$ p");
+        assert_eq!(editor.doc().text.to_string(), "abXY\ncd");
+        assert_eq!(editor.doc().cursor, 3); // on the last pasted char
+    }
+
+    #[test]
+    fn join_lines_eats_the_indent_and_stops_at_the_last_line() {
+        let mut editor = editor_with("foo\n    bar\nbaz");
+        press(&mut editor, "J");
+        assert_eq!(editor.doc().text.to_string(), "foo bar\nbaz");
+        assert_eq!(editor.doc().cursor, 3); // on the joining space
+        // A blank line joins with nothing between, not with a stray space.
+        let mut editor = editor_with("foo\n\nbar");
+        press(&mut editor, "J");
+        assert_eq!(editor.doc().text.to_string(), "foo\nbar");
+        let mut editor = editor_with("only");
+        press(&mut editor, "J");
+        assert_eq!(editor.doc().text.to_string(), "only");
+    }
+
+    #[test]
+    fn dep_upgrade_rewrites_the_version_and_nothing_else() {
+        // Each ecosystem writes its version differently, and only the digits
+        // are ours to touch: go.mod keeps its `v`, npm keeps its caret, and a
+        // Cargo inline table keeps everything but the number.
+        let mut editor = editor_with("module x\n\nrequire golang.org/x/tools v0.29.0\n");
+        editor.doc_mut().path = Some("go.mod".into());
+        editor.dep_info.insert(
+            (crate::deps::Kind::Go, "golang.org/x/tools".into()),
+            (Some("0.29.0".into()), Some("0.30.0".into())),
+        );
+        press(&mut editor, "jj");
+        (find("dep_upgrade").unwrap().func)(&mut editor);
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "module x\n\nrequire golang.org/x/tools v0.30.0\n"
+        );
+
+        let mut editor =
+            editor_with("{\n  \"dependencies\": {\n    \"react\": \"^18.2.0\"\n  }\n}\n");
+        editor.doc_mut().path = Some("package.json".into());
+        editor.dep_info.insert(
+            (crate::deps::Kind::Npm, "react".into()),
+            (Some("18.2.0".into()), Some("19.0.0".into())),
+        );
+        press(&mut editor, "jj");
+        (find("dep_upgrade").unwrap().func)(&mut editor);
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "{\n  \"dependencies\": {\n    \"react\": \"^19.0.0\"\n  }\n}\n"
+        );
+
+        let mut editor = editor_with(
+            "[dependencies]\ncrossterm = { version = \"0.27.0\", features = [\"event-stream\"] }\n",
+        );
+        editor.doc_mut().path = Some("Cargo.toml".into());
+        editor.dep_info.insert(
+            (crate::deps::Kind::Cargo, "crossterm".into()),
+            (Some("0.27.0".into()), Some("0.29.0".into())),
+        );
+        press(&mut editor, "j");
+        (find("dep_upgrade").unwrap().func)(&mut editor);
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "[dependencies]\ncrossterm = { version = \"0.29.0\", features = [\"event-stream\"] }\n"
+        );
+    }
+
+    #[test]
+    fn dep_upgrade_refuses_without_touching_the_buffer() {
+        // Every refusal is silent apart from the status line, so a wrong guard
+        // would show up as a corrupted manifest rather than an error.
+        let before = "[dependencies]\nropey = \"1.6.0\"\n";
+        let mut editor = editor_with(before);
+        (find("dep_upgrade").unwrap().func)(&mut editor);
+        assert_eq!(editor.status, "not a package manifest");
+
+        editor.doc_mut().path = Some("Cargo.toml".into());
+        (find("dep_upgrade").unwrap().func)(&mut editor);
+        assert_eq!(editor.status, "no dependency on this line"); // the [dependencies] header
+
+        press(&mut editor, "j");
+        (find("dep_upgrade").unwrap().func)(&mut editor);
+        assert_eq!(editor.status, "no version info for ropey (still fetching?)");
+
+        editor.dep_info.insert(
+            (crate::deps::Kind::Cargo, "ropey".into()),
+            (Some("1.6.0".into()), Some("1.6.0".into())),
+        );
+        (find("dep_upgrade").unwrap().func)(&mut editor);
+        assert_eq!(editor.status, "ropey is already 1.6.0");
+        assert_eq!(editor.doc().text.to_string(), before);
+    }
+
+    #[test]
+    fn format_buffer_says_so_when_there_is_no_formatter() {
+        // The two `None` paths: no file at all, and a file whose extension no
+        // formatter claims. Neither is an error and neither touches the buffer.
+        let mut editor = editor_with("x");
+        (find("format_buffer").unwrap().func)(&mut editor);
+        assert_eq!(
+            editor.status,
+            "no formatter for this buffer (see [fmt] in crow.toml)"
+        );
+        editor.doc_mut().path = Some("notes.zzz".into());
+        editor.set_status("");
+        (find("format_buffer").unwrap().func)(&mut editor);
+        assert_eq!(
+            editor.status,
+            "no formatter for this buffer (see [fmt] in crow.toml)"
+        );
+        assert_eq!(editor.doc().text.to_string(), "x");
+    }
+
+    #[test]
+    fn bare_d_with_extra_cursors_deletes_a_char_each_instead_of_arming_dd() {
+        let mut editor = editor_with("abc\ndef");
+        press(&mut editor, "C d");
+        assert_eq!(editor.doc().text.to_string(), "bc\nef");
+        assert_eq!(editor.register, "d\na");
+        assert!(editor.pending_dd.is_none());
+        // The count stops at the end of each cursor's own line.
+        let mut editor = editor_with("ab\ncd");
+        press(&mut editor, "C 5d");
+        assert_eq!(editor.doc().text.to_string(), "\n");
+    }
+
+    #[test]
+    fn word_motions_stop_at_punctuation_and_the_buffer_edges() {
+        let mut doc = Document::empty();
+        doc.text = ropey::Rope::from_str("foo.bar baz");
+        assert_eq!(
+            (
+                next_word_start(&doc, 0),
+                next_word_start(&doc, 3),
+                next_word_start(&doc, 4)
+            ),
+            (3, 4, 8)
+        );
+        assert_eq!(
+            (
+                prev_word_start(&doc, 8),
+                prev_word_start(&doc, 4),
+                prev_word_start(&doc, 0)
+            ),
+            (4, 3, 0)
+        );
+        assert_eq!(
+            (word_end(&doc, 0), word_end(&doc, 2), word_end(&doc, 10)),
+            (2, 3, 10)
+        );
+        // `e` on the last word of the buffer still takes its final character.
+        let mut editor = editor_with("foo");
+        press(&mut editor, "ed");
+        assert_eq!(editor.doc().text.to_string(), "");
+    }
 }
