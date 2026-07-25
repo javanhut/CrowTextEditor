@@ -1382,7 +1382,7 @@ mod tests {
         assert_eq!(editor.register, "\ntwo");
         press(&mut editor, "p");
         assert_eq!(editor.doc().text.to_string(), "one\ntwo"); // and it round-trips
-        // A count past the end of the buffer clamps rather than panicking.
+                                                               // A count past the end of the buffer clamps rather than panicking.
         let mut editor = editor_with("a\nb\nc\n");
         press(&mut editor, "j 5dd");
         assert_eq!(editor.doc().text.to_string(), "a");
@@ -1411,7 +1411,7 @@ mod tests {
         press(&mut editor, "J");
         assert_eq!(editor.doc().text.to_string(), "foo bar\nbaz");
         assert_eq!(editor.doc().cursor, 3); // on the joining space
-        // A blank line joins with nothing between, not with a stray space.
+                                            // A blank line joins with nothing between, not with a stray space.
         let mut editor = editor_with("foo\n\nbar");
         press(&mut editor, "J");
         assert_eq!(editor.doc().text.to_string(), "foo\nbar");

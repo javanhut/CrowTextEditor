@@ -156,9 +156,7 @@ impl Document {
             return self.save(force); // `:w ./notes.txt` on notes.txt is just `:w`
         }
         if !force && path.exists() {
-            return Err(std::io::Error::other(
-                "file exists — use :w! to overwrite",
-            ));
+            return Err(std::io::Error::other("file exists — use :w! to overwrite"));
         }
         self.path = Some(path);
         self.disk_mtime = None;
