@@ -161,6 +161,12 @@ const BUILTIN_LSP: &[(&str, &str)] = &[
     ("bash", "bash-language-server start"),
     ("lua", "lua-language-server"),
     ("zig", "zls"),
+    ("odin", "ols"),
+    ("java", "jdtls"),
+    ("rb", "ruby-lsp"),
+    ("php", "intelephense --stdio"),
+    ("md", "marksman server"),
+    ("markdown", "marksman server"),
     ("toml", "taplo lsp stdio"),
     ("yml", "yaml-language-server --stdio"),
     ("yaml", "yaml-language-server --stdio"),
@@ -220,6 +226,12 @@ const INSTALLERS: &[(&str, &str)] = &[
     ),
     ("lua-language-server", "brew install lua-language-server"),
     ("zls", "brew install zls"),
+    ("ols", "brew install ols"),
+    ("odinfmt", "brew install ols"),
+    ("jdtls", "brew install jdtls"),
+    ("ruby-lsp", "gem install ruby-lsp"),
+    ("intelephense", "npm install -g intelephense"),
+    ("marksman", "brew install marksman"),
 ];
 
 /// The shell command that installs `program`, if we know one.
