@@ -532,6 +532,16 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
     if !info.is_empty() {
         info.push_str("  ");
     }
+    // Shown only while a server is up for this buffer; absence is the "no LSP"
+    // state, so nothing is drawn otherwise.
+    let lsp_seg = if !editor.lsp_active() {
+        String::new()
+    } else if crate::config::icons() {
+        "\u{f085} lsp  ".to_string()
+    } else {
+        "lsp  ".to_string()
+    };
+
     // Filetype segment: the tree's icon and color, so both agree on what a
     // file is. Empty for a scratch buffer or an extensionless file.
     let (ft_seg, ft_color) = if ft.is_empty() {
@@ -559,6 +569,7 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
 
     let left_w = 2 + label.chars().count() + lsep.chars().count() + file.chars().count() + diag_w;
     let right_w = info.chars().count()
+        + lsp_seg.chars().count()
         + ft_seg.chars().count()
         + rsep.chars().count() * 2
         + pos.chars().count()
@@ -570,6 +581,8 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
             SetBackgroundColor(bar_bg),
             SetForegroundColor(fg),
             Print(&info),
+            SetForegroundColor(Color::Green),
+            Print(&lsp_seg),
             SetForegroundColor(ft_color),
             Print(&ft_seg),
             SetForegroundColor(theme.selection),

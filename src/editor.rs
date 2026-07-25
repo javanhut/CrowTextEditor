@@ -2110,6 +2110,12 @@ impl Editor {
         server_for(&self.lsp_table, path).map(str::to_string)
     }
 
+    /// True when a language server is up for the current buffer (status line).
+    pub fn lsp_active(&self) -> bool {
+        self.current_server_command()
+            .is_some_and(|cmd| self.lsps.iter().any(|c| c.command() == cmd))
+    }
+
     /// The running client that serves the current buffer's language.
     pub fn current_client(&mut self) -> Option<&mut lsp::Client> {
         let command = self.current_server_command()?;
