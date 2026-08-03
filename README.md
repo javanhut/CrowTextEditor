@@ -54,8 +54,10 @@ feeds its messages into a channel, and the main loop drains it between
 keystrokes — the editor never blocks on the server. Diagnostics color the
 gutter (red errors, yellow warnings) and the message for the cursor line shows
 below the status bar; `gd` jumps to a definition (opening the file if needed);
-`K` shows hover info. rust-analyzer is wired up by default; any server is one
-config line.
+`K` shows hover info. Completions come from the server as you type an
+identifier, on the trigger characters it advertises (`.` for members, `<` for
+Oxigen's type annotations), and on demand with `C-space`. rust-analyzer is
+wired up by default; any server is one config line.
 
 Configuration is a data file, not a program. `~/.config/crow/crow.toml` —
 created with comments on first run, opened with `:config` — declares
@@ -107,7 +109,7 @@ an emoji ZWJ sequence or a combining stack.
 | `u` `C-r`                          | undo / redo                                                                                                                                                                                                                                 |
 | `gn` `gp`                          | next / previous buffer                                                                                                                                                                                                                      |
 | `gd` `K`                           | goto definition / hover (LSP)                                                                                                                                                                                                               |
-| _(typing)_                         | intellisense pops itself from buffer words — Tab accepts, Enter stays Enter                                                                                                                                                                 |
+| _(typing)_                         | intellisense pops itself from buffer words, then from the language server when one is up — Tab accepts, Enter stays Enter                                                                                                                    |
 | `C-space` (insert)                 | LSP completion menu — Tab/Enter accepts, type to narrow                                                                                                                                                                                     |
 | `space e`                          | file tree sidebar — same key focuses and closes; `j`/`k` move, Enter/`l` expand or open, `h` collapse, `a` add (trailing `/` = dir), `r` rename, `d` delete (y/n), `x`/`c`/`p` cut/copy/paste, `R` refresh, `Esc` back to editor, `q` close |
 | `space c`                          | command palette: fuzzy-run any command                                                                                                                                                                                                      |

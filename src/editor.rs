@@ -433,9 +433,11 @@ pub struct Editor {
     /// Terminal size as (columns, rows).
     pub size: (u16, u16),
     pub keymaps: Keymaps,
-    /// A `.`/`::` was just typed: ask the server for members on the next
-    /// tick, after the edit has been synced.
-    lsp_completion_pending: bool,
+    /// A completion request owed to the server on the next tick, once the
+    /// edit that prompted it has been synced. The tag says which kind:
+    /// `completion` for a trigger character the user typed, `completion_typed`
+    /// for the ambient one that follows an identifier being typed.
+    lsp_completion_pending: Option<&'static str>,
     /// A bare `d` was pressed (with its count): a second `d` deletes lines.
     pub pending_dd: Option<usize>,
     /// The hover docs popup: its lines and scroll offset (K to open).
@@ -522,7 +524,7 @@ impl Editor {
             size,
             keymaps,
             lsp_table: config.lsp.clone(),
-            lsp_completion_pending: false,
+            lsp_completion_pending: None,
             pending_dd: None,
             hover: None,
             pending_install: None,
@@ -2205,18 +2207,20 @@ impl Editor {
     /// may have changed, so the main loop knows a redraw is needed.
     pub fn lsp_tick(&mut self) -> bool {
         self.lsp_sync();
-        if std::mem::take(&mut self.lsp_completion_pending) && self.mode == Mode::Insert {
-            if let Some(path) = self.doc().path.clone() {
-                let (line, col) = self.doc().cursor_line_col();
-                let utf16_col = crate::position::char_to_utf16(self.doc().line(line), col);
-                if let Some(lsp) = self.current_client() {
-                    lsp.request_position(
-                        "completion",
-                        "textDocument/completion",
-                        &path,
-                        line,
-                        utf16_col,
-                    );
+        if let Some(tag) = self.lsp_completion_pending.take() {
+            if self.mode == Mode::Insert {
+                if let Some(path) = self.doc().path.clone() {
+                    let (line, col) = self.doc().cursor_line_col();
+                    let utf16_col = crate::position::char_to_utf16(self.doc().line(line), col);
+                    if let Some(lsp) = self.current_client() {
+                        lsp.request_position(
+                            tag,
+                            "textDocument/completion",
+                            &path,
+                            line,
+                            utf16_col,
+                        );
+                    }
                 }
             }
         }
@@ -2242,7 +2246,7 @@ impl Editor {
                 lsp::Event::Diagnostics(path, diags) => {
                     self.diagnostics.insert(path, diags);
                 }
-                lsp::Event::Completions(items) => self.show_completions(items),
+                lsp::Event::Completions(items, typed) => self.show_completions(items, typed),
                 lsp::Event::CompletionResolved(label, info) => {
                     if let Some(c) = self.completion.as_mut() {
                         if !info.is_empty() {
@@ -2265,7 +2269,9 @@ impl Editor {
         self.hover = Some((text.lines().map(str::to_string).collect(), 0));
     }
 
-    fn show_completions(&mut self, items: Vec<(String, String, String)>) {
+    /// `typed` marks the list crow asked for on its own while an identifier
+    /// was being typed, rather than one the user asked for.
+    fn show_completions(&mut self, items: Vec<(String, String, String)>, typed: bool) {
         if self.mode != Mode::Insert {
             return; // the answer arrived after insert mode ended
         }
@@ -2284,21 +2290,26 @@ impl Editor {
             .collect();
         items.truncate(50);
         if items.is_empty() {
-            self.set_status("no completions");
-            self.completion = None;
-        } else {
-            self.completion = Some(Completion {
-                items,
-                selected: 0,
-                prefix,
-                // The server was asked (C-space or a `::`/`.` trigger):
-                // the list is the point, so Enter accepts right away.
-                navigated: true,
-                docs,
-            });
-            // Docs for the item highlighted on open, if the server defers them.
-            self.maybe_resolve_completion();
+            // An unasked-for list that no longer matches what has been typed
+            // since must not close the popup that is up, nor say anything.
+            if !typed {
+                self.set_status("no completions");
+                self.completion = None;
+            }
+            return;
         }
+        self.completion = Some(Completion {
+            items,
+            selected: 0,
+            prefix,
+            // Asked for (C-space, or a `.`/`<`/`::` trigger): the list is the
+            // point, so Enter accepts. Offered while typing: Enter stays
+            // Enter and Tab accepts, like the buffer-word popup it replaced.
+            navigated: !typed,
+            docs,
+        });
+        // Docs for the item highlighted on open, if the server defers them.
+        self.maybe_resolve_completion();
     }
 
     /// One typed character in insert mode: bracket/quote pairs close
@@ -2370,16 +2381,36 @@ impl Editor {
         self.doc_mut().insert_at_cursor(&c.to_string());
         if c.is_alphanumeric() || c == '_' || c == '/' {
             self.maybe_autocomplete();
+            // With a server up, ask it as well: buffer words can only offer
+            // what the file already says, so `println` is invisible until
+            // something types it first. Its answer lands in the same popup a
+            // tick later, filtered by whatever the prefix is by then.
+            //
+            // ponytail: one request per identifier keystroke, held to one in
+            // flight by the single slot; a real debounce timer if a server
+            // ever starts falling behind.
+            if self.lsp_completion_pending.is_none()
+                && self.word_prefix().chars().count() >= 2
+                && self.current_server_command().is_some()
+            {
+                self.lsp_completion_pending = Some("completion_typed");
+            }
         }
         // Member access: `.` or a second `:` asks the server what's inside.
         // Deferred to `lsp_tick` so the request follows this edit's didChange.
         // A digit before the dot is a float literal, not member access.
         let member_dot = c == '.' && !prev.is_some_and(|p| p.is_ascii_digit());
-        if (member_dot || (c == ':' && prev == Some(':')))
+        // Plus whatever else the server itself calls a trigger — `<` opens
+        // Oxigen's type list, and nothing but the server knows that.
+        let declared = c != '.'
+            && self
+                .current_client()
+                .is_some_and(|lsp| lsp.triggers_completion(c));
+        if (member_dot || declared || (c == ':' && prev == Some(':')))
             && self.current_server_command().is_some()
         {
             self.completion = None;
-            self.lsp_completion_pending = true;
+            self.lsp_completion_pending = Some("completion");
         }
     }
 
@@ -3072,10 +3103,13 @@ pub(crate) mod tests {
         let mut editor = editor_with("");
         press(&mut editor, "i");
         press(&mut editor, "pri");
-        editor.show_completions(vec![
-            ("println!".into(), "println!".into(), String::new()),
-            ("print!".into(), "print!".into(), String::new()),
-        ]);
+        editor.show_completions(
+            vec![
+                ("println!".into(), "println!".into(), String::new()),
+                ("print!".into(), "print!".into(), String::new()),
+            ],
+            false,
+        );
         assert_eq!(editor.completion.as_ref().unwrap().items.len(), 2);
         press(&mut editor, "<enter>");
         assert_eq!(editor.doc().text.to_string(), "println!");
@@ -3140,10 +3174,13 @@ pub(crate) mod tests {
         let mut editor = editor_with("");
         press(&mut editor, "i");
         press(&mut editor, "p");
-        editor.show_completions(vec![
-            ("print!".into(), "print!".into(), String::new()),
-            ("push".into(), "push".into(), "Appends an element.".into()),
-        ]);
+        editor.show_completions(
+            vec![
+                ("print!".into(), "print!".into(), String::new()),
+                ("push".into(), "push".into(), "Appends an element.".into()),
+            ],
+            false,
+        );
         // An LSP menu starts navigated: Tab advances, S-Tab goes back.
         press(&mut editor, "<tab>");
         assert_eq!(editor.completion.as_ref().unwrap().selected, 1);
@@ -3158,15 +3195,49 @@ pub(crate) mod tests {
         let mut editor = editor_with("");
         press(&mut editor, "i");
         press(&mut editor, "p");
-        editor.show_completions(vec![
-            ("print!".into(), "print!".into(), String::new()),
-            ("push".into(), "push".into(), String::new()),
-        ]);
+        editor.show_completions(
+            vec![
+                ("print!".into(), "print!".into(), String::new()),
+                ("push".into(), "push".into(), String::new()),
+            ],
+            false,
+        );
         press(&mut editor, "u"); // types through the menu
         assert_eq!(editor.doc().text.to_string(), "pu");
         assert_eq!(editor.completion.as_ref().unwrap().items.len(), 1);
         press(&mut editor, "<enter>");
         assert_eq!(editor.doc().text.to_string(), "push");
+    }
+
+    /// The list crow asks the server for while you type replaces the
+    /// buffer-word popup, so it has to keep that popup's manners.
+    #[test]
+    fn a_typed_completion_list_keeps_enter_as_enter() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "pri");
+        editor.show_completions(
+            vec![("println".into(), "println".into(), String::new())],
+            true,
+        );
+        assert_eq!(editor.completion.as_ref().unwrap().items.len(), 1);
+        press(&mut editor, "<enter>");
+        assert_eq!(editor.doc().text.to_string(), "pri\n");
+        assert!(editor.completion.is_none());
+
+        // And an answer that arrives too late to match what has been typed
+        // since leaves the popup that is up alone instead of closing it.
+        press(&mut editor, "pri");
+        editor.show_completions(
+            vec![("println".into(), "println".into(), String::new())],
+            true,
+        );
+        editor.show_completions(vec![("zzz".into(), "zzz".into(), String::new())], true);
+        assert!(
+            editor.completion.is_some(),
+            "a stale typed list closed the popup"
+        );
+        assert_eq!(editor.status, "");
     }
 
     #[test]

@@ -29,8 +29,10 @@ pub enum Event {
     Definition(PathBuf, usize, usize),
     Hover(String),
     Diagnostics(PathBuf, Vec<Diagnostic>),
-    /// Completion candidates as (label, insert text).
-    Completions(Vec<(String, String, String)>),
+    /// Completion candidates as (label, insert text, docs), and whether they
+    /// answer the ambient request made while an identifier was being typed
+    /// rather than one the user asked for.
+    Completions(Vec<(String, String, String)>, bool),
     /// `completionItem/resolve` came back: (label, signature + docs).
     CompletionResolved(String, String),
     Status(String),
@@ -53,6 +55,9 @@ pub struct Client {
     /// The raw items of the last completion response, by label — what
     /// `completionItem/resolve` needs sent back to fetch the docs.
     completion_items: HashMap<String, Value>,
+    /// Characters the server said should pop the completion menu, from its
+    /// initialize result: `.` almost everywhere, `<` for Oxigen's `x <int>`.
+    triggers: Vec<char>,
     dead: bool,
 }
 
@@ -91,6 +96,7 @@ impl Client {
             queued: Vec::new(),
             synced: HashMap::new(),
             completion_items: HashMap::new(),
+            triggers: Vec::new(),
             dead: false,
         };
         client.send_request(
@@ -219,6 +225,12 @@ impl Client {
         &self.command
     }
 
+    /// Whether typing `c` should ask this server for completions, per the
+    /// trigger characters it advertised.
+    pub fn triggers_completion(&self, c: char) -> bool {
+        self.triggers.contains(&c)
+    }
+
     pub fn poll(&mut self) -> Vec<Event> {
         let mut events = Vec::new();
         loop {
@@ -276,6 +288,16 @@ impl Client {
                 match tag {
                     "initialize" => {
                         self.ready = true;
+                        self.triggers = msg["result"]["capabilities"]["completionProvider"]
+                            ["triggerCharacters"]
+                            .as_array()
+                            .map(|chars| {
+                                chars
+                                    .iter()
+                                    .filter_map(|v| v.as_str()?.chars().next())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         self.write(
                             &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
                         );
@@ -293,9 +315,12 @@ impl Client {
                         Some(text) => events.push(Event::Hover(text)),
                         None => events.push(Event::Status("no hover info".into())),
                     },
-                    "completion" => {
+                    "completion" | "completion_typed" => {
                         self.completion_items = raw_items(&msg["result"]);
-                        events.push(Event::Completions(parse_completions(&msg["result"])))
+                        events.push(Event::Completions(
+                            parse_completions(&msg["result"]),
+                            tag == "completion_typed",
+                        ))
                     }
                     "resolve" => {
                         let item = &msg["result"];
@@ -588,6 +613,52 @@ mod tests {
         }
         assert!(client.ready, "initialize handshake did not complete");
         client.shutdown();
+    }
+
+    /// The Oxigen round trip: handshake, the `<` trigger the type list hangs
+    /// off, and completions parsed back out of the response.
+    #[test]
+    #[ignore] // needs oxigen-lsp on PATH; run with `cargo test -- --ignored`
+    fn oxigen_completions_arrive_from_its_server() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join("crow-oxigen-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("probe.oxi");
+        let src = "fun helper(a <int>) { a }\nx <\n";
+        std::fs::write(&file, src).unwrap();
+
+        let Some(mut client) = Client::spawn(&dir, "oxigen-lsp") else {
+            return; // no server installed — nothing to verify
+        };
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && !client.ready {
+            let _ = client.poll();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(client.ready, "initialize handshake did not complete");
+        assert!(
+            client.triggers_completion('<'),
+            "the server advertises `<` as a completion trigger"
+        );
+        client.did_open(&file, src.to_string(), 0);
+        client.request_position("completion", "textDocument/completion", &file, 1, 3);
+
+        let mut items = None;
+        while Instant::now() < deadline && items.is_none() {
+            for event in client.poll() {
+                if let Event::Completions(list, _) = event {
+                    items = Some(list);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        client.shutdown();
+        let items = items.expect("no completions arrived");
+        assert!(
+            items.iter().any(|(label, _, _)| label == "int"),
+            "the type list should be offered after `<`: {items:?}"
+        );
     }
 
     #[test]
