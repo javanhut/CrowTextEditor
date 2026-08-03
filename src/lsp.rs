@@ -504,6 +504,7 @@ pub fn language_id(path: &Path) -> &str {
         "ex" | "exs" => "elixir",
         "md" => "markdown",
         "sh" => "shellscript",
+        "oxi" => "oxigen",
         other => other,
     }
 }

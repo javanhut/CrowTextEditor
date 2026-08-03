@@ -101,14 +101,10 @@ impl Document {
         Ok(doc)
     }
 
-    /// (Re)parse the buffer if its language has a grammar.
+    /// (Re)color the buffer if its language has a grammar or a fallback lexer.
     pub fn refresh_syntax(&mut self) {
-        let config = self
-            .syntax
-            .as_ref()
-            .map(|s| s.config)
-            .or_else(|| crate::syntax::config_for(self.path.as_deref()));
-        self.syntax = config.and_then(|c| crate::syntax::parse(c, &self.text));
+        let cached = self.syntax.as_ref().and_then(|s| s.config);
+        self.syntax = crate::syntax::highlight(self.path.as_deref(), &self.text, cached);
     }
 
     /// Write the buffer out, unless the file moved underneath us.

@@ -109,9 +109,11 @@ static FMT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec:
 
 /// Built-in formatters, all reading the buffer on stdin and writing the
 /// result to stdout. `{file}` becomes the buffer's path (for tools that
-/// pick style/parser from the filename).
+/// pick style/parser from the filename); `{tmp}` becomes a throwaway copy of
+/// the buffer, for tools that only rewrite files in place.
 const BUILTIN_FMT: &[(&str, &str)] = &[
     ("rs", "rustfmt --edition 2021"),
+    ("oxi", "oxigen fmt {tmp}"),
     ("go", "gofmt"),
     ("py", "black -q -"),
     ("sh", "shfmt"),
@@ -149,6 +151,7 @@ const BUILTIN_FMT: &[(&str, &str)] = &[
 /// section has no entry for the extension. Every one has an `:install` entry.
 const BUILTIN_LSP: &[(&str, &str)] = &[
     ("rs", "rust-analyzer"),
+    ("oxi", "oxigen-lsp"),
     ("py", "pyright-langserver --stdio"),
     ("go", "gopls"),
     ("js", "typescript-language-server --stdio"),
@@ -240,7 +243,23 @@ const INSTALLERS: &[(&str, &str)] = &[
     ("ruby-lsp", "gem install ruby-lsp"),
     ("intelephense", "npm install -g intelephense"),
     ("marksman", "brew install marksman"),
+    // Oxigen ships no package: build it from its own repo, cached under
+    // ~/.cache/crow. `make install` picks /usr/local or ~/.local by itself,
+    // so neither needs sudo.
+    ("oxigen", OXIGEN_BUILD),
+    ("oxigen-lsp", OXIGEN_LSP_BUILD),
 ];
+
+const OXIGEN_BUILD: &str = concat!(
+    "git clone --depth 1 https://github.com/javanhut/OxigenLang.git ~/.cache/crow/OxigenLang",
+    " || git -C ~/.cache/crow/OxigenLang pull --ff-only;",
+    " make -C ~/.cache/crow/OxigenLang install"
+);
+const OXIGEN_LSP_BUILD: &str = concat!(
+    "git clone --depth 1 https://github.com/javanhut/OxigenLang.git ~/.cache/crow/OxigenLang",
+    " || git -C ~/.cache/crow/OxigenLang pull --ff-only;",
+    " make -C ~/.cache/crow/OxigenLang install-lsp"
+);
 
 /// The shell command that installs `program`, if we know one.
 pub fn installer(program: &str) -> Option<&'static str> {
@@ -328,6 +347,7 @@ show_hidden = false      # dotfiles, .git, and build dirs everywhere (toggle: . 
 rs = "rust-analyzer"
 # py = "pyright-langserver --stdio"
 # go = "gopls"
+# oxi = "oxigen-lsp"
 
 # Extra keybindings: "sequence" = "command". Any command callable with
 # `:name` can be bound. Later bindings win over defaults.

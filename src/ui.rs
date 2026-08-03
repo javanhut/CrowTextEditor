@@ -1240,6 +1240,7 @@ fn file_icon(name: &str, is_dir: bool, expanded: bool) -> (&'static str, Color) 
         "c" | "h" => ("\u{e61e}", rgb(86, 156, 214)),
         "cc" | "cpp" | "hpp" => ("\u{e61d}", rgb(86, 156, 214)),
         "go" => ("\u{e626}", rgb(86, 192, 230)),
+        "oxi" => ("\u{f121}", rgb(158, 206, 106)),
         "html" => ("\u{e736}", rgb(225, 140, 84)),
         "css" => ("\u{e749}", rgb(86, 156, 214)),
         "yml" | "yaml" => ("\u{e615}", rgb(187, 154, 247)),

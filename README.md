@@ -36,6 +36,12 @@ one match arm), colors them, and
 statement, block, function — one keypress per level. Since it's just a
 selection, `d`/`c`/`y`, multi-cursor, and `s` all compose with it.
 
+Oxigen (`.oxi`) has no published grammar, so it is colored by a lexer built
+into `syntax.rs` instead — keywords, `<type>` annotations, strings, comments,
+`#[indent]` directives, calls. Same colors, minus `A-o`, which needs a tree.
+`oxigen-lsp` and `oxigen fmt` are wired up by default like every other
+language; `:install oxigen-lsp` builds them from the language's own repo.
+
 Insert-mode niceties: brackets and quotes auto-close (type `(` and `)`
 appears, retype the closer to step over it, backspace eats an empty pair;
 quotes stay single after word characters so `don't` types naturally), and the

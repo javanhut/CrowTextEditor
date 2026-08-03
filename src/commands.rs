@@ -372,18 +372,21 @@ fn expand_selection(editor: &mut Editor) {
             let c = doc.cursor.min(len);
             (a.min(c), a.max(c))
         };
-        doc.syntax.as_ref().map(|syn| {
-            let b0 = doc.text.char_to_byte(from);
-            let b1 = doc.text.char_to_byte(to);
-            let mut node = syn.tree.root_node().descendant_for_byte_range(b0, b1)?;
-            while node.start_byte() == b0 && node.end_byte() == b1 {
-                node = node.parent()?;
-            }
-            Some((
-                doc.text.byte_to_char(node.start_byte()),
-                doc.text.byte_to_char(node.end_byte()),
-            ))
-        })
+        doc.syntax
+            .as_ref()
+            .and_then(|s| s.tree.as_ref())
+            .map(|tree| {
+                let b0 = doc.text.char_to_byte(from);
+                let b1 = doc.text.char_to_byte(to);
+                let mut node = tree.root_node().descendant_for_byte_range(b0, b1)?;
+                while node.start_byte() == b0 && node.end_byte() == b1 {
+                    node = node.parent()?;
+                }
+                Some((
+                    doc.text.byte_to_char(node.start_byte()),
+                    doc.text.byte_to_char(node.end_byte()),
+                ))
+            })
     };
     match range {
         None => editor.set_status("no syntax tree for this buffer"),
@@ -1044,11 +1047,24 @@ fn run_formatter(editor: &mut Editor) -> Option<Result<&'static str, String>> {
     // (`rustfmt {file}`) instead of filtering stdin. That is still our write —
     // re-stamp below so the save guard does not read it as an external edit.
     let in_place = command.contains("{file}");
-    let command = command.replace("{file}", &path.to_string_lossy());
+    // `{tmp}`: a formatter that rewrites the file it is given rather than
+    // filtering stdin (`oxigen fmt`) gets a copy of the *buffer* — on :w the
+    // real file is still the unformatted version, and may not exist yet.
+    let tmp = command
+        .contains("{tmp}")
+        .then(|| std::env::temp_dir().join(format!("crow-fmt-{}.{ext}", std::process::id())));
+    let src = editor.doc().text.to_string();
+    if let Some(tmp) = &tmp {
+        if let Err(e) = std::fs::write(tmp, &src) {
+            return Some(Err(format!("{}: {e}", tmp.display())));
+        }
+    }
+    let command = command
+        .replace("{file}", &path.to_string_lossy())
+        .replace("{tmp}", &tmp.as_deref().unwrap_or(&path).to_string_lossy());
     let mut words = command.split_whitespace();
     let program = words.next().unwrap_or("");
 
-    let src = editor.doc().text.to_string();
     let spawned = Proc::new(program)
         .args(words)
         .stdin(Stdio::piped())
@@ -1057,19 +1073,36 @@ fn run_formatter(editor: &mut Editor) -> Option<Result<&'static str, String>> {
         .spawn();
     let mut child = match spawned {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if editor.offer_install(program) {
-                return None; // the status line is now the install prompt
+        Err(e) => {
+            if let Some(tmp) = &tmp {
+                let _ = std::fs::remove_file(tmp);
             }
-            return Some(Err(format!("{program}: not installed")));
+            if e.kind() == std::io::ErrorKind::NotFound {
+                if editor.offer_install(program) {
+                    return None; // the status line is now the install prompt
+                }
+                return Some(Err(format!("{program}: not installed")));
+            }
+            return Some(Err(format!("{program}: {e}")));
         }
-        Err(e) => return Some(Err(format!("{program}: {e}"))),
     };
     let _ = child.stdin.take().unwrap().write_all(src.as_bytes());
     let out = match child.wait_with_output() {
         Ok(o) => o,
-        Err(e) => return Some(Err(format!("{program}: {e}"))),
+        Err(e) => {
+            if let Some(tmp) = &tmp {
+                let _ = std::fs::remove_file(tmp);
+            }
+            return Some(Err(format!("{program}: {e}")));
+        }
     };
+    // Read the copy back before the status check: a formatter that exits
+    // non-zero still leaves its temp file behind.
+    let rewritten = tmp.map(|tmp| {
+        let text = std::fs::read_to_string(&tmp).unwrap_or_default();
+        let _ = std::fs::remove_file(&tmp);
+        text
+    });
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let first = err
@@ -1082,7 +1115,7 @@ fn run_formatter(editor: &mut Editor) -> Option<Result<&'static str, String>> {
     if in_place {
         editor.doc_mut().restamp();
     }
-    let new = String::from_utf8_lossy(&out.stdout).into_owned();
+    let new = rewritten.unwrap_or_else(|| String::from_utf8_lossy(&out.stdout).into_owned());
     if new.is_empty() || new == src {
         return Some(Ok("already formatted"));
     }
@@ -1512,6 +1545,40 @@ mod tests {
             "no formatter for this buffer (see [fmt] in crow.toml)"
         );
         assert_eq!(editor.doc().text.to_string(), "x");
+    }
+
+    /// A `{tmp}` formatter (`oxigen fmt`) rewrites the file it is handed and
+    /// prints something else on stdout. The new buffer has to be read back
+    /// from that file — taking stdout would replace the code with a message.
+    #[cfg(unix)]
+    #[test]
+    fn a_tmp_formatter_is_read_back_from_its_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The `[fmt]` overrides are global; this is the lock every test that
+        // swaps them shares.
+        let _guard = crate::theme::TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir();
+        let script = dir.join("crow-tmp-fmt-test.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ntr a-z A-Z < \"$1\" > \"$1.up\" && mv \"$1.up\" \"$1\"\necho 'Formatted 1 file'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::config::apply(&crate::config::Config {
+            fmt: vec![("crowtest".into(), format!("{} {{tmp}}", script.display()))],
+            ..crate::config::Config::default()
+        });
+
+        let mut editor = editor_with("hello");
+        editor.doc_mut().path = Some(dir.join("never-written.crowtest"));
+        (find("format_buffer").unwrap().func)(&mut editor);
+        assert_eq!(editor.status, "formatted");
+        assert_eq!(editor.doc().text.to_string(), "HELLO");
+        let copy = dir.join(format!("crow-fmt-{}.crowtest", std::process::id()));
+        assert!(!copy.exists(), "the temp copy outlived the format");
+        let _ = std::fs::remove_file(&script);
     }
 
     #[test]

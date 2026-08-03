@@ -3,6 +3,10 @@
 //! Each additional language is one grammar dependency, one `lang!` line, and
 //! one arm in `config_for`. Highlight groups are deliberately coarse: a
 //! handful of colors reads better in a terminal than a full theme.
+//!
+//! A language with no published grammar can still be colored: `highlight`
+//! falls back to a hand-rolled lexer that emits the same spans without a
+//! tree. Oxigen (`.oxi`) is the one that takes that path.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -22,8 +26,12 @@ pub struct Config {
 }
 
 pub struct Syntax {
-    pub config: &'static Config,
-    pub tree: Tree,
+    /// The grammar that produced this, kept so a reparse reuses it. `None`
+    /// when the fallback lexer did the coloring.
+    pub config: Option<&'static Config>,
+    /// `None` from the fallback lexer: it produces spans, not a tree, so
+    /// `A-o` (expand to the enclosing node) has nothing to walk.
+    pub tree: Option<Tree>,
     /// Highlight spans as (start, end, group) char ranges, sorted by start.
     pub spans: Vec<(usize, usize, u8)>,
 }
@@ -256,6 +264,27 @@ pub fn config_for(path: Option<&Path>) -> Option<&'static Config> {
     }
 }
 
+/// Color a buffer: tree-sitter when a grammar covers the file, else the
+/// fallback lexer. `cached` is the grammar the buffer already had, so an
+/// unsaved or renamed buffer keeps the language it was opened with.
+pub fn highlight(
+    path: Option<&Path>,
+    text: &Rope,
+    cached: Option<&'static Config>,
+) -> Option<Syntax> {
+    if let Some(config) = cached.or_else(|| config_for(path)) {
+        return parse(config, text);
+    }
+    match path?.extension()?.to_str()? {
+        "oxi" => Some(Syntax {
+            config: None,
+            tree: None,
+            spans: oxigen_spans(&text.chars().collect::<Vec<char>>()),
+        }),
+        _ => None,
+    }
+}
+
 /// Parse the whole buffer and collect highlight spans.
 ///
 /// ponytail: full reparse and a flattened copy per edit; tree-sitter's
@@ -299,8 +328,8 @@ pub fn parse(config: &'static Config, text: &Rope) -> Option<Syntax> {
 
     spans.sort_unstable();
     Some(Syntax {
-        config,
-        tree,
+        config: Some(config),
+        tree: Some(tree),
         spans,
     })
 }
@@ -348,6 +377,192 @@ pub fn group_at(spans: &[(usize, usize, u8)], pos: usize) -> u8 {
         .find(|s| s.1 > pos)
         .map(|s| s.2)
         .unwrap_or(0)
+}
+
+// ---- Oxigen ---------------------------------------------------------------
+//
+// No tree-sitter grammar exists for Oxigen, so it gets a lexer instead: one
+// pass over the chars emitting the same (start, end, group) spans the query
+// path emits. Everything the language's own Neovim syntax file colors, minus
+// what needs a parser.
+
+/// Reserved words (`token_map` in the Oxigen lexer) plus the parser's
+/// contextual ones: `includes`, `main`, `hidden`.
+const OXIGEN_KEYWORDS: &[&str] = &[
+    "and",
+    "as",
+    "choose",
+    "converge",
+    "diverge",
+    "each",
+    "enum",
+    "fail",
+    "from",
+    "fun",
+    "give",
+    "guard",
+    "hidden",
+    "hide",
+    "in",
+    "includes",
+    "intro",
+    "introduce",
+    "main",
+    "not",
+    "option",
+    "or",
+    "pattern",
+    "repeat",
+    "self",
+    "skip",
+    "stop",
+    "struct",
+    "then",
+    "unless",
+    "when",
+    "within",
+];
+
+/// Built-in functions, colored like the functions they are even where they
+/// are passed around rather than called.
+const OXIGEN_BUILTINS: &[&str] = &[
+    "byte", "cancel", "chars", "chr", "error", "first", "float", "has", "insert", "int",
+    "is_error", "is_value", "keys", "last", "len", "ord", "print", "println", "push", "range",
+    "remove", "rest", "set", "str", "tuple", "type", "uint", "values",
+];
+
+const OXIGEN_CONSTANTS: &[&str] = &["True", "False", "None"];
+
+/// Highlight spans for an Oxigen buffer, in char offsets.
+fn oxigen_spans(c: &[char]) -> Vec<(usize, usize, u8)> {
+    let mut spans = Vec::new();
+    let mut prev_word = String::new();
+    let mut i = 0;
+    while i < c.len() {
+        let start = i;
+        match c[i] {
+            '/' if c.get(i + 1) == Some(&'/') => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+                spans.push((start, i, 1));
+            }
+            '/' if c.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(c.len());
+                spans.push((start, i, 1));
+            }
+            '"' | '\'' => {
+                i = oxigen_string_end(c, i);
+                spans.push((start, i, 2));
+            }
+            // `#[indent]` and friends: a directive, not a comment.
+            '#' if c.get(i + 1) == Some(&'[') => {
+                while i < c.len() && c[i] != ']' && c[i] != '\n' {
+                    i += 1;
+                }
+                i = (i + 1).min(c.len());
+                spans.push((start, i, 7));
+            }
+            '<' => match oxigen_type_end(c, i) {
+                Some(end) => {
+                    spans.push((start, end, 5));
+                    i = end;
+                }
+                None => i += 1,
+            },
+            ch if ch.is_ascii_digit() => {
+                while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '.' || c[i] == '_') {
+                    i += 1;
+                }
+                spans.push((start, i, 6));
+            }
+            ch if ch.is_alphabetic() || ch == '_' => {
+                while i < c.len() && (c[i].is_alphanumeric() || c[i] == '_') {
+                    i += 1;
+                }
+                let word: String = c[start..i].iter().collect();
+                let group = if OXIGEN_KEYWORDS.contains(&word.as_str()) {
+                    3
+                } else if OXIGEN_CONSTANTS.contains(&word.as_str()) {
+                    6
+                } else if OXIGEN_BUILTINS.contains(&word.as_str()) || c.get(i) == Some(&'(') {
+                    4
+                } else if prev_word == "struct"
+                    || prev_word == "enum"
+                    || word.starts_with(char::is_uppercase)
+                {
+                    5
+                } else {
+                    0
+                };
+                if group != 0 {
+                    spans.push((start, i, group));
+                }
+                prev_word = word;
+            }
+            _ => i += 1,
+        }
+    }
+    spans
+}
+
+/// Past the end of the string literal starting at `i`. An unterminated one
+/// ends at the newline, or at the end of the file if it is triple-quoted.
+fn oxigen_string_end(c: &[char], i: usize) -> usize {
+    let quote = c[i];
+    let triple = c.get(i + 1) == Some(&quote) && c.get(i + 2) == Some(&quote);
+    let fence = if triple { 3 } else { 1 };
+    let mut j = i + fence;
+    while j < c.len() {
+        if c[j] == '\\' {
+            j += 2;
+            continue;
+        }
+        if !triple && c[j] == '\n' {
+            return j;
+        }
+        if c[j] == quote
+            && (!triple || (c.get(j + 1) == Some(&quote) && c.get(j + 2) == Some(&quote)))
+        {
+            return (j + fence).min(c.len());
+        }
+        j += 1;
+    }
+    c.len()
+}
+
+/// The end of the type annotation opening at `i` — `<int>`, `<Array>`,
+/// `<Error<div_by_zero>>`, `<type<Error || Value>>`, `<test>` — or `None`
+/// when this `<` is a comparison.
+///
+/// ponytail: no parser, so `a<b || c>d` colors as a type; the space-free
+/// form nobody writes is the price of not building one.
+fn oxigen_type_end(c: &[char], i: usize) -> Option<usize> {
+    if !c
+        .get(i + 1)
+        .is_some_and(|ch| ch.is_alphabetic() || *ch == '_')
+    {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (j, ch) in c.iter().enumerate().take(c.len().min(i + 64)).skip(i) {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth = depth.checked_sub(1)?; // never negative from a `<` start
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+            ch if ch.is_alphanumeric() || " _|,".contains(*ch) => {}
+            _ => return None,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -413,6 +628,53 @@ mod tests {
         // Emphasis carries no color of its own, only the attribute.
         assert_eq!(color(BOLD), None);
         assert_eq!(attrs(BOLD) & BOLD, BOLD);
+    }
+
+    /// Oxigen has no grammar, so `highlight` must reach the fallback lexer
+    /// and color the same shapes tree-sitter would.
+    #[test]
+    fn oxigen_is_highlighted_without_a_grammar() {
+        let src = "// note\n#[indent]\nstruct Point {\n    x <int>\n}\n\nfun main() {\n    p <Point>\n    println(\"hi\", True, 42)\n}\n";
+        let text = Rope::from_str(src);
+        let syntax = highlight(Some(Path::new("x.oxi")), &text, None).unwrap();
+        assert!(syntax.tree.is_none(), "the fallback produces no tree");
+        let at = |needle: &str| group_at(&syntax.spans, src.find(needle).unwrap());
+        assert_eq!(at("// note"), 1);
+        assert_eq!(at("#[indent]"), 7);
+        assert_eq!(at("struct"), 3);
+        assert_eq!(at("Point"), 5);
+        assert_eq!(at("<int>"), 5);
+        assert_eq!(at("fun"), 3);
+        assert_eq!(at("main"), 3);
+        assert_eq!(at("println"), 4);
+        assert_eq!(at("\"hi\""), 2);
+        assert_eq!(at("True"), 6);
+        assert_eq!(at("42"), 6);
+        assert_eq!(at("    p <Point>"), 0); // a plain binding stays uncolored
+    }
+
+    /// The `<` heuristic must not turn every comparison into a type.
+    #[test]
+    fn oxigen_comparisons_are_not_types() {
+        let src = "repeat when n < limit {\n    d <= n\n    a<b\n}\n";
+        let text = Rope::from_str(src);
+        let syntax = highlight(Some(Path::new("x.oxi")), &text, None).unwrap();
+        for (i, _) in src.match_indices('<') {
+            assert_eq!(
+                group_at(&syntax.spans, i),
+                0,
+                "`<` at {i} colored as a type"
+            );
+        }
+    }
+
+    #[test]
+    fn oxigen_strings_swallow_their_contents() {
+        let src = "s <string> := \"fun struct // 42\"\nt := \"\"\"line\nfun\"\"\"\n";
+        let text = Rope::from_str(src);
+        let syntax = highlight(Some(Path::new("x.oxi")), &text, None).unwrap();
+        assert_eq!(group_at(&syntax.spans, src.find("fun struct").unwrap()), 2);
+        assert_eq!(group_at(&syntax.spans, src.rfind("fun").unwrap()), 2);
     }
 
     #[test]
