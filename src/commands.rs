@@ -83,11 +83,12 @@ commands! {
 
     delete_selection => "delete the selection, or the character under the cursor",
     change_selection => "delete the selection and insert",
-    yank => "copy the selection to the register",
+    copy => "copy the selection to the register",
+    copy_line => "copy the current line to the register (cc)",
     paste_after => "paste the register after the cursor",
     paste_before => "paste the register before the cursor",
     delete_char => "delete the character under the cursor",
-    delete_line => "delete the current line into the register (dd)",
+    delete_line => "delete the current line into the register (dd, xx)",
     delete_to_line_end => "delete to the end of the line",
     join_lines => "join this line with the next",
     undo => "undo the last change",
@@ -107,6 +108,25 @@ commands! {
     next_window => "focus the next window",
     save => "write the buffer to disk",
     quit => "close the window, or the editor with the last one",
+}
+
+/// Keys that act on the whole line when pressed twice with nothing selected.
+/// `handle_key` arms them by character rather than through the keymap, so this
+/// is also where `:help` gets their keys column.
+pub static LINE_OPS: &[(char, &str)] = &[
+    ('d', "delete_line"),
+    ('x', "delete_line"),
+    ('c', "copy_line"),
+];
+
+/// The doubled keys bound to `name`, e.g. `"dd  xx"` — empty if it has none.
+fn line_op_keys(name: &str) -> String {
+    LINE_OPS
+        .iter()
+        .filter(|(_, cmd)| *cmd == name)
+        .map(|(c, _)| format!("{c}{c}"))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// One row of the `:help` window.
@@ -154,7 +174,9 @@ pub fn help_lines(keymap: &crate::keymap::KeyTrie) -> Vec<HelpLine> {
     ));
     for c in COMMANDS {
         out.push(HelpLine::Entry {
-            keys: keymap.binding_of(c.name).unwrap_or_default(),
+            keys: keymap
+                .binding_of(c.name)
+                .unwrap_or_else(|| line_op_keys(c.name)),
             name: c.name.to_string(),
             doc: c.doc.to_string(),
         });
@@ -185,7 +207,7 @@ pub static PER_CURSOR: &[&str] = &[
     "expand_selection",
     "delete_selection",
     "change_selection",
-    "yank",
+    "copy",
     "paste_after",
     "paste_before",
     "delete_backward",
@@ -636,6 +658,51 @@ fn push_register(editor: &mut Editor, s: &str) {
         buf.push('\n');
     }
     buf.push_str(s);
+
+    // Named registers stay inside crow; the unnamed one is what `c`, `x` and
+    // `d` fill, so that is the one worth putting where other apps can see it.
+    if editor.active_register.is_none() {
+        let text = editor.register.clone();
+        to_system_clipboard(&text);
+    }
+}
+
+/// Mirror the register onto the system clipboard.
+///
+/// Best effort by design: a machine with none of these tools still has a
+/// working editor, and a failed copy is not worth interrupting an edit over.
+///
+/// ponytail: the platform tool only. Over ssh the clipboard lives on the far
+/// side of the terminal and this reaches the wrong machine — add an OSC 52
+/// fallback (needs base64) if crow starts getting used that way.
+fn to_system_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    const TOOLS: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+
+    for (program, args) in TOOLS {
+        let Ok(mut child) = Command::new(program)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue; // not installed; try the next one
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        // The pipe is closed by the drop above, so this returns immediately.
+        let _ = child.wait();
+        return;
+    }
 }
 
 /// The char range the next action applies to: the selection, or the character
@@ -653,12 +720,8 @@ fn selection_range(doc: &Document) -> (usize, usize) {
 
 fn delete_selection(editor: &mut Editor) {
     let count = editor.take_count();
-    // Bare `d` with a single cursor and nothing selected: wait for a second
-    // `d` — vim's dd. With extra cursors it keeps deleting a char per cursor.
-    if editor.doc().anchor == editor.doc().cursor && editor.doc().extra.is_empty() {
-        editor.pending_dd = Some(count);
-        return;
-    }
+    // A bare `d`/`x` with a single cursor never gets here: `handle_key` arms
+    // the doubled line op first. With extra cursors it deletes a char each.
     let (from, to) = {
         let doc = editor.doc();
         if doc.anchor == doc.cursor {
@@ -696,7 +759,7 @@ fn change_selection(editor: &mut Editor) {
     editor.set_mode(Mode::Insert);
 }
 
-fn yank(editor: &mut Editor) {
+fn copy(editor: &mut Editor) {
     editor.extend = false;
     let (from, to) = selection_range(editor.doc());
     if from >= to {
@@ -704,11 +767,21 @@ fn yank(editor: &mut Editor) {
     }
     let text = editor.doc().text.slice(from..to).to_string();
     push_register(editor, &text);
-    // Cursor to the selection start, so `xyp` duplicates the current line.
+    // Cursor to the selection start, so `Vcp` duplicates the current line.
     let doc = editor.doc_mut();
     doc.cursor = from;
     doc.goal_col = None;
-    editor.set_status(format!("yanked {} chars", to - from));
+    editor.set_status(format!("copied {} chars", to - from));
+}
+
+/// `cc` — the whole line into the register, cursor left where it was.
+fn copy_line(editor: &mut Editor) {
+    let at = editor.doc().cursor;
+    select_line(editor);
+    copy(editor);
+    let doc = editor.doc_mut();
+    doc.cursor = at.min(doc.text.len_chars());
+    doc.anchor = doc.cursor;
 }
 
 // ponytail: one unnamed register; named registers when someone misses them.
@@ -1384,25 +1457,30 @@ mod tests {
     }
 
     #[test]
-    fn yank_gathers_every_cursor_and_rewinds_to_the_selection_start() {
+    fn copy_gathers_every_cursor_and_rewinds_to_the_selection_start() {
         // The extra cursors run before the primary, and the register gets no
         // blank line between two line selections — that is what makes a
-        // multi-cursor yank paste back as clean lines.
+        // multi-cursor copy paste back as clean lines.
         let mut editor = editor_with("one\ntwo\nthree");
-        press(&mut editor, "C x y");
+        press(&mut editor, "C V c");
         assert_eq!(editor.register, "two\none\n");
-        assert_eq!(editor.doc().cursor, 0); // rewound, so `xyp` duplicates
+        assert_eq!(editor.doc().cursor, 0); // rewound, so `Vcp` duplicates
         assert!(!editor.extend);
     }
 
     #[test]
-    fn a_second_yank_replaces_the_register() {
-        let mut editor = editor_with("abc");
-        press(&mut editor, "y");
-        assert_eq!(editor.register, "a");
-        press(&mut editor, "l y");
-        assert_eq!(editor.register, "b");
-        assert_eq!(editor.status, "yanked 1 chars");
+    fn a_second_copy_replaces_the_register() {
+        // cc takes the line with its newline; on the last line there is none.
+        let mut editor = editor_with("abc\ndef");
+        press(&mut editor, "cc");
+        assert_eq!(editor.register, "abc\n");
+        assert_eq!(editor.doc().cursor, 0); // cc leaves the cursor alone
+        press(&mut editor, "j cc");
+        assert_eq!(editor.register, "def");
+        assert_eq!(editor.status, "copied 3 chars");
+        // And a selection copy replaces it in turn.
+        press(&mut editor, "vlc");
+        assert_eq!(editor.register, "d");
     }
 
     #[test]
@@ -1419,6 +1497,60 @@ mod tests {
         let mut editor = editor_with("a\nb\nc\n");
         press(&mut editor, "j 5dd");
         assert_eq!(editor.doc().text.to_string(), "a");
+    }
+
+    #[test]
+    fn help_shows_the_doubled_line_keys() {
+        // They are armed by character, not bound in the trie, so the keys
+        // column has to come from LINE_OPS or it renders blank.
+        let editor = editor_with("");
+        let lines = help_lines(&editor.keymaps.normal);
+        let keys = |want: &str| {
+            lines
+                .iter()
+                .find_map(|l| match l {
+                    HelpLine::Entry { keys, name, .. } if name == want => Some(keys.clone()),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(keys("delete_line"), "dd  xx");
+        assert_eq!(keys("copy_line"), "cc");
+        assert_eq!(keys("select_line"), "V");
+        assert_eq!(keys("copy"), "c");
+    }
+
+    /// Ignored by default: it writes the real clipboard, and clobbering what
+    /// the user had copied to run the test suite is rude. `cargo test --
+    /// --ignored system_clipboard` when touching `to_system_clipboard`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn system_clipboard_gets_what_was_copied() {
+        let mut editor = editor_with("hello\nworld");
+        press(&mut editor, "cc");
+        let out = std::process::Command::new("pbpaste").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n");
+        // A named register stays inside crow.
+        press(&mut editor, "j \"ax");
+        let out = std::process::Command::new("pbpaste").output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n");
+    }
+
+    #[test]
+    fn xx_cuts_a_line_and_x_cuts_the_selection() {
+        let mut editor = editor_with("one\ntwo\nthree");
+        press(&mut editor, "xx");
+        assert_eq!(editor.doc().text.to_string(), "two\nthree");
+        assert_eq!(editor.register, "one\n");
+        // A pending x that is not doubled cancels; the next key runs normally.
+        press(&mut editor, "xj");
+        assert_eq!(editor.doc().text.to_string(), "two\nthree");
+        assert_eq!(editor.doc().cursor_line(), 1);
+        // With a selection, a single x cuts it.
+        press(&mut editor, "Vx");
+        assert_eq!(editor.doc().text.to_string(), "two\n");
+        assert_eq!(editor.register, "three");
     }
 
     #[test]
@@ -1587,7 +1719,7 @@ mod tests {
         press(&mut editor, "C d");
         assert_eq!(editor.doc().text.to_string(), "bc\nef");
         assert_eq!(editor.register, "d\na");
-        assert!(editor.pending_dd.is_none());
+        assert!(editor.pending_line_op.is_none());
         // The count stops at the end of each cursor's own line.
         let mut editor = editor_with("ab\ncd");
         press(&mut editor, "C 5d");

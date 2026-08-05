@@ -255,7 +255,7 @@ impl Default for Keymaps {
         normal.bind_str("O", "open_above");
 
         // selection and edits
-        normal.bind_str("x", "select_line");
+        normal.bind_str("V", "select_line");
         normal.bind_str("v", "extend_mode");
         normal.bind_str("A-o", "expand_selection");
         normal.bind_str(";", "collapse_selection");
@@ -266,9 +266,11 @@ impl Default for Keymaps {
         normal.bind_str("s", "select_matches");
         normal.bind_str("n", "search_next");
         normal.bind_str("N", "search_prev");
+        // d/x cut, c copies; doubled (dd, xx, cc) they act on the whole line.
         normal.bind_str("d", "delete_selection");
-        normal.bind_str("c", "change_selection");
-        normal.bind_str("y", "yank");
+        normal.bind_str("x", "delete_selection");
+        normal.bind_str("c", "copy");
+        normal.bind_str("S", "change_selection");
         normal.bind_str("p", "paste_after");
         normal.bind_str("P", "paste_before");
         normal.bind_str("D", "delete_to_line_end");
@@ -438,8 +440,9 @@ pub struct Editor {
     /// `completion` for a trigger character the user typed, `completion_typed`
     /// for the ambient one that follows an identifier being typed.
     lsp_completion_pending: Option<&'static str>,
-    /// A bare `d` was pressed (with its count): a second `d` deletes lines.
-    pub pending_dd: Option<usize>,
+    /// A bare `d`, `x` or `c` was pressed (with its count): pressing the same
+    /// key again runs that key's line op.
+    pub pending_line_op: Option<(char, usize)>,
     /// The hover docs popup: its lines and scroll offset (K to open).
     pub hover: Option<(Vec<String>, usize)>,
     /// A "not installed — run `…`? (y/N)" offer; the next keypress answers it.
@@ -525,7 +528,7 @@ impl Editor {
             keymaps,
             lsp_table: config.lsp.clone(),
             lsp_completion_pending: None,
-            pending_dd: None,
+            pending_line_op: None,
             hover: None,
             pending_install: None,
             install: None,
@@ -767,6 +770,15 @@ impl Editor {
 
     // ---- key handling ------------------------------------------------------
 
+    /// The command a doubled key runs on the current line: `dd`/`xx` cut it,
+    /// `cc` copies it.
+    fn line_op(c: char) -> Option<&'static str> {
+        commands::LINE_OPS
+            .iter()
+            .find(|(key, _)| *key == c)
+            .map(|(_, cmd)| *cmd)
+    }
+
     pub fn handle_key(&mut self, key: Key) {
         // An armed install offer eats exactly one key: y runs it, anything
         // else declines and the key is not replayed.
@@ -803,18 +815,22 @@ impl Editor {
             }
         }
 
-        // A bare `d` is waiting: a second `d` deletes the line (vim's dd);
-        // any other key cancels and is handled normally.
-        if let Some(count) = self.pending_dd.take() {
-            if self.mode == Mode::Normal && !key.ctrl && !key.alt && key.code == KeyCode::Char('d')
+        // A bare `d`, `x` or `c` is waiting: pressing it again acts on the
+        // whole line; any other key cancels and is handled normally.
+        if let Some((armed, count)) = self.pending_line_op.take() {
+            if self.mode == Mode::Normal
+                && !key.ctrl
+                && !key.alt
+                && key.code == KeyCode::Char(armed)
             {
                 self.count = Some(count);
                 self.register_fresh = true;
-                (commands::find("delete_line").unwrap().func)(self);
+                (commands::find(Self::line_op(armed).unwrap()).unwrap().func)(self);
                 let doc = self.doc_mut();
                 doc.anchor = doc.cursor;
                 doc.commit_undo_group();
                 self.count = None;
+                self.active_register = None; // the `"a` prefix was for this op
                 return;
             }
         }
@@ -870,6 +886,27 @@ impl Editor {
                 if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) {
                     let digit = c.to_digit(10).unwrap() as usize;
                     self.count = Some(self.count.unwrap_or(0).saturating_mul(10) + digit);
+                    return;
+                }
+            }
+        }
+
+        // A bare d/x/c with nothing selected arms the doubled line op instead
+        // of eating a character, so dd/xx/cc are two keystrokes with no
+        // selection step. With extra cursors it falls through and each cursor
+        // acts on its own char.
+        // ponytail: keyed by character, so rebinding d/x/c in config leaves
+        // the doubles where they are. Move them here too if that ever bites.
+        if self.mode == Mode::Normal
+            && self.pending.is_empty()
+            && !key.ctrl
+            && !key.alt
+            && self.doc().anchor == self.doc().cursor
+            && self.doc().extra.is_empty()
+        {
+            if let KeyCode::Char(c) = key.code {
+                if Self::line_op(c).is_some() {
+                    self.pending_line_op = Some((c, self.take_count()));
                     return;
                 }
             }
@@ -2801,14 +2838,14 @@ pub(crate) mod tests {
     #[test]
     fn select_line_then_d_deletes_the_line() {
         let mut editor = editor_with("one\ntwo\nthree");
-        press(&mut editor, "xd");
+        press(&mut editor, "Vd");
         assert_eq!(editor.doc().text.to_string(), "two\nthree");
     }
 
     #[test]
-    fn repeated_x_extends_the_selection() {
+    fn repeated_line_select_extends_the_selection() {
         let mut editor = editor_with("one\ntwo\nthree");
-        press(&mut editor, "xxd");
+        press(&mut editor, "VVd");
         assert_eq!(editor.doc().text.to_string(), "three");
     }
 
@@ -2831,22 +2868,22 @@ pub(crate) mod tests {
     #[test]
     fn change_replaces_the_selection() {
         let mut editor = editor_with("foo bar");
-        press(&mut editor, "wc");
+        press(&mut editor, "wS");
         press(&mut editor, "x");
         assert_eq!(editor.doc().text.to_string(), "xbar");
     }
 
     #[test]
-    fn linewise_yank_then_paste_duplicates_the_line() {
+    fn linewise_copy_then_paste_duplicates_the_line() {
         let mut editor = editor_with("one\ntwo");
-        press(&mut editor, "xyp");
+        press(&mut editor, "Vcp");
         assert_eq!(editor.doc().text.to_string(), "one\none\ntwo");
     }
 
     #[test]
     fn delete_then_paste_moves_a_line() {
         let mut editor = editor_with("one\ntwo\nthree");
-        press(&mut editor, "xdjp");
+        press(&mut editor, "Vdjp");
         assert_eq!(editor.doc().text.to_string(), "two\nthree\none");
     }
 
@@ -2943,7 +2980,7 @@ pub(crate) mod tests {
         press(&mut editor, "<enter>");
         assert_eq!(editor.doc().extra.len(), 2);
         // Interactive replace-all: change every match.
-        press(&mut editor, "cX");
+        press(&mut editor, "SX");
         press(&mut editor, "<esc>");
         assert_eq!(editor.doc().text.to_string(), "X bar X baz X");
     }
@@ -2951,7 +2988,7 @@ pub(crate) mod tests {
     #[test]
     fn select_matches_is_scoped_by_the_selection() {
         let mut editor = editor_with("foo\nfoo\nfoo");
-        press(&mut editor, "xx"); // select first two lines
+        press(&mut editor, "VV"); // select first two lines
         press(&mut editor, "sfoo");
         press(&mut editor, "<enter>");
         press(&mut editor, "d");
@@ -3018,7 +3055,7 @@ pub(crate) mod tests {
     fn named_registers_are_independent() {
         let mut editor = editor_with("foo bar");
         press(&mut editor, "w"); // select "foo "
-        press(&mut editor, "\"ay"); // into register a; cursor back to 0
+        press(&mut editor, "\"ac"); // into register a; cursor back to 0
         press(&mut editor, "vld"); // select "f", delete: unnamed register = "f"
         assert_eq!(editor.doc().text.to_string(), "oo bar");
         assert_eq!(editor.register, "f");
