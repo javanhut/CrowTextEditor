@@ -1,4 +1,4 @@
-# Crow
+# Crow - My Ideal Text Editor
 
 A selection-first modal terminal text editor. One cursor is a crow; many are a
 murder. It's a very opinionated text editor similar to a custom neovim config without
@@ -111,7 +111,7 @@ an emoji ZWJ sequence or a combining stack.
 | `u` `C-r`                          | undo / redo                                                                                                                                                                                                                                 |
 | `gn` `gp`                          | next / previous buffer                                                                                                                                                                                                                      |
 | `gd` `K`                           | goto definition / hover (LSP)                                                                                                                                                                                                               |
-| _(typing)_                         | intellisense pops itself from buffer words, then from the language server when one is up — Tab accepts, Enter stays Enter                                                                                                                    |
+| _(typing)_                         | intellisense pops itself from buffer words, then from the language server when one is up — Tab accepts, Enter stays Enter                                                                                                                   |
 | `C-space` (insert)                 | LSP completion menu — Tab/Enter accepts, type to narrow                                                                                                                                                                                     |
 | `space e`                          | file tree sidebar — same key focuses and closes; `j`/`k` move, Enter/`l` expand or open, `h` collapse, `a` add (trailing `/` = dir), `r` rename, `d` delete (y/n), `x`/`c`/`p` cut/copy/paste, `R` refresh, `Esc` back to editor, `q` close |
 | `space c`                          | command palette: fuzzy-run any command                                                                                                                                                                                                      |
