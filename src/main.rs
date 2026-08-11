@@ -6,6 +6,7 @@ mod editor;
 mod filetree;
 mod keymap;
 mod lsp;
+mod markdown;
 mod picker;
 mod position;
 mod search;
@@ -46,12 +47,16 @@ KEYS (normal mode):
     gg G  42gg   file ends, jump to line       :w :q :wq  write, quit
     C-d C-u      half page       gn gp         next/prev buffer
     gd K         goto definition, hover        C-space  LSP complete (insert)
+    gc  ms(      comment lines, surround selection
+    space m  :md   live GitHub-style markdown preview beside the buffer
     space e      file tree sidebar             (typing pops word completion)
     space c/f/d/t  command palette, find file, browse dir, themes
 
     Motions select the text they cross; d/c/y act on the selection.
     Every motion, edit, and inserted keystroke applies at every cursor.
     A count may prefix most commands: 3x, 10d, 5C.
+
+    Long lines soft-wrap by default; :wrap turns that off.
 
 CONFIG:
     ~/.config/crow/crow.toml — theme, options, keybindings, language
@@ -83,7 +88,9 @@ fn main() -> std::io::Result<()> {
 }
 
 fn run(editor: &mut Editor) -> std::io::Result<()> {
-    let mut out = stdout();
+    // A frame is thousands of tiny writes. Unbuffered, each one is a syscall
+    // through the stdout lock; buffered, the frame leaves as one write.
+    let mut out = std::io::BufWriter::with_capacity(1 << 16, stdout());
     // Repaint only when state actually changed; redrawing the whole screen
     // on every idle poll tick is what made the cursor and text flicker.
     let mut dirty = true;
@@ -91,6 +98,8 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
     loop {
         if dirty {
             editor.ensure_cursor_visible();
+            editor.refresh_highlights();
+            editor.refresh_preview();
             ui::render(editor, &mut out)?;
             dirty = false;
         }
@@ -98,22 +107,32 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
         // Poll instead of block, so language-server messages arriving while
         // idle still get drained and drawn.
         if event::poll(std::time::Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(ev) => {
-                    if let Some(key) = Key::from_crossterm(ev) {
-                        editor.handle_key(key);
+            // Drain the whole burst before drawing again. Holding `j`, a
+            // paste, or simply typing faster than a frame otherwise costs one
+            // full repaint per keystroke, and the screen falls behind the
+            // keyboard — which is what "laggy" actually is.
+            loop {
+                match event::read()? {
+                    Event::Key(ev) => {
+                        if let Some(key) = Key::from_crossterm(ev) {
+                            editor.handle_key(key);
+                            dirty = true;
+                        }
+                    }
+                    Event::Paste(text) => {
+                        editor.handle_paste(&text);
                         dirty = true;
                     }
+                    Event::Resize(cols, rows) => {
+                        editor.size = (cols, rows);
+                        dirty = true;
+                    }
+                    _ => {}
                 }
-                Event::Paste(text) => {
-                    editor.handle_paste(&text);
-                    dirty = true;
+                // Quitting mid-burst must not swallow the rest as editor keys.
+                if editor.should_quit || !event::poll(std::time::Duration::ZERO)? {
+                    break;
                 }
-                Event::Resize(cols, rows) => {
-                    editor.size = (cols, rows);
-                    dirty = true;
-                }
-                _ => {}
             }
         }
         if editor.lsp_tick() {

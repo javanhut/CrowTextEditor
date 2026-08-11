@@ -12,9 +12,11 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crossterm::style::Color;
-use ropey::Rope;
+use ropey::{Rope, RopeSlice};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Parser, Query, QueryCursor, Tree};
+use tree_sitter::{
+    InputEdit, Language, Node, Parser, Point, Query, QueryCursor, TextProvider, Tree,
+};
 
 pub struct Config {
     language: Language,
@@ -33,7 +35,59 @@ pub struct Syntax {
     /// `A-o` (expand to the enclosing node) has nothing to walk.
     pub tree: Option<Tree>,
     /// Highlight spans as (start, end, group) char ranges, sorted by start.
+    /// Only covers `span_range` — running the highlight query over a whole
+    /// large file per keystroke is what made typing lag.
     pub spans: Vec<(usize, usize, u8)>,
+    /// The char range `spans` was collected for.
+    pub span_range: (usize, usize),
+    /// The text changed since the spans were collected.
+    pub dirty: bool,
+}
+
+impl Syntax {
+    /// Ensure `spans` covers the char range `from..to`, re-running the
+    /// highlight query only when the text moved or the viewport left the
+    /// range already collected. The collected range is padded either side so
+    /// scrolling a line at a time does not re-query every frame.
+    pub fn update(&mut self, text: &Rope, from: usize, to: usize) {
+        if !self.dirty && self.span_range.0 <= from && to <= self.span_range.1 {
+            return;
+        }
+        let pad = (to - from).max(64);
+        let len = text.len_chars();
+
+        self.spans.clear();
+        self.span_range = match (self.config, &self.tree) {
+            (Some(config), Some(tree)) => {
+                let range = (from.saturating_sub(pad), (to + pad).min(len));
+                let bytes = text.char_to_byte(range.0)..text.char_to_byte(range.1);
+                push_captures(
+                    config,
+                    tree.root_node(),
+                    RopeProvider(text.slice(..)),
+                    Some(bytes.clone()),
+                    0,
+                    text,
+                    &mut self.spans,
+                );
+                // Markdown: the block grammar leaves `inline` nodes unparsed;
+                // run the inline grammar over the visible ones for emphasis,
+                // code spans, and links.
+                if let Some(inline) = config.inline {
+                    collect_inline(inline, tree.root_node(), bytes, text, &mut self.spans);
+                }
+                self.spans.sort_unstable();
+                range
+            }
+            // The fallback lexer has no tree to query; it re-lexes the file,
+            // which is one linear pass and happens at most once per frame.
+            _ => {
+                self.spans = oxigen_spans(&text.chars().collect::<Vec<char>>());
+                (0, len)
+            }
+        };
+        self.dirty = false;
+    }
 }
 
 /// A span's group byte is a color group id (low bits) plus attribute flags,
@@ -237,7 +291,30 @@ lang!(
 );
 
 pub fn config_for(path: Option<&Path>) -> Option<&'static Config> {
-    match path?.extension()?.to_str()? {
+    by_ext(path?.extension()?.to_str()?)
+}
+
+/// The grammar for a markdown fence's info string (```` ```rust ````), by the
+/// names people actually write.
+pub fn config_for_lang(name: &str) -> Option<&'static Config> {
+    by_ext(match name.to_ascii_lowercase().as_str() {
+        "rust" => "rs",
+        "python" => "py",
+        "shell" | "console" | "bash" | "sh" | "zsh" => "sh",
+        "javascript" | "node" => "js",
+        "typescript" => "ts",
+        "c++" | "cpp" => "cpp",
+        "golang" => "go",
+        "ruby" => "rb",
+        "csharp" | "c#" => "cs",
+        "yaml" => "yml",
+        "markdown" => "md",
+        other => return by_ext(other),
+    })
+}
+
+fn by_ext(ext: &str) -> Option<&'static Config> {
+    match ext {
         "rs" => rust(),
         "toml" => toml(),
         "json" => json(),
@@ -276,76 +353,113 @@ pub fn highlight(
         return parse(config, text);
     }
     match path?.extension()?.to_str()? {
-        "oxi" => Some(Syntax {
-            config: None,
-            tree: None,
-            spans: oxigen_spans(&text.chars().collect::<Vec<char>>()),
-        }),
+        "oxi" => {
+            let mut syntax = Syntax {
+                config: None,
+                tree: None,
+                spans: Vec::new(),
+                span_range: (0, 0),
+                dirty: true,
+            };
+            syntax.update(text, 0, text.len_chars());
+            Some(syntax)
+        }
         _ => None,
     }
 }
 
-/// Parse the whole buffer and collect highlight spans.
-///
-/// ponytail: full reparse and a flattened copy per edit; tree-sitter's
-/// incremental `InputEdit` path is the upgrade when large files itch.
+/// Parse the whole buffer and collect highlight spans for all of it. Opening
+/// a file and the tests take this path; editing takes `parse_tree` +
+/// `Syntax::update`, which reuse the tree and only re-query what is on screen.
 pub fn parse(config: &'static Config, text: &Rope) -> Option<Syntax> {
-    let src = text.to_string();
-    let mut parser = Parser::new();
-    parser.set_language(&config.language).ok()?;
-    let tree = parser.parse(&src, None)?;
-
-    let mut spans = Vec::new();
-    collect_spans(config, tree.root_node(), &src, 0, text, &mut spans);
-
-    // Markdown: the block grammar leaves `inline` nodes unparsed; run the
-    // inline grammar over each for emphasis, code spans, and links.
-    if let Some(inline) = config.inline {
-        let mut ip = Parser::new();
-        if ip.set_language(&inline.language).is_ok() {
-            let mut stack = vec![tree.root_node()];
-            while let Some(node) = stack.pop() {
-                if node.kind() == "inline" {
-                    let range = node.byte_range();
-                    if let Some(itree) = ip.parse(&src[range.clone()], None) {
-                        collect_spans(
-                            inline,
-                            itree.root_node(),
-                            &src[range.clone()],
-                            range.start,
-                            text,
-                            &mut spans,
-                        );
-                    }
-                } else {
-                    for i in 0..node.child_count() {
-                        stack.push(node.child(i).unwrap());
-                    }
-                }
-            }
-        }
-    }
-
-    spans.sort_unstable();
-    Some(Syntax {
+    let mut syntax = Syntax {
         config: Some(config),
-        tree: Some(tree),
-        spans,
-    })
+        tree: Some(parse_tree(config, text, None)?),
+        spans: Vec::new(),
+        span_range: (0, 0),
+        dirty: true,
+    };
+    syntax.update(text, 0, text.len_chars());
+    Some(syntax)
 }
 
-/// Run `config`'s query over `root` (parsed from `src`, which starts at
-/// `byte_off` in the buffer) and append the resulting spans.
-fn collect_spans(
+/// Parse `text`, reusing `old` when the caller has already told it about the
+/// edit with `Tree::edit`. Reads the rope chunk by chunk, so nothing here
+/// flattens the buffer into a `String`.
+pub fn parse_tree(config: &'static Config, text: &Rope, old: Option<&Tree>) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(&config.language).ok()?;
+    let mut chunk = |byte: usize, _: Point| -> &[u8] {
+        if byte >= text.len_bytes() {
+            return &[];
+        }
+        let (chunk, start, _, _) = text.chunk_at_byte(byte);
+        &chunk.as_bytes()[byte - start..]
+    };
+    parser.parse_with_options(&mut chunk, old, None)
+}
+
+/// The `InputEdit` for a change that replaced the chars `start..old_end` with
+/// the chars now at `start..new_end`. `before` is the rope as it was, `after`
+/// as it is.
+pub fn input_edit(
+    before: &Rope,
+    after: &Rope,
+    start: usize,
+    old_end: usize,
+    new_end: usize,
+) -> InputEdit {
+    let point = |text: &Rope, char_idx: usize| {
+        let row = text.char_to_line(char_idx);
+        Point::new(row, text.char_to_byte(char_idx) - text.line_to_byte(row))
+    };
+    InputEdit {
+        start_byte: before.char_to_byte(start),
+        old_end_byte: before.char_to_byte(old_end),
+        new_end_byte: after.char_to_byte(new_end),
+        start_position: point(before, start),
+        old_end_position: point(before, old_end),
+        new_end_position: point(after, new_end),
+    }
+}
+
+/// Rope chunks as byte slices, so a query can read its text straight out of
+/// the buffer instead of a flattened copy.
+struct ChunksBytes<'a>(ropey::iter::Chunks<'a>);
+
+impl<'a> Iterator for ChunksBytes<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(str::as_bytes)
+    }
+}
+
+struct RopeProvider<'a>(RopeSlice<'a>);
+
+impl<'a> TextProvider<&'a [u8]> for RopeProvider<'a> {
+    type I = ChunksBytes<'a>;
+    fn text(&mut self, node: Node) -> Self::I {
+        ChunksBytes(self.0.byte_slice(node.byte_range()).chunks())
+    }
+}
+
+/// Run `config`'s query over `root` and append the resulting spans, limited to
+/// `range` when given. `byte_off` is where `root`'s source starts in the
+/// buffer (non-zero only for markdown's inline sub-parses).
+fn push_captures<I: AsRef<[u8]>, T: TextProvider<I>>(
     config: &Config,
-    root: tree_sitter::Node,
-    src: &str,
+    root: Node,
+    provider: T,
+    range: Option<std::ops::Range<usize>>,
     byte_off: usize,
     text: &Rope,
     spans: &mut Vec<(usize, usize, u8)>,
 ) {
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&config.query, root, src.as_bytes());
+    if let Some(r) = range {
+        cursor.set_byte_range(r);
+    }
+    let mut matches = cursor.matches(&config.query, root, provider);
     while let Some(m) = matches.next() {
         for cap in m.captures {
             let group = config.groups[cap.index as usize];
@@ -359,6 +473,47 @@ fn collect_spans(
                     text.byte_to_char(byte_off + r.end),
                     group,
                 ));
+            }
+        }
+    }
+}
+
+/// Markdown only: parse each `inline` node that overlaps `bytes` with the
+/// inline grammar and add its spans. Subtrees outside the range are skipped,
+/// so this costs the visible screen, not the file.
+fn collect_inline(
+    inline: &'static Config,
+    root: Node,
+    bytes: std::ops::Range<usize>,
+    text: &Rope,
+    spans: &mut Vec<(usize, usize, u8)>,
+) {
+    let mut parser = Parser::new();
+    if parser.set_language(&inline.language).is_err() {
+        return;
+    }
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let r = node.byte_range();
+        if r.end < bytes.start || r.start > bytes.end {
+            continue;
+        }
+        if node.kind() == "inline" {
+            let src = text.byte_slice(r.clone()).to_string();
+            if let Some(tree) = parser.parse(&src, None) {
+                push_captures(
+                    inline,
+                    tree.root_node(),
+                    src.as_bytes(),
+                    None,
+                    r.start,
+                    text,
+                    spans,
+                );
+            }
+        } else {
+            for i in 0..node.child_count() {
+                stack.push(node.child(i).unwrap());
             }
         }
     }

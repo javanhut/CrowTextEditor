@@ -42,6 +42,29 @@ into `syntax.rs` instead — keywords, `<type>` annotations, strings, comments,
 `oxigen-lsp` and `oxigen fmt` are wired up by default like every other
 language; `:install oxigen-lsp` builds them from the language's own repo.
 
+Markdown renders, it doesn't just get highlighted. `:md` (or `space m`) opens
+a preview beside the buffer that reads the way GitHub does: `**bold**` is
+bold with no asterisks, headings get their rules, fences become tinted
+syntax-colored blocks, lists get bullets and checkboxes, tables are drawn
+with real columns and alignment, block quotes get a bar, and links show
+their label instead of their URL. It re-renders as you type and scrolls in
+step with the source, so the two panes always look at the same paragraph.
+Focus never moves into it — you edit the markdown, you read the render.
+
+Editing is incremental, and so is the parser. Tree-sitter is told what the
+edit was and reparses only that, and the highlight query runs over the lines
+on screen rather than the whole file — 194µs per keystroke on a 16,000-line
+file, against 65ms for the full reparse it used to do. Input events are
+drained in a burst before drawing, so holding a key or pasting costs one
+frame instead of one per keystroke, and the frame leaves as a single
+buffered write.
+
+Long lines soft-wrap by default, at word boundaries, with the gutter left
+blank on continuation rows — a paragraph-per-line markdown file reads as
+prose instead of scrolling sideways. `:wrap` turns it off. Trailing
+whitespace is tinted (except on the line you are typing) and cut on write,
+never in markdown, where two trailing spaces are a line break.
+
 Insert-mode niceties: brackets and quotes auto-close (type `(` and `)`
 appears, retype the closer to step over it, backspace eats an empty pair;
 quotes stay single after word characters so `don't` types naturally), and the
@@ -69,6 +92,8 @@ theme = "gruvbox"            # default | gruvbox | mono; :theme switches live
 [options]
 tab_width = 4
 scrolloff = 3
+soft_wrap = true             # wrap long lines instead of scrolling sideways
+strip_trailing_whitespace = true
 
 [lsp]                        # file extension = server command
 rs = "rust-analyzer"
@@ -111,6 +136,10 @@ an emoji ZWJ sequence or a combining stack.
 | `u` `C-r`                          | undo / redo                                                                                                                                                                                                                                 |
 | `gn` `gp`                          | next / previous buffer                                                                                                                                                                                                                      |
 | `gd` `K`                           | goto definition / hover (LSP)                                                                                                                                                                                                               |
+| `gc`                               | comment or uncomment the selected lines                                                                                                                                                                                                     |
+| `ms` _(then a character)_          | surround the selection with it — `ms(`, `ms"`, `ms*`                                                                                                                                                                                       |
+| `space m` `:md`                    | live markdown preview beside the buffer                                                                                                                                                                                                     |
+| `:wrap`                            | soft wrap on / off                                                                                                                                                                                                                          |
 | _(typing)_                         | intellisense pops itself from buffer words, then from the language server when one is up — Tab accepts, Enter stays Enter                                                                                                                   |
 | `C-space` (insert)                 | LSP completion menu — Tab/Enter accepts, type to narrow                                                                                                                                                                                     |
 | `space e`                          | file tree sidebar — same key focuses and closes; `j`/`k` move, Enter/`l` expand or open, `h` collapse, `a` add (trailing `/` = dir), `r` rename, `d` delete (y/n), `x`/`c`/`p` cut/copy/paste, `R` refresh, `Esc` back to editor, `q` close |
@@ -126,11 +155,12 @@ Any command in the registry is also callable by name, so `:join_lines` works.
 
 ```
 transaction.rs   changesets: the edit and undo primitive
-position.rs      char offsets <-> display columns
+position.rs      char offsets <-> display columns, soft-wrap points
 document.rs      rope buffer, cursor, undo history, file I/O
 keymap.rs        keys, and the trie mapping sequences to commands
 commands.rs      every action, as a named static value
 editor.rs        state, key dispatch, ex commands, scrolling
+markdown.rs      markdown -> styled rows, for the preview pane
 ui.rs            rendering
 ```
 
@@ -178,12 +208,9 @@ Roughly in the order worth doing them:
 2. **More grammars and servers** — each grammar is one dependency and one arm
    in `syntax::config_for`; each server is one row in a table `lsp.rs` doesn't
    have yet (rust-analyzer is hardcoded).
-3. **Incremental parsing** — tree-sitter currently reparses the file per edit
-   (fine below ~1MB); the transaction model already produces the edit deltas
-   `InputEdit` wants.
-4. **Rendering-side graphemes** — the cursor steps by grapheme now, but width
+3. **Rendering-side graphemes** — the cursor steps by grapheme now, but width
    is still summed per char, so a ZWJ emoji renders wider than it should.
-5. **More themes and config options** — a theme is one entry in
+4. **More themes and config options** — a theme is one entry in
    `theme::THEMES`; an option is one key in `config.rs`. The parser is a
    deliberate TOML subset; swap in the `toml` crate if the config ever needs
    arrays or nesting.
@@ -196,7 +223,17 @@ cargo test
 
 The tests cover the parts that are easy to get subtly wrong and hard to notice:
 transaction inversion round-trips, undo grouping, tab and wide-character column
-math, count parsing, and the sticky goal column.
+math, count parsing, the sticky goal column, soft-wrap break points and the
+row arithmetic that scrolling depends on, and that markdown's markup is
+consumed rather than shown.
+
+```
+cargo test --release -- --ignored    # the benchmarks
+```
+
+`document::bench::editing_beats_reparsing_the_file` is the guard on the thing
+this editor is supposed to be: it asserts that an edit plus colouring one
+screenful costs less than a tenth of re-parsing the file.
 
 ## Note
 
