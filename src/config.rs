@@ -20,6 +20,9 @@ pub struct Config {
     pub icons: bool,
     pub format_on_save: bool,
     pub show_hidden: bool,
+    pub soft_wrap: bool,
+    pub trailing_whitespace: bool,
+    pub strip_trailing_whitespace: bool,
     /// Extra bindings per mode: (key sequence, command name).
     pub keys_normal: Vec<(String, String)>,
     pub keys_insert: Vec<(String, String)>,
@@ -40,6 +43,9 @@ impl Default for Config {
             icons: true,
             format_on_save: true,
             show_hidden: false,
+            soft_wrap: true,
+            trailing_whitespace: true,
+            strip_trailing_whitespace: true,
             keys_normal: Vec::new(),
             keys_insert: Vec::new(),
             lsp: vec![("rs".into(), "rust-analyzer".into())],
@@ -57,6 +63,9 @@ static AUTOCLOSE: AtomicBool = AtomicBool::new(true);
 static ICONS: AtomicBool = AtomicBool::new(true);
 static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false);
 static FORMAT_ON_SAVE: AtomicBool = AtomicBool::new(true);
+static SOFT_WRAP: AtomicBool = AtomicBool::new(true);
+static TRAILING_WHITESPACE: AtomicBool = AtomicBool::new(true);
+static STRIP_TRAILING_WHITESPACE: AtomicBool = AtomicBool::new(true);
 
 pub fn tab_width() -> usize {
     TAB_WIDTH.load(Ordering::Relaxed)
@@ -87,6 +96,26 @@ pub fn format_on_save() -> bool {
     FORMAT_ON_SAVE.load(Ordering::Relaxed)
 }
 
+/// Wrap long lines onto the next row instead of scrolling sideways.
+pub fn soft_wrap() -> bool {
+    SOFT_WRAP.load(Ordering::Relaxed)
+}
+
+/// Flip soft wrap at runtime (`:wrap`). Returns the new value.
+pub fn toggle_soft_wrap() -> bool {
+    !SOFT_WRAP.fetch_xor(true, Ordering::Relaxed)
+}
+
+/// Tint spaces and tabs left at the end of a line.
+pub fn trailing_whitespace() -> bool {
+    TRAILING_WHITESPACE.load(Ordering::Relaxed)
+}
+
+/// Cut that whitespace on write.
+pub fn strip_trailing_whitespace() -> bool {
+    STRIP_TRAILING_WHITESPACE.load(Ordering::Relaxed)
+}
+
 /// Install the config's options and theme as the live values. False when the
 /// theme name was not recognised — startup ignores that, `:config!` reports it
 /// rather than looking like the reload did nothing.
@@ -97,6 +126,9 @@ pub fn apply(config: &Config) -> bool {
     ICONS.store(config.icons, Ordering::Relaxed);
     SHOW_HIDDEN.store(config.show_hidden, Ordering::Relaxed);
     FORMAT_ON_SAVE.store(config.format_on_save, Ordering::Relaxed);
+    SOFT_WRAP.store(config.soft_wrap, Ordering::Relaxed);
+    TRAILING_WHITESPACE.store(config.trailing_whitespace, Ordering::Relaxed);
+    STRIP_TRAILING_WHITESPACE.store(config.strip_trailing_whitespace, Ordering::Relaxed);
     *FMT.lock().unwrap() = config.fmt.clone();
     crate::theme::set(&config.theme)
 }
@@ -340,6 +372,9 @@ autoclose = true         # type ( [ { " ' and the closer appears
 icons = true             # Nerd Font file icons in the tree (needs a Nerd Font)
 format_on_save = true    # pipe the buffer through its [fmt] formatter on :w
 show_hidden = false      # dotfiles, .git, and build dirs everywhere (toggle: . in the tree, :toggle_hidden)
+soft_wrap = true         # wrap long lines instead of scrolling sideways (toggle: :wrap)
+trailing_whitespace = true          # tint spaces left at the end of a line
+strip_trailing_whitespace = true    # and cut them on :w (never in markdown, where they mean a line break)
 
 # Language servers: file extension = server command. crow starts the first
 # server whose extension matches an open file.
@@ -417,6 +452,14 @@ fn parse(text: &str) -> Config {
                 "show_hidden" => config.show_hidden = value.parse().unwrap_or(config.show_hidden),
                 "format_on_save" => {
                     config.format_on_save = value.parse().unwrap_or(config.format_on_save)
+                }
+                "soft_wrap" => config.soft_wrap = value.parse().unwrap_or(config.soft_wrap),
+                "trailing_whitespace" => {
+                    config.trailing_whitespace = value.parse().unwrap_or(config.trailing_whitespace)
+                }
+                "strip_trailing_whitespace" => {
+                    config.strip_trailing_whitespace =
+                        value.parse().unwrap_or(config.strip_trailing_whitespace)
                 }
                 _ => {}
             },

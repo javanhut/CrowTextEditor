@@ -6,6 +6,7 @@ mod editor;
 mod filetree;
 mod keymap;
 mod lsp;
+mod markdown;
 mod picker;
 mod position;
 mod search;
@@ -47,12 +48,16 @@ KEYS (normal mode):
     gg G  42gg   file ends, jump to line       :w :q :wq  write, quit
     C-d C-u      half page       gn gp         next/prev buffer
     gd K         goto definition, hover        C-space  LSP complete (insert)
+    gc  ms(      comment lines, surround selection
+    space m  :md   live GitHub-style markdown preview beside the buffer
     space e      file tree sidebar             (typing pops word completion)
     space c/f/d/t  command palette, find file, browse dir, themes
 
     Motions select the text they cross; d/c/y act on the selection.
     Every motion, edit, and inserted keystroke applies at every cursor.
     A count may prefix most commands: 3x, 10d, 5C.
+
+    Long lines soft-wrap by default; :wrap turns that off.
 
 CONFIG:
     ~/.config/crow/crow.toml — theme, options, keybindings, language
@@ -166,6 +171,11 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
 
         if dirty {
             editor.ensure_cursor_visible();
+            // Spans are collected for the lines about to be drawn, not for the
+            // whole file: the reparse above maintains the tree, this turns the
+            // visible part of it into colors.
+            editor.refresh_highlights();
+            editor.refresh_preview();
             ui::render(editor, &mut out)?;
             dirty = false;
         }

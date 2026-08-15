@@ -77,6 +77,7 @@ thread_local! {
 const ST_NONE: u8 = 0;
 const ST_SEL: u8 = 1;
 const ST_CURSOR: u8 = 2;
+const ST_TRAIL: u8 = 3;
 
 /// (overlay, color, BOLD/ITALIC flags) for one cell.
 type Style = (u8, Option<Color>, u8);
@@ -93,6 +94,8 @@ fn render_text(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
                 queue!(out, cursor::MoveTo(x, row), Print(" ".repeat(w as usize)))?;
             }
             queue!(out, ResetColor)?;
+        } else if editor.preview_win() == Some(id) {
+            render_preview(editor, rect, out)?;
         } else {
             render_window(editor, id, rect, out)?;
         }
@@ -131,7 +134,7 @@ fn render_window(
     let win = editor.layout.find(id).expect("window exists");
     // The focused window's live state is in its document; other windows render
     // from their stashed state.
-    let (doc, cursor, anchor, extra, view_line, view_col) = if focused {
+    let (doc, cursor, anchor, extra, view_line, view_row, view_col) = if focused {
         let d = editor.doc();
         (
             d,
@@ -139,6 +142,7 @@ fn render_window(
             d.anchor,
             d.extra.clone(),
             d.view_line,
+            d.view_row,
             d.view_col,
         )
     } else {
@@ -149,6 +153,7 @@ fn render_window(
             win.anchor,
             win.extra.clone(),
             win.view_line,
+            win.view_row,
             win.view_col,
         )
     };
@@ -198,8 +203,16 @@ fn render_window(
     let base_bg = theme.bg.unwrap_or(Color::Reset);
     let base_fg = theme.fg.unwrap_or(Color::Reset);
 
-    for row in 0..rh as usize {
-        let line_idx = view_line + row;
+    let wrap = crate::config::soft_wrap()
+        .then_some(width)
+        .filter(|w| *w > 0);
+    // Walk logical lines, each contributing one row or — soft-wrapped — several.
+    let mut row = 0usize;
+    let mut line_idx = view_line;
+    // Visual row of `line_idx` to draw next; only the first line starts partway
+    // in, and only when the viewport is parked inside a tall wrapped line.
+    let mut next_sub = view_row;
+    while row < rh as usize {
         queue!(
             out,
             cursor::MoveTo(rx, ry + row as u16),
@@ -215,10 +228,29 @@ fn render_window(
                 Print(" ".repeat((rw as usize).saturating_sub(1))),
                 ResetColor
             )?;
+            row += 1;
+            line_idx += 1;
             continue;
         }
 
-        let number = format!("{:>width$} ", line_idx + 1, width = gutter - 1);
+        let line = doc.line(line_idx);
+        let line_len = doc.line_len(line_idx);
+        let offsets = match wrap {
+            Some(w) => crate::position::wrap_offsets(line, w, tab_width()),
+            None => vec![0],
+        };
+        let sub_row = next_sub.min(offsets.len() - 1);
+        let from = offsets[sub_row];
+        let to = offsets.get(sub_row + 1).copied().unwrap_or(line_len);
+        let last_row = sub_row + 1 == offsets.len();
+
+        // Continuation rows leave the gutter blank, so the line numbers still
+        // read as one number per line.
+        let number = if sub_row == 0 {
+            format!("{:>width$} ", line_idx + 1, width = gutter - 1)
+        } else {
+            " ".repeat(gutter)
+        };
         // A diagnostic on the line colors its number: red error, yellow warning.
         let diag_color = diags
             .iter()
@@ -237,18 +269,25 @@ fn render_window(
         )?;
 
         let ls = doc.line_start(line_idx);
-        let line_len = doc.line_len(line_idx);
         let spans = doc
             .syntax
             .as_ref()
             .map(|s| s.spans.as_slice())
             .unwrap_or(&[]);
+        // Whitespace the line ends on, so it can be tinted rather than left
+        // invisible — except on the line being typed, where it is just the
+        // space you have not finished typing after.
+        let trail = (crate::config::trailing_whitespace() && !(focused && line_idx == cursor_line))
+            .then(|| trailing_start(line, line_len))
+            .flatten();
         let style_of = |off: usize| -> Style {
             let p = ls + off;
             let overlay = if curs.contains(&p) {
                 ST_CURSOR
             } else if sels.iter().any(|&(f, t)| f <= p && p < t) {
                 ST_SEL
+            } else if trail.is_some_and(|t| off >= t && off < line_len) {
+                ST_TRAIL
             } else {
                 ST_NONE
             };
@@ -257,7 +296,15 @@ fn render_window(
             (overlay, fg, crate::syntax::attrs(group))
         };
 
-        let runs = styled_visible(doc.line(line_idx), line_len, view_col, width, style_of);
+        let runs = styled_visible(
+            line,
+            from..to,
+            line_len,
+            last_row,
+            view_col,
+            width,
+            style_of,
+        );
         let mut printed = 0usize;
         for ((overlay, fg, attrs), s) in runs {
             printed += display_width(&s);
@@ -270,12 +317,13 @@ fn render_window(
             }
             match overlay {
                 ST_SEL => queue!(out, SetBackgroundColor(theme.selection))?,
+                ST_TRAIL => queue!(out, SetBackgroundColor(Color::DarkRed))?,
                 ST_CURSOR => queue!(out, SetAttribute(Attribute::Reverse))?,
                 _ => {}
             }
             queue!(out, Print(s))?;
             match overlay {
-                ST_SEL => queue!(out, SetBackgroundColor(base_bg))?,
+                ST_SEL | ST_TRAIL => queue!(out, SetBackgroundColor(base_bg))?,
                 ST_CURSOR => queue!(out, SetAttribute(Attribute::NoReverse))?,
                 _ => {}
             }
@@ -289,7 +337,7 @@ fn render_window(
         // Package manifests: the dependency's current version, and the newer
         // one on its registry when there is one — like the diagnostics,
         // virtual text.
-        if let Some(kind) = manifest_kind {
+        if let (Some(kind), true) = (manifest_kind, last_row) {
             let head: String = doc.line(line_idx).chars().take(200).collect();
             let dep = crate::deps::line_dep(kind, &head)
                 .and_then(|name| editor.dep_info.get(&(kind, name)));
@@ -319,10 +367,14 @@ fn render_window(
         }
 
         // The line's worst diagnostic, inline after the text (virtual text).
-        let inline = diags
-            .iter()
-            .filter(|d| d.line == line_idx)
-            .min_by_key(|d| d.severity);
+        let inline = last_row
+            .then(|| {
+                diags
+                    .iter()
+                    .filter(|d| d.line == line_idx)
+                    .min_by_key(|d| d.severity)
+            })
+            .flatten();
         if let Some(d) = inline {
             let avail = width.saturating_sub(printed);
             if avail > 8 {
@@ -350,10 +402,115 @@ fn render_window(
             queue!(out, Print(" ".repeat(width - printed)))?;
         }
         queue!(out, ResetColor)?;
+
+        row += 1;
+        if last_row {
+            line_idx += 1;
+            next_sub = 0;
+        } else {
+            next_sub = sub_row + 1;
+        }
     }
 
     Ok(())
 }
+
+/// The markdown preview pane: rows of styled spans built by `markdown.rs`,
+/// with a one-column left margin so the text doesn't touch the separator.
+fn render_preview(
+    editor: &Editor,
+    rect: crate::editor::Rect,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    let (rx, ry, rw, rh) = rect;
+    let Some(preview) = &editor.preview else {
+        return Ok(());
+    };
+    let theme = crate::theme::current();
+    let base_bg = theme.bg.unwrap_or(Color::Reset);
+    let width = rw as usize;
+
+    for row in 0..rh as usize {
+        queue!(
+            out,
+            cursor::MoveTo(rx, ry + row as u16),
+            ResetColor,
+            SetBackgroundColor(base_bg)
+        )?;
+        let Some(line) = preview.rows.get(preview.scroll + row) else {
+            queue!(out, Print(" ".repeat(width)))?;
+            continue;
+        };
+        let fill = line.bg.unwrap_or(base_bg);
+        let base_fg = theme.fg.unwrap_or(Color::Reset);
+        queue!(out, SetBackgroundColor(fill), Print(" "))?;
+        let mut printed = 1usize;
+        for span in &line.spans {
+            // Clip at the window edge a whole character at a time; half a wide
+            // glyph corrupts every column after it.
+            let mut text = String::new();
+            for c in span.text.chars() {
+                let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                if printed + w > width {
+                    break;
+                }
+                printed += w;
+                text.push(c);
+            }
+            queue!(
+                out,
+                SetBackgroundColor(span.style.bg.unwrap_or(fill)),
+                SetForegroundColor(span.style.fg.unwrap_or(base_fg))
+            )?;
+            for (bit, on, _) in ATTRS {
+                if span.style.attrs & bit != 0 {
+                    queue!(out, SetAttribute(on))?;
+                }
+            }
+            queue!(out, Print(text))?;
+            for (bit, _, off) in ATTRS {
+                if span.style.attrs & bit != 0 {
+                    queue!(out, SetAttribute(off))?;
+                }
+            }
+            if printed >= width {
+                break;
+            }
+        }
+        queue!(
+            out,
+            SetBackgroundColor(fill),
+            Print(" ".repeat(width.saturating_sub(printed))),
+            ResetColor
+        )?;
+    }
+    Ok(())
+}
+
+/// Markdown attribute bit -> the escape that turns it on, and the one that
+/// turns it off again without resetting the colors around it.
+const ATTRS: [(u8, Attribute, Attribute); 4] = [
+    (
+        crate::markdown::BOLD,
+        Attribute::Bold,
+        Attribute::NormalIntensity,
+    ),
+    (
+        crate::markdown::ITALIC,
+        Attribute::Italic,
+        Attribute::NoItalic,
+    ),
+    (
+        crate::markdown::UNDERLINE,
+        Attribute::Underlined,
+        Attribute::NoUnderline,
+    ),
+    (
+        crate::markdown::STRIKE,
+        Attribute::CrossedOut,
+        Attribute::NotCrossedOut,
+    ),
+];
 
 fn display_width(s: &str) -> usize {
     s.chars()
@@ -361,18 +518,30 @@ fn display_width(s: &str) -> usize {
         .sum()
 }
 
-/// Render the portion of a line inside the horizontal viewport as runs of
-/// equally-styled text, where `style_of` maps a char offset within the line to
-/// its style.
+/// Where a line's trailing whitespace begins, if it has any and isn't blank.
+fn trailing_start(line: RopeSlice, line_len: usize) -> Option<usize> {
+    let mut at = line_len;
+    while at > 0 && matches!(line.char(at - 1), ' ' | '\t') {
+        at -= 1;
+    }
+    (at > 0 && at < line_len).then_some(at)
+}
+
+/// Render the chars `range` of a line as runs of equally-styled text, where
+/// `style_of` maps a char offset within the line to its style. The range is
+/// the whole line when nothing wraps, and one visual row of it when soft wrap
+/// is on — columns are measured from the start of the range either way.
 ///
 /// Tabs expand to spaces, and wide characters straddling either edge of the
 /// viewport are replaced with spaces rather than being cut in half — a
-/// half-drawn wide character corrupts every column after it. The newline gets
-/// one extra column when styled, so a selected line ending or a cursor sitting
-/// on it is visible.
+/// half-drawn wide character corrupts every column after it. On a line's last
+/// row the newline gets one extra column when styled, so a selected line
+/// ending or a cursor sitting on it is visible.
 fn styled_visible(
     line: RopeSlice,
+    range: std::ops::Range<usize>,
     line_len: usize,
+    last_row: bool,
     view_col: usize,
     width: usize,
     style_of: impl Fn(usize) -> Style,
@@ -386,7 +555,9 @@ fn styled_visible(
     let right_edge = view_col + width;
     let mut col = 0usize;
 
-    for (i, c) in line.chars().enumerate() {
+    let mut chars = line.chars_at(range.start.min(line.len_chars()));
+    for i in range.clone() {
+        let Some(c) = chars.next() else { break };
         if c == '\n' || c == '\r' {
             break;
         }
@@ -414,9 +585,9 @@ fn styled_visible(
         }
     }
 
-    if col >= view_col && col < right_edge {
+    if last_row && col >= view_col && col < right_edge {
         let style = style_of(line_len);
-        if style.0 != ST_NONE {
+        if style.0 != ST_NONE && style.0 != ST_TRAIL {
             push(&mut runs, style, ' ');
         }
     }
@@ -1425,10 +1596,12 @@ mod tests {
 
     fn plain(line: RopeSlice, view_col: usize, width: usize) -> String {
         let len = position::line_len_without_newline(line);
-        styled_visible(line, len, view_col, width, |_| (ST_NONE, None, 0))
-            .into_iter()
-            .map(|(_, s)| s)
-            .collect()
+        styled_visible(line, 0..len, len, true, view_col, width, |_| {
+            (ST_NONE, None, 0)
+        })
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect()
     }
 
     #[test]
@@ -1461,7 +1634,7 @@ mod tests {
     fn styles_split_a_line_into_runs() {
         let rope = Rope::from_str("abcdef");
         // Select chars 2..4.
-        let runs = styled_visible(rope.line(0), 6, 0, 10, |i| {
+        let runs = styled_visible(rope.line(0), 0..6, 6, true, 0, 10, |i| {
             if (2..4).contains(&i) {
                 (ST_SEL, None, 0)
             } else {
@@ -1482,7 +1655,7 @@ mod tests {
     fn styled_newline_shows_as_one_column() {
         let rope = Rope::from_str("ab\ncd");
         // The whole line plus its newline is selected.
-        let runs = styled_visible(rope.line(0), 2, 0, 10, |_| (ST_SEL, None, 0));
+        let runs = styled_visible(rope.line(0), 0..2, 2, true, 0, 10, |_| (ST_SEL, None, 0));
         assert_eq!(runs, vec![((ST_SEL, None, 0), "ab ".to_string())]);
     }
 }

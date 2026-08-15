@@ -136,6 +136,38 @@ impl Transaction {
         Transaction { ops }
     }
 
+    /// The stretch of document this transaction touches, as
+    /// `(start, old_end, new_end)` char offsets — `start` and `old_end` in the
+    /// document before, `new_end` in the document after. Everything before
+    /// `start` is retained, so that offset means the same thing in both.
+    ///
+    /// One range covering every change, not one per change: a multi-cursor
+    /// edit hands tree-sitter a wider region to reparse and stays correct.
+    pub fn changed_range(&self) -> Option<(usize, usize, usize)> {
+        let (mut old, mut new) = (0usize, 0usize);
+        let mut start: Option<usize> = None;
+        let (mut old_end, mut new_end) = (0usize, 0usize);
+        for op in &self.ops {
+            match op {
+                Operation::Retain(n) => {
+                    old += n;
+                    new += n;
+                }
+                Operation::Delete(n) => {
+                    start.get_or_insert(old);
+                    old += n;
+                    (old_end, new_end) = (old, new);
+                }
+                Operation::Insert(s) => {
+                    start.get_or_insert(old);
+                    new += s.chars().count();
+                    (old_end, new_end) = (old, new);
+                }
+            }
+        }
+        start.map(|s| (s, old_end, new_end))
+    }
+
     /// Map a position through this transaction, so a cursor or mark survives an
     /// edit made elsewhere in the document.
     ///
@@ -222,6 +254,27 @@ mod tests {
 
         tx.invert(&original).apply(&mut text);
         assert_eq!(text.to_string(), "aaa bbb ccc");
+    }
+
+    #[test]
+    fn changed_range_spans_every_change() {
+        let text = Rope::from_str("aaa bbb ccc");
+        // A pure insert: nothing was removed, so old_end == start.
+        let tx = Transaction::insert(&text, 4, "xy");
+        assert_eq!(tx.changed_range(), Some((4, 4, 6)));
+        // A pure delete: nothing was added, so new_end == start.
+        let tx = Transaction::delete(&text, 4, 7);
+        assert_eq!(tx.changed_range(), Some((4, 7, 4)));
+        // Two changes: one range covering both, each end in its own document.
+        let tx = Transaction::change(
+            &text,
+            [
+                (0, 3, Some("x".to_string())),
+                (8, 11, Some("zzzz".to_string())),
+            ],
+        );
+        assert_eq!(tx.changed_range(), Some((0, 11, 10)));
+        assert!(Transaction::default().changed_range().is_none());
     }
 
     #[test]

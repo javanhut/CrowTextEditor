@@ -45,6 +45,23 @@ pub struct Completion {
     pub docs: std::collections::HashMap<String, String>,
 }
 
+/// The live markdown preview: the window showing it and the rows currently
+/// drawn there. Rendered from whichever buffer is focused, so the preview
+/// follows you across buffers the way a browser tab follows a save.
+pub struct Preview {
+    /// The window id the preview owns. Never focused — it is a view, not a
+    /// place to edit.
+    pub win: usize,
+    pub rows: Vec<crate::markdown::Row>,
+    /// First row on screen, kept in step with the source's viewport.
+    pub scroll: usize,
+    /// What the cached rows were rendered from.
+    doc: usize,
+    revision: u64,
+    width: usize,
+    theme: &'static str,
+}
+
 /// A window's saved view state. The focused window's state lives in its
 /// `Document`; it is stashed here whenever focus moves away.
 ///
@@ -58,6 +75,7 @@ pub struct Window {
     pub anchor: usize,
     pub extra: Vec<(usize, usize)>,
     pub view_line: usize,
+    pub view_row: usize,
     pub view_col: usize,
 }
 
@@ -311,6 +329,9 @@ impl Default for Keymaps {
         normal.bind_str("C-w l", "focus_right");
         normal.bind_str("<space> d", "file_explorer");
         normal.bind_str("<space> t", "theme_picker");
+        normal.bind_str("<space> m", "markdown_preview");
+        normal.bind_str("gc", "toggle_comment");
+        normal.bind_str("ms", "surround");
         normal.bind_str("<space> s v", "split_vertical");
         normal.bind_str("<space> s h", "split_horizontal");
         normal.bind_str("<space> w", "save");
@@ -386,6 +407,8 @@ pub struct Editor {
     pub active_register: Option<char>,
     /// A `"` has been pressed; the next key names the register.
     pub awaiting_register: bool,
+    /// `ms` has been pressed; the next key is the pair to surround with.
+    pub awaiting_surround: bool,
     /// True until the first register capture of the current keypress, so the
     /// captures of one multi-cursor edit accumulate instead of overwriting.
     pub register_fresh: bool,
@@ -410,6 +433,8 @@ pub struct Editor {
     lsp_failed: std::collections::HashSet<String>,
     /// Latest diagnostics per file (canonical paths, as the server sends them).
     pub diagnostics: HashMap<PathBuf, Vec<lsp::Diagnostic>>,
+    /// The markdown preview split, when open.
+    pub preview: Option<Preview>,
     /// The active popup picker, if any (mode == Picker).
     pub picker: Option<crate::picker::Picker>,
     /// The active completion menu, if any (mode == Insert).
@@ -494,6 +519,7 @@ impl Editor {
                 anchor: 0,
                 extra: Vec::new(),
                 view_line: 0,
+                view_row: 0,
                 view_col: 0,
             }),
             focused: 0,
@@ -507,6 +533,7 @@ impl Editor {
             registers: std::collections::HashMap::new(),
             active_register: None,
             awaiting_register: false,
+            awaiting_surround: false,
             register_fresh: true,
             last_search: String::new(),
             search_select: false,
@@ -516,6 +543,7 @@ impl Editor {
             lsps: Vec::new(),
             lsp_failed: std::collections::HashSet::new(),
             diagnostics: HashMap::new(),
+            preview: None,
             picker: None,
             completion: None,
             help_scroll: None,
@@ -628,11 +656,19 @@ impl Editor {
             doc.anchor,
             doc.extra.clone(),
             doc.view_line,
+            doc.view_row,
             doc.view_col,
         );
         if let Some(w) = self.layout.find_mut(self.focused) {
             w.doc = current;
-            (w.cursor, w.anchor, w.extra, w.view_line, w.view_col) = snap;
+            (
+                w.cursor,
+                w.anchor,
+                w.extra,
+                w.view_line,
+                w.view_row,
+                w.view_col,
+            ) = snap;
         }
     }
 
@@ -641,12 +677,13 @@ impl Editor {
         let Some(w) = self.layout.find(self.focused) else {
             return;
         };
-        let (doc_idx, c, a, extra, vl, vc) = (
+        let (doc_idx, c, a, extra, vl, vr, vc) = (
             w.doc,
             w.cursor,
             w.anchor,
             w.extra.clone(),
             w.view_line,
+            w.view_row,
             w.view_col,
         );
         self.current = doc_idx.min(self.documents.len() - 1);
@@ -659,6 +696,7 @@ impl Editor {
             .map(|(a, c)| (a.min(len), c.min(len)))
             .collect();
         doc.view_line = vl.min(doc.line_count().saturating_sub(1));
+        doc.view_row = vr;
         doc.view_col = vc;
         doc.clamp_cursor(false);
         doc.dedupe_cursors();
@@ -684,6 +722,12 @@ impl Editor {
     }
 
     pub fn close_focused_window(&mut self) {
+        // Closing the last text window would leave you alone in the preview,
+        // which has no cursor. Take the preview down instead.
+        if self.window_count() == 2 && self.preview.is_some() {
+            self.close_preview();
+            return;
+        }
         if self.window_count() <= 1 {
             return;
         }
@@ -691,6 +735,82 @@ impl Editor {
         self.focus_next_window();
         // focus_next_window saved into `closing` and restored the next one.
         self.layout.close(closing);
+    }
+
+    // ---- markdown preview ---------------------------------------------------
+
+    /// The window id the preview owns, if it is open.
+    pub fn preview_win(&self) -> Option<usize> {
+        self.preview.as_ref().map(|p| p.win)
+    }
+
+    /// `:md` — open the preview beside the buffer, or close it.
+    pub fn toggle_preview(&mut self) {
+        if self.preview.is_some() {
+            self.close_preview();
+            return;
+        }
+        let source = self.focused;
+        self.split_window(true);
+        let win = self.focused;
+        // Hand focus straight back: you edit the markdown, you read the render.
+        self.save_focus_state();
+        self.focused = source;
+        self.restore_focus_state();
+        self.preview = Some(Preview {
+            win,
+            rows: Vec::new(),
+            scroll: 0,
+            doc: usize::MAX,
+            revision: u64::MAX,
+            width: 0,
+            theme: "",
+        });
+        self.set_status("markdown preview — :md closes it");
+    }
+
+    fn close_preview(&mut self) {
+        if let Some(p) = self.preview.take() {
+            self.layout.close(p.win);
+            if self.layout.find(self.focused).is_none() {
+                let mut ids = Vec::new();
+                self.layout.leaf_ids(&mut ids);
+                self.focused = ids.first().copied().unwrap_or(0);
+                self.restore_focus_state();
+            }
+        }
+    }
+
+    /// Re-render the preview when the buffer, the window, or the theme moved
+    /// under it, and keep its scroll in step with the source's viewport.
+    /// Called once per frame; a frame where nothing changed costs one compare.
+    pub fn refresh_preview(&mut self) {
+        let Some(win) = self.preview_win() else {
+            return;
+        };
+        let Some((_, (.., w, h))) = self.window_rects().0.into_iter().find(|&(id, _)| id == win)
+        else {
+            return;
+        };
+        let (doc, revision, view_line) = {
+            let d = self.doc();
+            (self.current, d.revision, d.view_line)
+        };
+        // The theme is part of the key: `:theme` recolors the rows too.
+        let theme = crate::theme::current().name;
+        let p = self.preview.as_mut().expect("checked above");
+        if (p.doc, p.revision, p.width, p.theme) != (doc, revision, w as usize, theme) {
+            p.rows = crate::markdown::render(&self.documents[doc].text, w as usize);
+            (p.doc, p.revision, p.width, p.theme) = (doc, revision, w as usize, theme);
+        }
+        // Scroll to the first row that came from the top visible source line,
+        // so the two panes stay looking at the same part of the document.
+        let at = p
+            .rows
+            .iter()
+            .position(|r| r.src_line >= view_line)
+            .unwrap_or(0);
+        p.scroll = at.min(p.rows.len().saturating_sub(h as usize));
     }
 
     /// Move focus to the nearest window in one direction (one of dx/dy is
@@ -703,6 +823,7 @@ impl Editor {
             .iter()
             .filter(|&&(id, (x, y, ..))| {
                 id != self.focused
+                    && Some(id) != self.preview_win()
                     && match (dx, dy) {
                         (-1, _) => x < fx,
                         (1, _) => x > fx,
@@ -733,6 +854,7 @@ impl Editor {
     pub fn focus_next_window(&mut self) {
         let mut ids = Vec::new();
         self.layout.leaf_ids(&mut ids);
+        ids.retain(|&id| Some(id) != self.preview_win() || id == self.focused);
         if ids.len() <= 1 {
             return;
         }
@@ -866,6 +988,17 @@ impl Editor {
         }
         if self.mode == Mode::Insert && self.completion.is_some() && self.handle_completion_key(key)
         {
+            return;
+        }
+
+        // `ms` armed the surround: this key is the pair to wrap with.
+        if self.awaiting_surround {
+            self.awaiting_surround = false;
+            if let KeyCode::Char(c) = key.code {
+                if !key.ctrl && !key.alt {
+                    commands::surround_with(self, c);
+                }
+            }
             return;
         }
 
@@ -1108,6 +1241,8 @@ impl Editor {
         "wq",
         "e",
         "help",
+        "md",
+        "wrap",
         "fmt",
         "bn",
         "bp",
@@ -1292,6 +1427,8 @@ impl Editor {
                 None => self.set_status("Usage: :e <file>"),
             },
             "help" | "h" => self.help_scroll = Some(0),
+            "md" | "preview" => self.toggle_preview(),
+            "wrap" => (commands::find("toggle_wrap").unwrap().func)(self),
             "fmt" | "format" => (commands::find("format_buffer").unwrap().func)(self),
             "bn" => (commands::find("next_buffer").unwrap().func)(self),
             "bp" => (commands::find("prev_buffer").unwrap().func)(self),
@@ -2692,6 +2829,14 @@ impl Editor {
 
     /// Adjust the viewport so the cursor is on screen, keeping a few lines of
     /// context above and below where possible.
+    /// Soft-wrap width for the focused window's text area, or `None` when
+    /// wrapping is off and long lines scroll sideways instead.
+    pub fn wrap_width(&self) -> Option<usize> {
+        crate::config::soft_wrap()
+            .then(|| self.text_width())
+            .filter(|w| *w > 0)
+    }
+
     pub fn ensure_cursor_visible(&mut self) {
         let height = self.text_height();
         let width = self.text_width();
@@ -2699,27 +2844,79 @@ impl Editor {
             return;
         }
         let scrolloff = crate::config::scrolloff().min(height.saturating_sub(1) / 2);
+        let wrap = self.wrap_width();
 
         let doc = self.doc_mut();
-        let (line, col) = doc.cursor_display();
+        let (line, row, col) = doc.cursor_visual(wrap);
 
-        if line < doc.view_line + scrolloff {
-            doc.view_line = line.saturating_sub(scrolloff);
-        }
-        if line + scrolloff >= doc.view_line + height {
-            doc.view_line = (line + scrolloff + 1).saturating_sub(height);
+        let Some(_) = wrap else {
+            doc.view_row = 0;
+            if line < doc.view_line + scrolloff {
+                doc.view_line = line.saturating_sub(scrolloff);
+            }
+            if line + scrolloff >= doc.view_line + height {
+                doc.view_line = (line + scrolloff + 1).saturating_sub(height);
+            }
+            doc.view_line = doc.view_line.min(doc.line_count().saturating_sub(1));
+            if col < doc.view_col {
+                doc.view_col = col;
+            }
+            if col >= doc.view_col + width {
+                doc.view_col = col - width + 1;
+            }
+            return;
+        };
+
+        // Wrapping makes "rows" and "lines" different units, so the viewport
+        // is a (line, row) pair and scrolling counts rows.
+        doc.view_col = 0; // nothing scrolls sideways while it wraps
+        doc.view_line = doc.view_line.min(doc.line_count().saturating_sub(1));
+        // A jump (`G`, a goto) can leave the viewport a whole file away. Land
+        // near the cursor first, so the row walk below stays bounded by the
+        // screen instead of the file.
+        if line >= doc.view_line + height || line + height < doc.view_line {
+            doc.view_line = line.saturating_sub(height / 2);
+            doc.view_row = 0;
         }
 
-        let max_view_line = doc.line_count().saturating_sub(1);
-        if doc.view_line > max_view_line {
-            doc.view_line = max_view_line;
+        let top = (doc.view_line, doc.view_row);
+        if (line, row) < top {
+            (doc.view_line, doc.view_row) = (line, row);
+            doc.scroll_view(wrap, -(scrolloff as isize));
+        } else {
+            let over = doc.rows_forward(wrap, top, (line, row)) as isize + scrolloff as isize + 1
+                - height as isize;
+            if over > 0 {
+                doc.scroll_view(wrap, over);
+            }
         }
+    }
 
-        if col < doc.view_col {
-            doc.view_col = col;
+    /// Collect highlight spans for the lines about to be drawn, and nothing
+    /// else. Every other path only marks them stale, so the cost of coloring
+    /// is a screenful per frame rather than a whole file per keystroke.
+    pub fn refresh_highlights(&mut self) {
+        let (wins, _) = self.window_rects();
+        // Two windows on one document share its spans, so take the union of
+        // what they need rather than letting them fight over the range.
+        let mut ranges: HashMap<usize, (usize, usize)> = HashMap::new();
+        for (id, (.., h)) in wins {
+            let (doc, first) = if id == self.focused {
+                (self.current, self.documents[self.current].view_line)
+            } else {
+                match self.layout.find(id) {
+                    Some(w) => (w.doc.min(self.documents.len() - 1), w.view_line),
+                    None => continue,
+                }
+            };
+            let want = (first, first + h as usize);
+            ranges
+                .entry(doc)
+                .and_modify(|r| *r = (r.0.min(want.0), r.1.max(want.1)))
+                .or_insert(want);
         }
-        if col >= doc.view_col + width {
-            doc.view_col = col - width + 1;
+        for (doc, (first, last)) in ranges {
+            self.documents[doc].highlight_range(first, last);
         }
     }
 
@@ -2755,16 +2952,20 @@ impl Editor {
         }
 
         let (rx, ry, rw, rh) = self.focused_rect();
+        let wrap = self.wrap_width();
         let doc = self.doc();
-        let (line, col) = doc.cursor_display();
-        if line < doc.view_line || line >= doc.view_line + rh as usize {
+        let (line, row, col) = doc.cursor_visual(wrap);
+        if line < doc.view_line || line > doc.view_line + rh as usize {
             return None;
         }
-        if col < doc.view_col {
+        if (line, row) < (doc.view_line, doc.view_row) || col < doc.view_col {
             return None;
         }
 
-        let screen_row = line - doc.view_line;
+        let screen_row = doc.rows_forward(wrap, (doc.view_line, doc.view_row), (line, row));
+        if screen_row >= rh as usize {
+            return None;
+        }
         let screen_col = self.gutter_width() + (col - doc.view_col);
         if screen_col >= rw as usize {
             return None;
@@ -3156,6 +3357,116 @@ pub(crate) mod tests {
         press(&mut editor, "quit");
         press(&mut editor, "<enter>");
         assert!(editor.should_quit);
+    }
+
+    /// The cursor has to land on the *visual* row its character wrapped onto,
+    /// not on its line's row — otherwise it drifts further off with every fold.
+    #[test]
+    fn soft_wrap_puts_the_cursor_on_its_wrapped_row() {
+        let mut editor = editor_with(&format!("{}\nnext\n", "x".repeat(200)));
+        // 80 columns less a 4-column gutter: rows start at chars 0, 76, 152.
+        editor.doc_mut().cursor = 100;
+        editor.ensure_cursor_visible();
+        assert_eq!(editor.screen_cursor(), Some((4 + 24, 1)));
+        editor.doc_mut().cursor = 160;
+        editor.ensure_cursor_visible();
+        assert_eq!(editor.screen_cursor(), Some((4 + 8, 2)));
+    }
+
+    /// Scrolling has to count rows, not lines: with every line folding in two,
+    /// a line-counting viewport thinks the cursor is on screen when it is a
+    /// screen and a half below it.
+    #[test]
+    fn scrolling_counts_wrapped_rows_not_lines() {
+        let long = "y".repeat(100);
+        let text = std::iter::repeat_n(long.as_str(), 30)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut editor = editor_with(&text);
+        let at = editor.doc().line_start(20);
+        editor.doc_mut().cursor = at;
+        editor.ensure_cursor_visible();
+        assert!(
+            editor.doc().view_line > 8,
+            "viewport still counting lines: {}",
+            editor.doc().view_line
+        );
+        assert!(
+            editor.screen_cursor().is_some(),
+            "cursor scrolled off screen"
+        );
+    }
+
+    /// A line taller than the whole window means the viewport has to be able
+    /// to start partway into a line, not just at one.
+    #[test]
+    fn the_viewport_can_park_inside_one_very_long_line() {
+        let mut editor = editor_with(&"z".repeat(4000));
+        editor.doc_mut().cursor = 3900;
+        editor.ensure_cursor_visible();
+        assert!(editor.doc().view_row > 0);
+        assert!(editor.screen_cursor().is_some());
+        editor.doc_mut().cursor = 0;
+        editor.ensure_cursor_visible();
+        assert_eq!((editor.doc().view_line, editor.doc().view_row), (0, 0));
+    }
+
+    #[test]
+    fn md_opens_a_live_preview_beside_the_text_and_closes_again() {
+        let mut editor = editor_with("# Title\n\nsome **bold** words\n");
+        press(&mut editor, "<space> m");
+        assert_eq!(editor.window_count(), 2);
+        assert!(editor.preview_win().is_some());
+        assert_ne!(
+            editor.preview_win(),
+            Some(editor.focused),
+            "focus belongs to the text, not the render"
+        );
+
+        editor.refresh_preview();
+        let rendered: String = editor
+            .preview
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(rendered.contains("TITLE"), "{rendered:?}");
+        assert!(rendered.contains("bold") && !rendered.contains('*'));
+
+        // Editing the buffer re-renders it.
+        press(&mut editor, "G");
+        press(&mut editor, "o");
+        for c in "## Added".chars() {
+            editor.handle_key(Key::char(c));
+        }
+        press(&mut editor, "<esc>");
+        editor.refresh_preview();
+        let rendered: String = editor
+            .preview
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(rendered.contains("Added"), "{rendered:?}");
+
+        press(&mut editor, "<space> m");
+        assert_eq!(editor.window_count(), 1);
+        assert!(editor.preview.is_none());
+    }
+
+    /// Focus must never land in the preview — it has no cursor to put there.
+    #[test]
+    fn window_cycling_skips_the_preview() {
+        let mut editor = editor_with("hi\n");
+        press(&mut editor, "<space> m");
+        let source = editor.focused;
+        editor.focus_next_window();
+        assert_eq!(editor.focused, source);
+        assert!(!editor.focus_window_dir(1, 0));
     }
 
     #[test]

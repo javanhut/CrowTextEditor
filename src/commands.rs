@@ -103,6 +103,10 @@ commands! {
     dep_upgrade => "rewrite this line's dependency to its latest version (package manifests)",
     next_buffer => "switch to the next buffer",
     prev_buffer => "switch to the previous buffer",
+    toggle_comment => "comment or uncomment the selected lines (gc)",
+    surround => "wrap the selection in a bracket or quote — ms then the character",
+    toggle_wrap => "turn soft wrapping of long lines on or off (:wrap)",
+    markdown_preview => "render this buffer as markdown in a live split (:md)",
     split_vertical => "split the window side by side",
     split_horizontal => "split the window stacked",
     next_window => "focus the next window",
@@ -1375,6 +1379,183 @@ fn prev_buffer(editor: &mut Editor) {
     editor.current = (editor.current + editor.documents.len() - 1) % editor.documents.len();
 }
 
+fn markdown_preview(editor: &mut Editor) {
+    editor.toggle_preview();
+}
+
+fn toggle_wrap(editor: &mut Editor) {
+    let on = crate::config::toggle_soft_wrap();
+    if !on {
+        editor.doc_mut().view_row = 0;
+    }
+    editor.set_status(if on { "soft wrap on" } else { "soft wrap off" });
+}
+
+/// The line-comment token for a buffer, or `None` where the language has no
+/// line comment (markdown, HTML) and this command has nothing honest to do.
+fn comment_token(doc: &Document) -> Option<&'static str> {
+    let ext = doc
+        .path
+        .as_ref()
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    Some(match ext {
+        "rs" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "mts" | "tsx" | "c" | "h" | "cpp" | "hpp"
+        | "cc" | "cxx" | "hh" | "go" | "java" | "cs" | "zig" | "odin" | "php" | "oxi" | "swift"
+        | "kt" | "scala" | "dart" => "//",
+        "py" | "sh" | "bash" | "zsh" | "yml" | "yaml" | "toml" | "rb" | "pl" | "r" | "nix"
+        | "gitignore" | "dockerfile" | "mk" => "#",
+        "lua" | "sql" | "hs" | "elm" => "--",
+        "vim" => "\"",
+        "el" | "lisp" | "clj" => ";",
+        _ => return None,
+    })
+}
+
+/// `gc` — comment the selected lines, or uncomment them when they already are.
+///
+/// The token goes in at the shallowest indent of the block, so a commented
+/// block keeps its shape instead of flattening to column zero.
+fn toggle_comment(editor: &mut Editor) {
+    let Some(token) = comment_token(editor.doc()) else {
+        editor.set_status("no line-comment syntax for this buffer");
+        return;
+    };
+    let doc = editor.doc();
+    let (from, to) = selection_range(doc);
+    let first = doc.text.char_to_line(from);
+    let last = doc
+        .text
+        .char_to_line(to.saturating_sub(1).max(from))
+        .min(doc.line_count().saturating_sub(1));
+
+    // (line, indent in chars, already commented)
+    let lines: Vec<(usize, usize, bool)> = (first..=last)
+        .filter_map(|l| {
+            let text: String = doc.line(l).chars().take(doc.line_len(l)).collect();
+            let indent = text.len() - text.trim_start().len();
+            (!text.trim().is_empty()).then(|| (l, indent, text.trim_start().starts_with(token)))
+        })
+        .collect();
+    if lines.is_empty() {
+        return;
+    }
+    let uncomment = lines.iter().all(|&(_, _, c)| c);
+    let column = lines.iter().map(|&(_, i, _)| i).min().unwrap_or(0);
+
+    let changes: Vec<(usize, usize, Option<String>)> = lines
+        .iter()
+        .map(|&(l, indent, _)| {
+            let start = doc.line_start(l);
+            if uncomment {
+                // Eat the token and the single space after it, if there is one.
+                let at = start + indent + token.chars().count();
+                let space = doc.text.get_char(at) == Some(' ');
+                (start + indent, at + usize::from(space), None)
+            } else {
+                (start + column, start + column, Some(format!("{token} ")))
+            }
+        })
+        .collect();
+
+    let tx = Transaction::change(&doc.text, changes);
+    let (cursor, anchor) = (tx.map_pos(doc.cursor, false), tx.map_pos(doc.anchor, false));
+    let doc = editor.doc_mut();
+    doc.apply(tx, cursor);
+    doc.anchor = anchor;
+    doc.commit_undo_group();
+    editor.keep_selection = true;
+}
+
+/// `ms` — arm the surround; the next key says what to wrap with.
+fn surround(editor: &mut Editor) {
+    editor.awaiting_surround = true;
+    // The selection is the whole point of the command, so it has to survive
+    // the keypress that only arms it.
+    editor.keep_selection = true;
+    editor.set_status("surround with: ( [ { < \" ' ` or any character");
+}
+
+/// Wrap the selection in `open` and its partner. Called by `handle_key` with
+/// the character typed after `ms`.
+pub fn surround_with(editor: &mut Editor, open: char) {
+    let close = match open {
+        '(' | ')' => ')',
+        '[' | ']' => ']',
+        '{' | '}' => '}',
+        '<' | '>' => '>',
+        c => c,
+    };
+    let open = match open {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        '>' => '<',
+        c => c,
+    };
+    let doc = editor.doc();
+    let (from, to) = selection_range(doc);
+    let tx = Transaction::change(
+        &doc.text,
+        [
+            (from, from, Some(open.to_string())),
+            (to, to, Some(close.to_string())),
+        ],
+    );
+    let doc = editor.doc_mut();
+    doc.apply(tx, from + 1);
+    doc.anchor = from;
+    doc.cursor = to + 1;
+    doc.commit_undo_group();
+    editor.keep_selection = true;
+    editor.set_status(format!("surrounded with {open}{close}"));
+}
+
+/// Cut whitespace hanging off the end of every line.
+///
+/// Never in markdown: two trailing spaces there are a hard line break, and
+/// silently deleting them rewrites the document.
+fn strip_trailing_whitespace(editor: &mut Editor) {
+    if !crate::config::strip_trailing_whitespace() {
+        return;
+    }
+    let ext = editor
+        .doc()
+        .path
+        .as_ref()
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    if matches!(ext.as_str(), "md" | "markdown") {
+        return;
+    }
+    let doc = editor.doc();
+    let mut changes = Vec::new();
+    for line in 0..doc.line_count() {
+        let start = doc.line_start(line);
+        let len = doc.line_len(line);
+        let slice = doc.line(line);
+        let mut at = len;
+        while at > 0 && matches!(slice.char(at - 1), ' ' | '\t') {
+            at -= 1;
+        }
+        if at < len {
+            changes.push((start + at, start + len, None));
+        }
+    }
+    if changes.is_empty() {
+        return;
+    }
+    let tx = Transaction::change(&doc.text, changes);
+    let cursor = tx.map_pos(doc.cursor, false);
+    let doc = editor.doc_mut();
+    doc.apply(tx, cursor);
+    doc.clamp_cursor(false);
+    doc.commit_undo_group();
+}
+
 fn split_vertical(editor: &mut Editor) {
     editor.split_window(true);
 }
@@ -1394,6 +1575,7 @@ fn save(editor: &mut Editor) {
 /// `force` waives the external-modification guard — that is `:w!`, which cannot
 /// be a registry entry because command names have to be Rust idents.
 pub fn save_with(editor: &mut Editor, force: bool) {
+    strip_trailing_whitespace(editor);
     // Format first; a broken formatter never blocks the write.
     let fmt_err = match crate::config::format_on_save().then(|| run_formatter(editor)) {
         Some(Some(Err(e))) => Some(e),
@@ -1433,6 +1615,91 @@ fn quit(editor: &mut Editor) {
 mod tests {
     use super::*;
     use crate::editor::tests::{editor_with, press};
+
+    /// A buffer that knows what language it is, so `gc` and the save-time
+    /// whitespace strip can tell a `//` file from a `#` one.
+    fn editor_named(text: &str, name: &str) -> Editor {
+        let mut editor = editor_with(text);
+        editor.doc_mut().path = Some(std::path::PathBuf::from(name));
+        editor
+    }
+
+    #[test]
+    fn gc_comments_a_block_and_takes_it_back_off() {
+        let mut editor = editor_named("fn a() {\n    let x = 1;\n}\n", "x.rs");
+        // Select the middle line and comment it.
+        press(&mut editor, "j");
+        press(&mut editor, "gc");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "fn a() {\n    // let x = 1;\n}\n"
+        );
+        press(&mut editor, "gc");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "fn a() {\n    let x = 1;\n}\n"
+        );
+    }
+
+    /// The token goes in at the block's shallowest indent, and a block that is
+    /// only partly commented gets commented rather than half-uncommented.
+    #[test]
+    fn gc_keeps_the_blocks_shape() {
+        let mut editor = editor_named("a\n    b\n\n  c\n", "x.py");
+        press(&mut editor, "V");
+        for _ in 0..3 {
+            press(&mut editor, "V");
+        }
+        press(&mut editor, "gc");
+        assert_eq!(editor.doc().text.to_string(), "# a\n#     b\n\n#   c\n");
+    }
+
+    #[test]
+    fn gc_says_so_when_the_language_has_no_line_comment() {
+        let mut editor = editor_named("hello\n", "notes.md");
+        press(&mut editor, "gc");
+        assert_eq!(editor.doc().text.to_string(), "hello\n");
+        assert!(editor.status.contains("no line-comment"));
+    }
+
+    #[test]
+    fn ms_wraps_the_selection_and_leaves_it_selected() {
+        let mut editor = editor_with("hello world\n");
+        press(&mut editor, "w"); // selects "hello "
+        press(&mut editor, "ms");
+        assert!(editor.awaiting_surround);
+        press(&mut editor, "(");
+        assert_eq!(editor.doc().text.to_string(), "(hello )world\n");
+        let doc = editor.doc();
+        assert_eq!((doc.anchor, doc.cursor), (0, 7));
+        // Undo takes the whole pair back in one step.
+        press(&mut editor, "u");
+        assert_eq!(editor.doc().text.to_string(), "hello world\n");
+    }
+
+    #[test]
+    fn a_closing_bracket_surrounds_with_the_same_pair() {
+        let mut editor = editor_with("ab cd\n");
+        press(&mut editor, "w"); // selects "ab "
+        press(&mut editor, "ms");
+        press(&mut editor, "]");
+        assert_eq!(editor.doc().text.to_string(), "[ab ]cd\n");
+    }
+
+    #[test]
+    fn writing_cuts_trailing_whitespace_but_never_in_markdown() {
+        let mut editor = editor_named("x = 1   \ny = 2\t\nz\n", "x.py");
+        strip_trailing_whitespace(&mut editor);
+        assert_eq!(editor.doc().text.to_string(), "x = 1\ny = 2\nz\n");
+        // One undo step, so a strip you didn't want is one `u` away.
+        press(&mut editor, "u");
+        assert_eq!(editor.doc().text.to_string(), "x = 1   \ny = 2\t\nz\n");
+
+        // Two trailing spaces in markdown are a hard line break, not litter.
+        let mut editor = editor_named("line  \n", "notes.md");
+        strip_trailing_whitespace(&mut editor);
+        assert_eq!(editor.doc().text.to_string(), "line  \n");
+    }
 
     #[test]
     fn vertical_motion_follows_the_display_column_not_the_char_index() {

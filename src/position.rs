@@ -59,6 +59,55 @@ pub fn display_col_to_char(line: RopeSlice, target_col: usize, tab_width: usize)
     line_len_without_newline(line)
 }
 
+/// Display width of the chars `from..to` of a line, measured as if the row
+/// started at column 0 — which is what a soft-wrapped row does.
+pub fn display_col_between(line: RopeSlice, from: usize, to: usize, tab_width: usize) -> usize {
+    let mut col = 0usize;
+    for c in line.chars_at(from).take(to.saturating_sub(from)) {
+        col += char_width(c, col, tab_width);
+    }
+    col
+}
+
+/// Char offsets within `line` where each soft-wrapped visual row begins.
+///
+/// Always starts with `0`, so a line that fits returns `[0]` and the count is
+/// the number of screen rows the line takes. Breaks after the last space that
+/// fits, and mid-word only when one word is wider than the window.
+pub fn wrap_offsets(line: RopeSlice, width: usize, tab_width: usize) -> Vec<usize> {
+    let mut offsets = vec![0usize];
+    if width == 0 {
+        return offsets;
+    }
+    let chars: Vec<char> = line.chars().take(line_len_without_newline(line)).collect();
+    let mut col = 0usize;
+    let mut row_start = 0usize;
+    // Offset just past the last space seen on this row — where a break would
+    // land without splitting a word.
+    let mut last_space: Option<usize> = None;
+
+    for (i, &c) in chars.iter().enumerate() {
+        let w = char_width(c, col, tab_width);
+        if col + w > width && i > row_start {
+            let brk = last_space.filter(|&b| b > row_start && b <= i).unwrap_or(i);
+            offsets.push(brk);
+            row_start = brk;
+            last_space = None;
+            // Re-lay what moved down onto the new row, tabs included.
+            col = chars[brk..i]
+                .iter()
+                .fold(0, |acc, &c| acc + char_width(c, acc, tab_width));
+            col += char_width(c, col, tab_width);
+        } else {
+            col += w;
+        }
+        if c == ' ' || c == '\t' {
+            last_space = Some(i + 1);
+        }
+    }
+    offsets
+}
+
 /// Length of a line in chars, not counting `\n` or `\r\n`.
 pub fn line_len_without_newline(line: RopeSlice) -> usize {
     let mut len = line.len_chars();
@@ -221,6 +270,30 @@ mod tests {
         assert_eq!(char_to_utf16(line, 2), 3);
         assert_eq!(utf16_to_char(line, 3), 2);
         assert_eq!(utf16_to_char(line, 1), 1);
+    }
+
+    #[test]
+    fn soft_wrap_breaks_at_spaces_and_splits_only_long_words() {
+        let rope = Rope::from_str("the quick brown fox\n");
+        // Rows: "the quick " / "brown fox"
+        assert_eq!(wrap_offsets(rope.line(0), 10, 4), vec![0, 10]);
+        // A word longer than the window has to be cut.
+        let rope = Rope::from_str("abcdefghijkl\n");
+        assert_eq!(wrap_offsets(rope.line(0), 5, 4), vec![0, 5, 10]);
+        // A line that fits is one row.
+        let rope = Rope::from_str("short\n");
+        assert_eq!(wrap_offsets(rope.line(0), 40, 4), vec![0]);
+        // Wide characters count double, so five of them fill six columns.
+        let rope = Rope::from_str("日本語です\n");
+        assert_eq!(wrap_offsets(rope.line(0), 6, 4), vec![0, 3]);
+    }
+
+    #[test]
+    fn wrapped_rows_measure_their_columns_from_the_row_start() {
+        let rope = Rope::from_str("the quick brown fox\n");
+        let line = rope.line(0);
+        // "brown fox" starts at char 10; "fox" is 6 columns into its own row.
+        assert_eq!(display_col_between(line, 10, 16, 4), 6);
     }
 
     #[test]

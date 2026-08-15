@@ -54,6 +54,10 @@ pub struct Document {
 
     /// First visible line.
     pub view_line: usize,
+    /// Visual row of `view_line` drawn first. Always 0 without soft wrap; with
+    /// it, a single line can be taller than the screen (one markdown paragraph
+    /// on one line), so the viewport has to be able to start inside a line.
+    pub view_row: usize,
     /// Horizontal scroll, in display columns.
     pub view_col: usize,
 
@@ -77,6 +81,7 @@ impl Document {
             modified: false,
             disk_mtime: None,
             view_line: 0,
+            view_row: 0,
             view_col: 0,
             history: Vec::new(),
             redo_stack: Vec::new(),
@@ -125,6 +130,50 @@ impl Document {
         self.syntax_dirty = false;
         let cached = self.syntax.as_ref().and_then(|s| s.config);
         self.syntax = crate::syntax::highlight(self.path.as_deref(), &self.text, cached);
+    }
+
+    /// Reparse after an edit, reusing the tree we already have.
+    ///
+    /// This is the difference between typing in a big file feeling instant and
+    /// feeling like a modem: a full reparse is O(file), an edited one is
+    /// O(change). The spans are only marked stale here — they get recollected
+    /// for whatever is on screen, in `highlight_range`.
+    fn edit_syntax(&mut self, before: &Rope, range: Option<(usize, usize, usize)>) {
+        let Some((start, old_end, new_end)) = range else {
+            return;
+        };
+        let mut syntax = self.syntax.take();
+        match syntax.as_mut() {
+            Some(s) => {
+                s.dirty = true;
+                if let (Some(config), Some(tree)) = (s.config, s.tree.as_mut()) {
+                    tree.edit(&crate::syntax::input_edit(
+                        before, &self.text, start, old_end, new_end,
+                    ));
+                    // A failed reparse leaves the edited tree in place: its
+                    // ranges are still right, only its shape is stale.
+                    if let Some(new) = crate::syntax::parse_tree(config, &self.text, Some(tree)) {
+                        s.tree = Some(new);
+                    }
+                }
+                self.syntax = syntax;
+            }
+            // No syntax yet (a scratch buffer that just got a path): try again.
+            None => self.refresh_syntax(),
+        }
+    }
+
+    /// Collect highlight spans for the lines `first..=last`, if they aren't
+    /// covered already. Called once per frame, before drawing.
+    pub fn highlight_range(&mut self, first_line: usize, last_line: usize) {
+        let Some(mut syntax) = self.syntax.take() else {
+            return;
+        };
+        let lines = self.text.len_lines();
+        let from = self.text.line_to_char(first_line.min(lines - 1));
+        let to = self.text.line_to_char((last_line + 1).min(lines - 1));
+        syntax.update(&self.text, from, to.max(from));
+        self.syntax = Some(syntax);
     }
 
     /// Write the buffer out, unless the file moved underneath us.
@@ -236,6 +285,70 @@ impl Document {
         (line, self.cursor - line_start)
     }
 
+    /// Screen rows a line takes. `wrap` is the soft-wrap width, or `None` when
+    /// long lines scroll sideways instead — then every line is one row.
+    pub fn visual_rows(&self, line: usize, wrap: Option<usize>) -> usize {
+        match wrap {
+            Some(w) => position::wrap_offsets(self.line(line), w, tab_width()).len(),
+            None => 1,
+        }
+    }
+
+    /// The cursor as (line, visual row within that line, display column within
+    /// that row). Without wrapping the row is always 0 and the column is the
+    /// line's own display column.
+    pub fn cursor_visual(&self, wrap: Option<usize>) -> (usize, usize, usize) {
+        let (line, col) = self.cursor_line_col();
+        let slice = self.line(line);
+        let Some(width) = wrap else {
+            return (
+                line,
+                0,
+                position::char_to_display_col(slice, col, tab_width()),
+            );
+        };
+        let offsets = position::wrap_offsets(slice, width, tab_width());
+        let row = offsets.partition_point(|&o| o <= col).saturating_sub(1);
+        (
+            line,
+            row,
+            position::display_col_between(slice, offsets[row], col, tab_width()),
+        )
+    }
+
+    /// Visual rows from `(line, row)` `a` forward to `b`, where `a <= b`.
+    pub fn rows_forward(&self, wrap: Option<usize>, a: (usize, usize), b: (usize, usize)) -> usize {
+        let mut n = 0isize;
+        for l in a.0..b.0.min(self.line_count()) {
+            n += self.visual_rows(l, wrap) as isize;
+        }
+        (n + b.1 as isize - a.1 as isize).max(0) as usize
+    }
+
+    /// Step the viewport `n` visual rows: down when positive, up when negative.
+    pub fn scroll_view(&mut self, wrap: Option<usize>, n: isize) {
+        let last = self.line_count().saturating_sub(1);
+        for _ in 0..n.unsigned_abs() {
+            if n > 0 {
+                if self.view_row + 1 < self.visual_rows(self.view_line, wrap) {
+                    self.view_row += 1;
+                } else if self.view_line < last {
+                    self.view_line += 1;
+                    self.view_row = 0;
+                } else {
+                    break;
+                }
+            } else if self.view_row > 0 {
+                self.view_row -= 1;
+            } else if self.view_line > 0 {
+                self.view_line -= 1;
+                self.view_row = self.visual_rows(self.view_line, wrap) - 1;
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Cursor as (line, display column).
     pub fn cursor_display(&self) -> (usize, usize) {
         let (line, col) = self.cursor_line_col();
@@ -287,6 +400,8 @@ impl Document {
 
         let inverse = tx.invert(&self.text);
         let cursor_before = self.cursor;
+        let range = tx.changed_range();
+        let before = self.text.clone(); // ropes are copy-on-write: this is cheap
 
         tx.apply(&mut self.text);
         self.cursor = new_cursor.min(self.text.len_chars());
@@ -319,7 +434,7 @@ impl Document {
         });
         self.redo_stack.clear();
         self.revision += 1;
-        self.refresh_syntax();
+        self.edit_syntax(&before, range);
     }
 
     /// Close the current undo group. The next edit starts a new one.
@@ -350,7 +465,10 @@ impl Document {
             .is_some_and(|entry| entry.group == target)
         {
             let entry = self.history.pop().unwrap();
+            let before = self.text.clone();
+            let range = entry.inverse.changed_range();
             entry.inverse.apply(&mut self.text);
+            self.edit_syntax(&before, range);
             self.cursor = entry.cursor_before.min(self.text.len_chars());
             self.anchor = self.cursor;
             self.redo_stack.push(entry);
@@ -361,7 +479,6 @@ impl Document {
         // Any further edit must not join the group we just undid.
         self.group += 1;
         self.revision += 1;
-        self.refresh_syntax();
         true
     }
 
@@ -378,7 +495,10 @@ impl Document {
             .is_some_and(|entry| entry.group == target)
         {
             let entry = self.redo_stack.pop().unwrap();
+            let before = self.text.clone();
+            let range = entry.forward.changed_range();
             entry.forward.apply(&mut self.text);
+            self.edit_syntax(&before, range);
             self.cursor = entry.cursor_after.min(self.text.len_chars());
             self.anchor = self.cursor;
             self.history.push(entry);
@@ -387,7 +507,6 @@ impl Document {
         self.modified = true;
         self.goal_col = None;
         self.revision += 1;
-        self.refresh_syntax();
         true
     }
 
@@ -634,5 +753,51 @@ mod tests {
         d.cursor = 3;
         d.clamp_cursor(true);
         assert_eq!(d.cursor, 3);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// The whole point of the incremental path, as a number.
+    ///
+    /// Self-calibrating rather than an absolute millisecond budget, so it
+    /// means the same thing on a slow machine: an edit plus colouring one
+    /// screenful must cost a fraction of what re-parsing the file costs.
+    /// Ignored by default — it is a benchmark, and it takes a second.
+    #[test]
+    #[ignore]
+    fn editing_beats_reparsing_the_file() {
+        let big: String = std::iter::repeat_n(include_str!("editor.rs"), 4).collect();
+        let mut doc = Document {
+            text: Rope::from_str(&big),
+            path: Some(PathBuf::from("big.rs")),
+            ..Document::empty()
+        };
+        doc.refresh_syntax();
+        doc.cursor = doc.text.len_chars() / 2;
+        eprintln!("{} lines, {} KB", doc.line_count(), big.len() / 1024);
+
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            doc.insert_at_cursor("x");
+            let line = doc.cursor_line();
+            doc.highlight_range(line, line + 40); // what a frame asks for
+        }
+        let edit = start.elapsed() / 100;
+
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            doc.insert_at_cursor("x");
+            doc.refresh_syntax();
+        }
+        let full = start.elapsed() / 10;
+
+        eprintln!("edit {edit:?} vs full reparse {full:?}");
+        assert!(
+            edit * 10 < full,
+            "incremental parsing lost its advantage: {edit:?} vs {full:?}"
+        );
     }
 }
