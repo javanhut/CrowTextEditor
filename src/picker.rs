@@ -147,7 +147,10 @@ impl Picker {
             self.items = if self.query.chars().count() < 2 {
                 Vec::new() // one char would light up the whole repo
             } else {
-                grep_corpus(corpus.get_or_insert_with(|| read_project(root)), &self.query)
+                grep_corpus(
+                    corpus.get_or_insert_with(|| read_project(root)),
+                    &self.query,
+                )
             };
             self.filtered = (0..self.items.len()).collect();
             self.selected = 0;
