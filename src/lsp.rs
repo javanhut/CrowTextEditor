@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
 use serde_json::{json, Value};
 
@@ -43,7 +43,10 @@ pub struct Client {
     /// documents are routed only to their own language's server.
     command: String,
     child: Child,
-    stdin: ChildStdin,
+    /// Outgoing messages, handed to a writer thread. A pipe holds ~64 KB, and
+    /// `didChange` sends the whole buffer — writing from the main loop meant a
+    /// server that stopped reading for a moment froze the editor with it.
+    tx_out: Sender<String>,
     rx: Receiver<Value>,
     next_id: i64,
     pending: HashMap<i64, &'static str>,
@@ -72,7 +75,7 @@ impl Client {
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
-        let stdin = child.stdin.take()?;
+        let mut stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
 
         let (tx, rx) = channel();
@@ -85,10 +88,21 @@ impl Client {
             }
         });
 
+        let (tx_out, rx_out) = channel::<String>();
+        std::thread::spawn(move || {
+            while let Ok(body) = rx_out.recv() {
+                if write!(stdin, "Content-Length: {}\r\n\r\n{body}", body.len()).is_err()
+                    || stdin.flush().is_err()
+                {
+                    break; // server gone; `poll` notices via the reader thread
+                }
+            }
+        });
+
         let mut client = Client {
             command: command.to_string(),
             child,
-            stdin,
+            tx_out,
             rx,
             next_id: 0,
             pending: HashMap::new(),
@@ -123,9 +137,7 @@ impl Client {
     // ---- outgoing ----------------------------------------------------------
 
     fn write(&mut self, msg: &Value) {
-        let body = msg.to_string();
-        let _ = write!(self.stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body);
-        let _ = self.stdin.flush();
+        let _ = self.tx_out.send(msg.to_string());
     }
 
     /// Send now if the handshake is done, otherwise queue.

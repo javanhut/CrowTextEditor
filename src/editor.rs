@@ -440,6 +440,9 @@ pub struct Editor {
     /// `completion` for a trigger character the user typed, `completion_typed`
     /// for the ambient one that follows an identifier being typed.
     lsp_completion_pending: Option<&'static str>,
+    /// When the last key landed. `didChange` ships the whole buffer, so it
+    /// waits for a pause in typing rather than firing on every keystroke.
+    last_key_at: std::time::Instant,
     /// A bare `d`, `x` or `c` was pressed (with its count): pressing the same
     /// key again runs that key's line op.
     pub pending_line_op: Option<(char, usize)>,
@@ -528,6 +531,11 @@ impl Editor {
             keymaps,
             lsp_table: config.lsp.clone(),
             lsp_completion_pending: None,
+            // Backdated, so the buffers opened on the command line are
+            // coloured for the very first frame rather than one gap later.
+            last_key_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now),
             pending_line_op: None,
             hover: None,
             pending_install: None,
@@ -780,6 +788,7 @@ impl Editor {
     }
 
     pub fn handle_key(&mut self, key: Key) {
+        self.last_key_at = std::time::Instant::now();
         // An armed install offer eats exactly one key: y runs it, anything
         // else declines and the key is not replayed.
         if let Some((program, cmd)) = self.pending_install.take() {
@@ -1670,7 +1679,7 @@ impl Editor {
                 self.set_status(format!("theme: {label}"));
             }
             Kind::Files { root } => self.jump_to(root.join(label), 0, 0),
-            Kind::Grep { root } => {
+            Kind::Grep { root, .. } => {
                 if let Some((path, line)) = label.rsplit_once(':') {
                     let line = line.parse::<usize>().unwrap_or(1).saturating_sub(1);
                     self.jump_to(root.join(path), line, 0);
@@ -2243,7 +2252,14 @@ impl Editor {
     /// Drains language-server messages. Returns true when anything on screen
     /// may have changed, so the main loop knows a redraw is needed.
     pub fn lsp_tick(&mut self) -> bool {
-        self.lsp_sync();
+        // `didChange` serialises the entire buffer to JSON and writes it down a
+        // pipe. Hold it until typing pauses — unless a completion is owed, and
+        // then the server has to see the edit that prompted it first.
+        if self.lsp_completion_pending.is_some()
+            || self.last_key_at.elapsed() >= std::time::Duration::from_millis(120)
+        {
+            self.lsp_sync();
+        }
         if let Some(tag) = self.lsp_completion_pending.take() {
             if self.mode == Mode::Insert {
                 if let Some(path) = self.doc().path.clone() {
@@ -2650,6 +2666,26 @@ impl Editor {
         doc.anchor = doc.cursor;
         doc.clamp_cursor(false);
         doc.goal_col = None;
+    }
+
+    /// Whether any buffer is owed a reparse.
+    pub fn needs_reparse(&self) -> bool {
+        self.documents.iter().any(Document::syntax_stale)
+    }
+
+    /// Whether nothing has been typed for `gap`.
+    pub fn idle_for(&self, gap: std::time::Duration) -> bool {
+        self.last_key_at.elapsed() >= gap
+    }
+
+    /// Recolor the stale buffers. A reparse is a whole-file tree-sitter pass —
+    /// tens of milliseconds on a big file — so the main loop holds this until
+    /// typing pauses, and draws the edits with the old spans slid through them
+    /// in the meantime.
+    pub fn settle(&mut self) {
+        for doc in &mut self.documents {
+            doc.settle_syntax();
+        }
     }
 
     // ---- scrolling ---------------------------------------------------------

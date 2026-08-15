@@ -38,6 +38,8 @@ pub struct Document {
     pub extra: Vec<(usize, usize)>,
     /// Tree-sitter state, when the file's language has a grammar.
     pub syntax: Option<crate::syntax::Syntax>,
+    /// `syntax` is stale and must be rebuilt before anything reads it.
+    syntax_dirty: bool,
     /// Bumped on every text change; lets the LSP layer notice edits.
     pub revision: u64,
     /// Sticky display column for vertical motion, so moving down through a
@@ -69,6 +71,7 @@ impl Document {
             anchor: 0,
             extra: Vec::new(),
             syntax: None,
+            syntax_dirty: false,
             revision: 0,
             goal_col: None,
             modified: false,
@@ -101,8 +104,25 @@ impl Document {
         Ok(doc)
     }
 
-    /// (Re)color the buffer if its language has a grammar or a fallback lexer.
+    /// Mark the buffer's coloring stale. The parse itself is deferred to
+    /// `settle_syntax`, because it is a full-file tree-sitter reparse and
+    /// doing one per keystroke is what made typing lag behind the keyboard.
     pub fn refresh_syntax(&mut self) {
+        self.syntax_dirty = true;
+    }
+
+    /// Whether a reparse is owed.
+    pub fn syntax_stale(&self) -> bool {
+        self.syntax_dirty
+    }
+
+    /// Rebuild the coloring if it is stale. Called once per frame, and by the
+    /// one command that reads the tree rather than the spans.
+    pub fn settle_syntax(&mut self) {
+        if !self.syntax_dirty {
+            return;
+        }
+        self.syntax_dirty = false;
         let cached = self.syntax.as_ref().and_then(|s| s.config);
         self.syntax = crate::syntax::highlight(self.path.as_deref(), &self.text, cached);
     }
@@ -276,6 +296,17 @@ impl Document {
             *a = tx.map_pos(*a, false);
             *c = tx.map_pos(*c, false);
         }
+        // Slide the existing highlight spans through the edit, exactly as the
+        // cursors just were. The reparse that replaces them waits for a gap in
+        // typing, and until it lands these keep every colour on the text it
+        // belongs to instead of one character behind it.
+        if let Some(syntax) = &mut self.syntax {
+            for (start, end, _) in &mut syntax.spans {
+                *start = tx.map_pos(*start, true);
+                *end = tx.map_pos(*end, false);
+            }
+            syntax.spans.retain(|&(start, end, _)| start < end);
+        }
         self.modified = true;
         self.goal_col = None;
 
@@ -438,6 +469,25 @@ mod tests {
             text: Rope::from_str(s),
             ..Document::empty()
         }
+    }
+
+    #[test]
+    fn editing_defers_the_reparse_until_it_is_settled() {
+        let mut d = Document {
+            path: Some("t.rs".into()),
+            ..doc("")
+        };
+        d.insert_at_cursor("fn main() {}");
+        // The edit only flagged the buffer; nothing has been parsed yet.
+        assert!(d.syntax.is_none());
+        d.settle_syntax();
+        assert!(
+            d.syntax.as_ref().is_some_and(|s| !s.spans.is_empty()),
+            "settling colors the buffer"
+        );
+        // Settling again with no edit is a no-op, and keeps the colors.
+        d.settle_syntax();
+        assert!(d.syntax.as_ref().is_some_and(|s| !s.spans.is_empty()));
     }
 
     #[test]

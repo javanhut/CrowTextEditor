@@ -386,6 +386,7 @@ fn select_line(editor: &mut Editor) {
 /// token, expression, statement, block, item — one keypress per level.
 fn expand_selection(editor: &mut Editor) {
     editor.keep_selection = true;
+    editor.doc_mut().settle_syntax(); // this one reads the tree, not the spans
     let range = {
         let doc = editor.doc();
         let len = doc.text.len_chars();

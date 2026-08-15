@@ -22,7 +22,13 @@ pub enum Kind {
     /// Browse a directory: Enter descends into `dir/label` or opens a file.
     Explorer { dir: PathBuf },
     /// Live content search: the query greps files, labels are `path:line`.
-    Grep { root: PathBuf },
+    /// `corpus` is the project read into memory on the first query, so typing
+    /// searches memory instead of re-walking and re-reading the whole tree on
+    /// every keystroke.
+    Grep {
+        root: PathBuf,
+        corpus: Option<Vec<GrepFile>>,
+    },
     /// Recently opened files; labels are absolute paths (`~`-shortened).
     Recent,
 }
@@ -128,6 +134,7 @@ impl Picker {
             "grep",
             Kind::Grep {
                 root: root.to_path_buf(),
+                corpus: None,
             },
             Vec::new(),
         )
@@ -136,8 +143,12 @@ impl Picker {
     /// React to a query change: Grep pickers re-search file contents, every
     /// other kind fuzzy-refilters its fixed item list.
     pub fn requery(&mut self) {
-        if let Kind::Grep { root } = &self.kind {
-            self.items = grep_files(root, &self.query);
+        if let Kind::Grep { root, corpus } = &mut self.kind {
+            self.items = if self.query.chars().count() < 2 {
+                Vec::new() // one char would light up the whole repo
+            } else {
+                grep_corpus(corpus.get_or_insert_with(|| read_project(root)), &self.query)
+            };
             self.filtered = (0..self.items.len()).collect();
             self.selected = 0;
         } else {
@@ -146,13 +157,14 @@ impl Picker {
     }
 
     pub fn refilter(&mut self) {
+        let query = self.query.to_lowercase();
         let mut scored: Vec<(i64, usize)> = self
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, item)| fuzzy_score(&self.query, &item.label).map(|s| (s, i)))
+            .filter_map(|(i, item)| score_lowered(&query, &item.label).map(|s| (s, i)))
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         self.filtered = scored.into_iter().map(|(_, i)| i).collect();
         self.selected = 0;
     }
@@ -173,35 +185,48 @@ impl Picker {
 /// Subsequence fuzzy match: every query char must appear in order.
 /// Consecutive hits and word starts score higher; shorter targets win ties.
 pub fn fuzzy_score(query: &str, target: &str) -> Option<i64> {
-    if query.is_empty() {
-        return Some(0);
-    }
-    let chars: Vec<char> = target.to_lowercase().chars().collect();
-    let mut score = 0i64;
-    let mut pos = 0usize;
-    let mut last_hit: Option<usize> = None;
+    score_lowered(&query.to_lowercase(), target)
+}
 
-    for qc in query.to_lowercase().chars() {
-        let mut hit = None;
-        while pos < chars.len() {
-            if chars[pos] == qc {
-                hit = Some(pos);
-                break;
+/// `fuzzy_score` with the query already lowercased, so filtering a 5000-item
+/// list does that once instead of once per item. Neither side is collected
+/// into a buffer — this used to allocate two Strings and a `Vec<char>` per
+/// item per keystroke, which is what made the file picker feel gluey.
+fn score_lowered(query: &str, target: &str) -> Option<i64> {
+    let mut wanted = query.chars();
+    let Some(mut want) = wanted.next() else {
+        return Some(0);
+    };
+
+    let mut score = 0i64;
+    let mut len = 0usize;
+    let mut prev: Option<char> = None;
+    let mut last_hit: Option<usize> = None;
+    let mut matched = false;
+
+    for (i, c) in target.chars().enumerate() {
+        len += 1;
+        // `to_lowercase` yields a sequence for a few characters; the first one
+        // is what the old `String`-building version compared against too.
+        let c = c.to_lowercase().next().unwrap_or(c);
+        if !matched && c == want {
+            score += 1;
+            if last_hit == Some(i.wrapping_sub(1)) {
+                score += 3; // consecutive
             }
-            pos += 1;
+            if prev.is_none_or(|p| !p.is_alphanumeric()) {
+                score += 2; // word start
+            }
+            last_hit = Some(i);
+            match wanted.next() {
+                Some(next) => want = next,
+                None => matched = true,
+            }
         }
-        let i = hit?;
-        score += 1;
-        if last_hit == Some(i.wrapping_sub(1)) {
-            score += 3; // consecutive
-        }
-        if i == 0 || !chars[i - 1].is_alphanumeric() {
-            score += 2; // word start
-        }
-        last_hit = Some(i);
-        pos = i + 1;
+        prev = Some(c);
     }
-    Some(score - (target.chars().count() as i64) / 8)
+
+    matched.then(|| score - (len as i64) / 8)
 }
 
 /// Every file under `root`, relative paths, skipping hidden entries and
@@ -226,7 +251,9 @@ fn list_files(root: &Path) -> Vec<String> {
                 continue;
             }
             let path = entry.path();
-            if path.is_dir() {
+            // `file_type()` comes off the directory entry on every platform we
+            // run on; `path.is_dir()` would be another stat per file.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
                 stack.push(path);
             } else {
                 out.push(
@@ -242,23 +269,56 @@ fn list_files(root: &Path) -> Vec<String> {
     out
 }
 
-/// Case-insensitive substring search over every project file.
-/// ponytail: a synchronous rescan per keystroke, capped at 100 hits; a
-/// background ripgrep-style walker when big repos itch.
-fn grep_files(root: &Path, query: &str) -> Vec<Item> {
-    if query.chars().count() < 2 {
-        return Vec::new(); // one char would light up the whole repo
-    }
-    let query = query.to_lowercase();
+/// One file in the grep corpus: its path relative to the root, its text, and
+/// a lowercased copy of that text to match against. Lowercasing once here is
+/// what turns the search from "re-read and re-fold the whole repo per
+/// keystroke" into a `contains` over memory.
+pub struct GrepFile {
+    rel: String,
+    text: String,
+    lower: String,
+}
+
+/// Read the project in once, for as long as the grep picker is open.
+///
+/// ponytail: capped at 16 MB of source and read on the main thread, so the
+/// first query in a huge repo pauses once; a background ripgrep-style walker
+/// is the upgrade when that itches.
+fn read_project(root: &Path) -> Vec<GrepFile> {
+    const BUDGET: usize = 16 << 20;
+    let mut used = 0usize;
     let mut out = Vec::new();
     for rel in list_files(root) {
         let Ok(text) = std::fs::read_to_string(root.join(&rel)) else {
             continue; // binary or unreadable
         };
-        for (i, line) in text.lines().enumerate() {
-            if line.to_lowercase().contains(&query) {
+        used += text.len();
+        out.push(GrepFile {
+            rel,
+            lower: text.to_lowercase(),
+            text,
+        });
+        if used >= BUDGET {
+            break;
+        }
+    }
+    out
+}
+
+/// Case-insensitive substring search over the in-memory corpus, capped at 100
+/// hits so a common word does not build a list nobody will scroll.
+fn grep_corpus(corpus: &[GrepFile], query: &str) -> Vec<Item> {
+    let query = query.to_lowercase();
+    let mut out = Vec::new();
+    for file in corpus {
+        // One pass to rule the file out, instead of walking its lines.
+        if !file.lower.contains(&query) {
+            continue;
+        }
+        for (i, (line, lower)) in file.text.lines().zip(file.lower.lines()).enumerate() {
+            if lower.contains(&query) {
                 out.push(Item {
-                    label: format!("{rel}:{}", i + 1),
+                    label: format!("{}:{}", file.rel, i + 1),
                     detail: line.trim().to_string(),
                 });
                 if out.len() >= 100 {

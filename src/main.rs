@@ -14,9 +14,10 @@ mod theme;
 mod transaction;
 mod ui;
 
-use std::io::{stdout, Write};
+use std::io::{stdout, BufWriter, Write};
 use std::panic;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
 use crossterm::terminal::{
@@ -78,44 +79,68 @@ fn main() -> std::io::Result<()> {
 
     let result = run(&mut editor);
 
+    // Give the terminal back first: killing and reaping the language servers
+    // is the last thing `:q` does, and nobody should watch it happen.
     restore_terminal()?;
+    editor.shutdown_lsps();
     result
 }
 
+/// How many queued events one iteration will absorb before it has to draw.
+/// Key repeat can outrun the renderer indefinitely; without a ceiling the
+/// screen would never update while a key is held.
+const MAX_BURST: usize = 512;
+
+/// How long typing has to pause before the buffer is recolored. Short enough
+/// that a keyword lights up as you finish the word, long enough that a full
+/// reparse never lands between two keystrokes.
+const REPARSE_GAP: Duration = Duration::from_millis(20);
+
+/// How long an idle loop blocks waiting for input. The ceiling on how late a
+/// language-server message can show up.
+const IDLE_POLL: Duration = Duration::from_millis(100);
+
 fn run(editor: &mut Editor) -> std::io::Result<()> {
-    let mut out = stdout();
+    // A frame is tens of kilobytes of escape sequences. Bare `stdout()` is
+    // line-buffered, so it turns that into a syscall every kilobyte or so;
+    // one big buffer makes it a single write.
+    let mut out = BufWriter::with_capacity(1 << 20, stdout());
     // Repaint only when state actually changed; redrawing the whole screen
     // on every idle poll tick is what made the cursor and text flicker.
     let mut dirty = true;
 
     loop {
-        if dirty {
-            editor.ensure_cursor_visible();
-            ui::render(editor, &mut out)?;
-            dirty = false;
-        }
-
-        // Poll instead of block, so language-server messages arriving while
-        // idle still get drained and drawn.
-        if event::poll(std::time::Duration::from_millis(100))? {
+        // Drain everything the terminal already has before drawing anything.
+        // Key repeat and fast typing arrive as a burst, and rendering (plus
+        // reparsing, plus syncing the language server) once per key in that
+        // burst is what makes the editor lag a whole word behind the keyboard.
+        let mut burst = 0;
+        while burst < MAX_BURST && event::poll(Duration::ZERO)? {
             match event::read()? {
                 Event::Key(ev) => {
                     if let Some(key) = Key::from_crossterm(ev) {
                         editor.handle_key(key);
                         dirty = true;
+                        burst += 1;
                     }
                 }
                 Event::Paste(text) => {
                     editor.handle_paste(&text);
                     dirty = true;
+                    burst += 1;
                 }
                 Event::Resize(cols, rows) => {
                     editor.size = (cols, rows);
                     dirty = true;
+                    burst += 1;
                 }
                 _ => {}
             }
+            if editor.should_quit {
+                break;
+            }
         }
+
         if editor.lsp_tick() {
             dirty = true;
         }
@@ -129,9 +154,29 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
         if editor.should_quit {
             break;
         }
+
+        // Recolor in the gaps between keystrokes, never in the middle of one:
+        // a reparse is a whole-file tree-sitter pass, and edits carry the old
+        // spans along so the frames before it are drawn correctly anyway.
+        let reparse_due = editor.needs_reparse();
+        if reparse_due && editor.idle_for(REPARSE_GAP) {
+            editor.settle();
+            dirty = true;
+        }
+
+        if dirty {
+            editor.ensure_cursor_visible();
+            ui::render(editor, &mut out)?;
+            dirty = false;
+        }
+
+        // Up to date and nothing queued: wait for input instead of spinning,
+        // but wake up regularly so language-server messages arriving while
+        // idle still get drained and drawn — and sooner when a recolor is owed.
+        let wait = if reparse_due { REPARSE_GAP } else { IDLE_POLL };
+        event::poll(wait)?;
     }
 
-    editor.shutdown_lsps();
     Ok(())
 }
 
