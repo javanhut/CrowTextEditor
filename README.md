@@ -112,7 +112,7 @@ an emoji ZWJ sequence or a combining stack.
 
 |                                    |                                                                                                                                                                                                                                             |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `h` `j` `k` `l`                    | move, collapsing the selection (arrows work too); `h` wraps to the previous line                                                                                                                                                            |
+| `h` `j` `k` `l`                    | move, collapsing the selection (arrows work too); `h`/`l` wrap to the previous/next line                                                                                                                                                    |
 | `%`                                | jump to the bracket matching the one under the cursor; the match also glows whenever the cursor sits on a bracket                                                                                                                           |
 | `w` `b` `e`                        | select to next word / previous word / word end                                                                                                                                                                                              |
 | `V`                                | select (highlight) the line; repeat to extend                                                                                                                                                                                               |
@@ -149,6 +149,7 @@ an emoji ZWJ sequence or a combining stack.
 | `space d`                          | directory browser picker (Enter descends, Backspace goes up)                                                                                                                                                                                |
 | `space t`                          | theme picker with live preview                                                                                                                                                                                                              |
 | `:w` `:q` `:wq` `:q!` `:e f` `:42` | ex commands                                                                                                                                                                                                                                 |
+| `:%s/pat/repl/g`                   | substitute: `%` = whole buffer (omit for the cursor line), `g` = every match (omit for first per line), `i` = ignore case; pattern is a regex with `\1` groups                                                                              |
 
 Any command in the registry is also callable by name, so `:join_lines` works.
 

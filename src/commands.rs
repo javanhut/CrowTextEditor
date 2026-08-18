@@ -30,7 +30,7 @@ macro_rules! commands {
 
 commands! {
     move_left => "move one character left, wrapping to the previous line",
-    move_right => "move one character right",
+    move_right => "move one character right, wrapping to the next line",
     move_up => "move one line up",
     move_down => "move one line down",
     move_line_start => "move to the start of the line",
@@ -165,6 +165,10 @@ pub fn help_lines(keymap: &crate::keymap::KeyTrie) -> Vec<HelpLine> {
             "edit crow.toml / reload it (restarts language servers if [lsp] changed)",
         ),
         (":<number>", "jump to that line"),
+        (
+            ":%s/pat/repl/g",
+            "substitute: % = whole buffer (else the cursor line), g = every match (else first per line), i = ignore case",
+        ),
         (":help  :h", "this window"),
         (":<command>", "run any command below by name"),
     ] {
@@ -244,9 +248,17 @@ fn move_right(editor: &mut Editor) {
     let past_end = editor.mode == Mode::Insert;
     let doc = editor.doc_mut();
     for _ in 0..count {
-        doc.cursor = position::next_grapheme_boundary(doc.text.slice(..), doc.cursor);
+        let line = doc.cursor_line();
+        let next = position::next_grapheme_boundary(doc.text.slice(..), doc.cursor);
+        if !past_end && next == doc.line_end(line) && line + 1 < doc.line_count() {
+            // Normal mode can't sit on the newline: stepping right off the
+            // line's last char crosses onto the next line's first char.
+            doc.cursor = doc.line_start(line + 1);
+        } else {
+            doc.cursor = next;
+            doc.clamp_cursor(past_end);
+        }
     }
-    doc.clamp_cursor(past_end);
     doc.goal_col = None;
 }
 

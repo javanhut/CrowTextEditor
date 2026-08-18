@@ -229,6 +229,20 @@ impl Layout {
     }
 }
 
+/// A parsed `:s/pat/repl/flags` ex command (see `parse_substitute`).
+pub struct Substitute {
+    /// `%s` substitutes in the whole buffer, `s` on the cursor line only.
+    pub whole_buffer: bool,
+    pub pattern: String,
+    pub replacement: String,
+    /// `g` flag: every match, not just the first on each line.
+    pub global: bool,
+    /// `i` flag: case-insensitive matching.
+    pub insensitive: bool,
+    /// The command looked like `:s` but had no pattern/replacement separator.
+    pub malformed: bool,
+}
+
 pub struct Keymaps {
     pub normal: KeyTrie,
     pub insert: KeyTrie,
@@ -1388,6 +1402,13 @@ impl Editor {
             return;
         }
 
+        // :s and :%s are parsed whole — their arguments are delimited, not
+        // whitespace-separated, and the pattern may well contain spaces.
+        if let Some(sub) = Self::parse_substitute(line) {
+            self.substitute(sub);
+            return;
+        }
+
         let mut parts = line.split_whitespace();
         let cmd = parts.next().unwrap_or("");
         let arg = parts.next();
@@ -1481,6 +1502,115 @@ impl Editor {
                 }
             }
         }
+    }
+
+    /// `:s/pat/repl/flags` parsed into its pieces. Returns `None` when the
+    /// line isn't a substitute command at all.
+    ///
+    /// The `%` prefix widens the scope from the cursor line to the whole
+    /// buffer. The delimiter is whatever non-alphanumeric character follows
+    /// the `s` (`/`, `#`, …) and can be used literally inside the pattern or
+    /// replacement by escaping it (`\/`); a bare `\` elsewhere is left alone
+    /// so regex classes like `\d` survive. Flags: `g` replaces every match
+    /// (default: the first on each line), `i` ignores case.
+    fn parse_substitute(line: &str) -> Option<Substitute> {
+        let (whole_buffer, rest) = match line.strip_prefix('%') {
+            Some(rest) => (true, rest),
+            None => (false, line),
+        };
+        let rest = rest.strip_prefix('s')?;
+        let delim = rest.chars().next()?;
+        if delim.is_alphanumeric() || delim.is_whitespace() {
+            // ":search"-like words are not :s.
+            return None;
+        }
+        let mut fields: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut chars = rest[delim.len_utf8()..].chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' && chars.peek() == Some(&delim) {
+                chars.next();
+                cur.push(delim);
+            } else if c == delim {
+                fields.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(c);
+            }
+        }
+        // A trailing delimiter is optional: fields is [pat], [pat, repl] or
+        // [pat, repl, flags].
+        fields.push(cur);
+        if fields.len() < 2 {
+            return Some(Substitute {
+                whole_buffer,
+                pattern: String::new(),
+                replacement: String::new(),
+                global: false,
+                insensitive: false,
+                malformed: true,
+            });
+        }
+        let flags = fields.get(2).cloned().unwrap_or_default();
+        Some(Substitute {
+            whole_buffer,
+            pattern: fields[0].clone(),
+            replacement: fields[1].clone(),
+            global: flags.contains('g'),
+            insensitive: flags.contains('i'),
+            malformed: false,
+        })
+    }
+
+    /// Run a parsed `:s`/`:%s`: one transaction over every match, so the
+    /// whole substitute is a single undo step.
+    fn substitute(&mut self, sub: Substitute) {
+        if sub.malformed {
+            self.set_status("Usage: :s/pat/repl/[g]  (%s for the whole buffer)");
+            return;
+        }
+        // An empty pattern repeats the last search, as in vim.
+        let pat = if sub.pattern.is_empty() {
+            self.last_search.clone()
+        } else {
+            sub.pattern
+        };
+        if pat.is_empty() {
+            self.set_status("no previous search pattern");
+            return;
+        }
+        let doc = self.doc_mut();
+        let scope = if sub.whole_buffer {
+            0..doc.text.len_chars()
+        } else {
+            let line = doc.cursor_line();
+            doc.line_start(line)..doc.line_end(line)
+        };
+        let changes = search::substitutions(
+            &doc.text,
+            scope,
+            &pat,
+            &sub.replacement,
+            sub.global,
+            sub.insensitive,
+        );
+        if changes.is_empty() {
+            self.set_status(format!("pattern not found: {pat}"));
+            return;
+        }
+        let n = changes.len();
+        let tx = crate::transaction::Transaction::change(
+            &doc.text,
+            changes.into_iter().map(|(f, t, r)| (f, t, Some(r))),
+        );
+        let cursor = tx.map_pos(doc.cursor, false);
+        doc.apply(tx, cursor);
+        doc.clamp_cursor(false);
+        doc.commit_undo_group();
+        self.last_search = pat;
+        self.set_status(format!(
+            "{n} substitution{}",
+            if n == 1 { "" } else { "s" }
+        ));
     }
 
     /// `:config!` — re-read crow.toml and install as much of it as can be
@@ -3538,6 +3668,77 @@ pub(crate) mod tests {
         // At the very start there is nowhere left to go.
         press(&mut editor, "h");
         assert_eq!(editor.doc().cursor, 0);
+    }
+
+    #[test]
+    fn l_wraps_onto_the_next_line() {
+        let mut editor = editor_with("ab\ncd\nef");
+        // From the last char of "ab", l lands on the first char of "cd".
+        editor.doc_mut().cursor = 1;
+        press(&mut editor, "l");
+        assert_eq!(editor.doc().cursor, 3);
+        // Repeated l keeps wrapping through an empty line.
+        let mut editor = editor_with("ab\n\ncd");
+        editor.doc_mut().cursor = 1;
+        press(&mut editor, "l");
+        assert_eq!(editor.doc().cursor, 3); // the empty line
+        press(&mut editor, "l");
+        assert_eq!(editor.doc().cursor, 4);
+        // On the last char of the last line there is nowhere right to go.
+        press(&mut editor, "l");
+        assert_eq!(editor.doc().cursor, 5);
+        press(&mut editor, "l");
+        assert_eq!(editor.doc().cursor, 5);
+    }
+
+    #[test]
+    fn percent_s_substitutes_in_the_whole_buffer_as_one_undo_step() {
+        let mut editor = editor_with("foo bar\nfoo baz\nfoo");
+        press(&mut editor, ":%s/foo/quux/g <enter>");
+        assert_eq!(editor.doc().text.to_string(), "quux bar\nquux baz\nquux");
+        assert_eq!(editor.status, "3 substitutions");
+        press(&mut editor, "u");
+        assert_eq!(editor.doc().text.to_string(), "foo bar\nfoo baz\nfoo");
+    }
+
+    #[test]
+    fn s_without_percent_or_g_replaces_the_first_match_on_the_cursor_line() {
+        let mut editor = editor_with("foo foo\nfoo foo");
+        editor.doc_mut().cursor = 8; // line 1
+        press(&mut editor, ":s/foo/bar <enter>");
+        assert_eq!(editor.doc().text.to_string(), "foo foo\nbar foo");
+        // With g, every match on the line goes.
+        let mut editor = editor_with("foo foo");
+        press(&mut editor, ":s/foo/bar/g <enter>");
+        assert_eq!(editor.doc().text.to_string(), "bar bar");
+    }
+
+    #[test]
+    fn s_supports_capture_groups_and_reports_missing_patterns() {
+        let mut editor = editor_with("ab");
+        press(&mut editor, ":%s/(a)(b)/\\2\\1/ <enter>");
+        assert_eq!(editor.doc().text.to_string(), "ba");
+        let mut editor = editor_with("hello");
+        press(&mut editor, ":%s/zzz/x/g <enter>");
+        assert_eq!(editor.doc().text.to_string(), "hello");
+        assert_eq!(editor.status, "pattern not found: zzz");
+    }
+
+    #[test]
+    fn search_like_words_are_not_substitute_commands() {
+        // ":s" must be followed by a delimiter; ":set" is not :s.
+        assert!(Editor::parse_substitute("set number").is_none());
+        assert!(Editor::parse_substitute("search").is_none());
+        assert!(Editor::parse_substitute("s").is_none());
+        let sub = Editor::parse_substitute("%s/a/b/g").unwrap();
+        assert!(sub.whole_buffer && sub.global && !sub.insensitive);
+        assert_eq!(sub.pattern, "a");
+        assert_eq!(sub.replacement, "b");
+        // A different delimiter works, and an escaped delimiter is literal.
+        let sub = Editor::parse_substitute("s#a#b#").unwrap();
+        assert!(!sub.whole_buffer && !sub.global);
+        let sub = Editor::parse_substitute("s/a\\/b/c/").unwrap();
+        assert_eq!(sub.pattern, "a/b");
     }
 
     #[test]
