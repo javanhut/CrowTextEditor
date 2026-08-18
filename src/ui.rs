@@ -185,6 +185,10 @@ fn render_window(
             }
         }
         curs = extra.iter().map(|&(_, c)| c.min(len)).collect();
+        // The bracket matching the one under the cursor glows like a cursor.
+        if let Some(m) = crate::position::matching_bracket(doc.text.slice(..), cursor) {
+            curs.push(m);
+        }
     }
 
     let manifest_kind = (!editor.dep_info.is_empty())

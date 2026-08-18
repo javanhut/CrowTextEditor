@@ -257,6 +257,7 @@ impl Default for Keymaps {
         normal.bind_str("e", "select_word_end");
         normal.bind_str("gg", "goto_file_start");
         normal.bind_str("G", "goto_file_end");
+        normal.bind_str("%", "goto_matching_bracket");
         normal.bind_str("C-d", "half_page_down");
         normal.bind_str("C-u", "half_page_up");
         normal.bind_str("C-f", "page_down");
@@ -2203,7 +2204,9 @@ impl Editor {
             }
             KeyCode::Esc => {
                 self.completion = None;
-                true
+                // Not consumed: one Esc both closes the menu and leaves
+                // insert mode via the keymap, not two.
+                false
             }
             // Tab steps into the list (first press selects the top item),
             // then Tab/S-Tab cycle; Enter accepts.
@@ -3498,6 +3501,55 @@ pub(crate) mod tests {
         press(&mut editor, "<enter>");
         assert_eq!(editor.doc().text.to_string(), "println!");
         assert!(editor.completion.is_none());
+    }
+
+    #[test]
+    fn esc_closes_completion_and_leaves_insert_mode_in_one_press() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "pri");
+        editor.show_completions(
+            vec![("println!".into(), "println!".into(), String::new())],
+            false,
+        );
+        press(&mut editor, "<esc>");
+        assert!(editor.completion.is_none());
+        assert_eq!(editor.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn h_wraps_onto_the_previous_line() {
+        let mut editor = editor_with("ab\ncd\nef");
+        press(&mut editor, "j");
+        press(&mut editor, "0");
+        assert_eq!(editor.doc().cursor, 3);
+        // One h from the start of "cd" lands on the last char of "ab".
+        press(&mut editor, "h");
+        assert_eq!(editor.doc().cursor, 1);
+        // Repeated h keeps wrapping through an empty line to the top.
+        let mut editor = editor_with("ab\n\ncd");
+        editor.doc_mut().cursor = 4;
+        press(&mut editor, "h");
+        assert_eq!(editor.doc().cursor, 3); // the empty line
+        press(&mut editor, "h");
+        assert_eq!(editor.doc().cursor, 1);
+        press(&mut editor, "h");
+        assert_eq!(editor.doc().cursor, 0);
+        // At the very start there is nowhere left to go.
+        press(&mut editor, "h");
+        assert_eq!(editor.doc().cursor, 0);
+    }
+
+    #[test]
+    fn percent_jumps_between_matching_brackets() {
+        let mut editor = editor_with("fn main() {\n    if x {\n    }\n}");
+        press(&mut editor, "%"); // on the 'f': not a bracket, stays put
+        assert_eq!(editor.doc().cursor, 0);
+        editor.doc_mut().cursor = 10; // the '{'
+        press(&mut editor, "%");
+        assert_eq!(editor.doc().cursor, 29); // the final '}'
+        press(&mut editor, "%");
+        assert_eq!(editor.doc().cursor, 10);
     }
 
     #[test]

@@ -29,7 +29,7 @@ macro_rules! commands {
 }
 
 commands! {
-    move_left => "move one character left",
+    move_left => "move one character left, wrapping to the previous line",
     move_right => "move one character right",
     move_up => "move one line up",
     move_down => "move one line down",
@@ -66,6 +66,7 @@ commands! {
     search_prev => "select the previous match of the last search",
     goto_file_start => "move to the first line, or with a count to that line",
     goto_file_end => "move to the last line, or with a count to that line",
+    goto_matching_bracket => "jump to the bracket matching the one under the cursor (%)",
     extend_mode => "toggle extending selections with every motion",
     half_page_down => "scroll down half a screen",
     half_page_up => "scroll up half a screen",
@@ -204,6 +205,7 @@ pub static PER_CURSOR: &[&str] = &[
     "move_line_end",
     "goto_file_start",
     "goto_file_end",
+    "goto_matching_bracket",
     "select_word_next",
     "select_word_prev",
     "select_word_end",
@@ -222,15 +224,18 @@ pub static PER_CURSOR: &[&str] = &[
 
 fn move_left(editor: &mut Editor) {
     let count = editor.take_count();
+    let past_end = editor.mode == Mode::Insert;
     let doc = editor.doc_mut();
-    let line_start = doc.line_start(doc.cursor_line());
     for _ in 0..count {
-        if doc.cursor <= line_start {
+        if doc.cursor == 0 {
             break;
         }
+        // Stepping left off the start of a line lands on the previous line's
+        // newline; clamp_cursor pulls that back onto the line's last char
+        // (in normal mode) or leaves it at the line end (in insert mode).
         doc.cursor = position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor);
+        doc.clamp_cursor(past_end);
     }
-    doc.cursor = doc.cursor.max(line_start);
     doc.goal_col = None;
 }
 
@@ -298,6 +303,15 @@ fn move_line_end(editor: &mut Editor) {
     doc.cursor = doc.line_end(line);
     doc.clamp_cursor(past_end);
     doc.goal_col = None;
+}
+
+fn goto_matching_bracket(editor: &mut Editor) {
+    let doc = editor.doc_mut();
+    if let Some(pos) = position::matching_bracket(doc.text.slice(..), doc.cursor) {
+        doc.cursor = pos;
+        doc.clamp_cursor(false);
+        doc.goal_col = None;
+    }
 }
 
 // ---- selection -------------------------------------------------------------

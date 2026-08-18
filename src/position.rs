@@ -169,6 +169,52 @@ pub fn prev_grapheme_boundary(slice: RopeSlice, char_idx: usize) -> usize {
     }
 }
 
+/// The bracket matching the one at `pos`, by depth counting.
+///
+/// `()`, `[]` and `{}` pair with their own kind only, so a `)` inside a
+/// parenthesised expression doesn't disturb a `{` scan. No string/comment
+/// awareness: a bracket in a string literal counts like any other.
+pub fn matching_bracket(text: RopeSlice, pos: usize) -> Option<usize> {
+    if pos >= text.len_chars() {
+        return None;
+    }
+    let (open, close, forward) = match text.char(pos) {
+        '(' => ('(', ')', true),
+        '[' => ('[', ']', true),
+        '{' => ('{', '}', true),
+        ')' => ('(', ')', false),
+        ']' => ('[', ']', false),
+        '}' => ('{', '}', false),
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    if forward {
+        for (i, c) in text.chars_at(pos).enumerate() {
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(pos + i);
+                }
+            }
+        }
+    } else {
+        for i in (0..=pos).rev() {
+            let c = text.char(i);
+            if c == close {
+                depth += 1;
+            } else if c == open {
+                if depth == 1 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+        }
+    }
+    None
+}
+
 /// Char offset within a line -> UTF-16 code units, the metric LSP speaks.
 pub fn char_to_utf16(line: RopeSlice, char_offset: usize) -> usize {
     line.chars().take(char_offset).map(|c| c.len_utf16()).sum()
@@ -301,5 +347,37 @@ mod tests {
         let rope = Rope::from_str("abc\ndef");
         assert_eq!(line_len_without_newline(rope.line(0)), 3);
         assert_eq!(line_len_without_newline(rope.line(1)), 3);
+    }
+
+    #[test]
+    fn matching_bracket_pairs_both_directions() {
+        //      012345678901234
+        let rope = Rope::from_str("fn main() { x }");
+        let s = rope.slice(..);
+        assert_eq!(matching_bracket(s, 7), Some(8)); // ( -> )
+        assert_eq!(matching_bracket(s, 8), Some(7)); // ) -> (
+        assert_eq!(matching_bracket(s, 10), Some(14)); // { -> }
+        assert_eq!(matching_bracket(s, 14), Some(10)); // } -> {
+        assert_eq!(matching_bracket(s, 0), None); // not a bracket
+    }
+
+    #[test]
+    fn matching_bracket_skips_nesting_and_matches_its_own_kind() {
+        let rope = Rope::from_str("{ a { b ( c ) } d }");
+        let s = rope.slice(..);
+        assert_eq!(matching_bracket(s, 0), Some(18));
+        assert_eq!(matching_bracket(s, 18), Some(0));
+        assert_eq!(matching_bracket(s, 4), Some(14));
+        // The closing paren does not end the brace scan.
+        assert_eq!(matching_bracket(s, 12), Some(8));
+    }
+
+    #[test]
+    fn matching_bracket_returns_none_when_unbalanced() {
+        let rope = Rope::from_str("(a");
+        let s = rope.slice(..);
+        assert_eq!(matching_bracket(s, 0), None);
+        let rope = Rope::from_str("a)");
+        assert_eq!(matching_bracket(rope.slice(..), 1), None);
     }
 }
