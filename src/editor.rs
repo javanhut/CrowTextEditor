@@ -1684,7 +1684,7 @@ impl Editor {
         };
         match program {
             Some(p) => match crate::config::installer(&p) {
-                Some(cmd) => self.start_install(&p, cmd),
+                Some(cmd) => self.start_install(&p, &cmd),
                 None => self.set_status(format!("don't know how to install {p}")),
             },
             None => self.set_status(format!(
@@ -1710,7 +1710,14 @@ impl Editor {
     /// Run `cmd` in a background thread; `install_tick` picks up the result.
     fn start_install(&mut self, program: &str, cmd: &str) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let shell_cmd = cmd.to_string();
+        // A system package manager needs root, and `sudo` here has no terminal
+        // to ask for a password on: the prompt would go nowhere and the install
+        // would hang for the rest of the session. `-n` turns that into an
+        // immediate failure `install_tick` can explain instead.
+        let shell_cmd = match cmd.strip_prefix("sudo ") {
+            Some(rest) => format!("sudo -n {rest}"),
+            None => cmd.to_string(),
+        };
         std::thread::spawn(move || {
             let result = match std::process::Command::new("sh")
                 .args(["-c", &shell_cmd])
@@ -1763,6 +1770,14 @@ impl Editor {
                 if formats_this {
                     (commands::find("format_buffer").unwrap().func)(self);
                 }
+            }
+            // `sudo -n` above rather than a password prompt nobody can answer:
+            // when that is what stopped it, hand over the command to run.
+            Err(e) if e.contains("password") => {
+                let cmd = crate::config::installer(&program).unwrap_or_default();
+                self.set_status(format!(
+                    "{program}: needs root — run `{cmd}` in a terminal"
+                ));
             }
             Err(e) => self.set_status(format!("{program}: install failed — {e}")),
         }

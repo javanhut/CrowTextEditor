@@ -224,24 +224,97 @@ pub fn builtin_lsp(ext: &str) -> Option<&'static str> {
     BUILTIN_LSP.iter().find(|(e, _)| *e == ext).map(|(_, c)| *c)
 }
 
+// ---- installing missing tools ----------------------------------------------
+
+/// A package manager crow can install through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pm {
+    Brew,
+    Apt,
+    Dnf,
+    Pacman,
+    Zypper,
+    Apk,
+}
+
+impl Pm {
+    /// The shell command that installs `pkg`, asking nothing. Homebrew owns
+    /// its own prefix; every system manager writes into system directories,
+    /// so every system manager needs root.
+    fn install(self, pkg: &str) -> String {
+        let (root, cmd) = match self {
+            Pm::Brew => (false, format!("brew install {pkg}")),
+            Pm::Apt => (true, format!("apt-get install -y {pkg}")),
+            Pm::Dnf => (true, format!("dnf install -y {pkg}")),
+            Pm::Pacman => (true, format!("pacman -S --needed --noconfirm {pkg}")),
+            Pm::Zypper => (true, format!("zypper --non-interactive install {pkg}")),
+            Pm::Apk => (true, format!("apk add {pkg}")),
+        };
+        if root && !is_root() {
+            format!("sudo {cmd}")
+        } else {
+            cmd
+        }
+    }
+}
+
+/// The manager to install through, worked out once from what is on PATH.
+///
+/// macOS means Homebrew. On Linux the distro's own manager wins even when
+/// Homebrew is installed beside it: it is what owns /usr/bin, it is where
+/// every other package on the machine came from, and every Linux box has one.
+/// Homebrew is the answer there only when nothing else answered.
+pub fn package_manager() -> Option<Pm> {
+    static PM: std::sync::OnceLock<Option<Pm>> = std::sync::OnceLock::new();
+    *PM.get_or_init(|| {
+        if cfg!(target_os = "macos") {
+            return Some(Pm::Brew);
+        }
+        [
+            ("pacman", Pm::Pacman),
+            ("apt-get", Pm::Apt),
+            ("dnf", Pm::Dnf),
+            ("zypper", Pm::Zypper),
+            ("apk", Pm::Apk),
+            ("brew", Pm::Brew),
+        ]
+        .into_iter()
+        .find(|(program, _)| on_path(program))
+        .map(|(_, pm)| pm)
+    })
+}
+
+/// Is `program` runnable? A walk of PATH rather than spawning `which`.
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+    })
+}
+
+/// Already root: the package manager needs no `sudo`, and a container that
+/// never installed `sudo` still gets its tools.
+#[cfg(unix)]
+fn is_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
+}
+
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    false
+}
+
 /// How to install a missing tool, keyed by the program :fmt or the LSP
 /// tries to spawn. Powers `:install` and the "install? (y/N)" offer.
-/// ponytail: macOS-first (brew/rustup/npm); add a Linux column when crow
-/// leaves this Mac.
+///
+/// Anything its own ecosystem ships — rustup, npm, gem, a source build — is
+/// installed that way on every platform, so it is one command here. Tools
+/// that come from the operating system live in `PACKAGES` instead, where
+/// each manager gets to name them itself.
 const INSTALLERS: &[(&str, &str)] = &[
     ("prettier", "npm install -g prettier"),
     ("rustfmt", "rustup component add rustfmt"),
     ("rust-analyzer", "rustup component add rust-analyzer"),
-    ("gofmt", "brew install go"),
-    ("gopls", "brew install gopls"),
-    ("black", "brew install black"),
-    ("ruff", "brew install ruff"),
-    ("shfmt", "brew install shfmt"),
-    ("stylua", "brew install stylua"),
-    ("taplo", "brew install taplo"),
-    ("clang-format", "brew install clang-format"),
-    ("clangd", "brew install llvm"),
-    ("zig", "brew install zig"),
     ("pyright-langserver", "npm install -g pyright"),
     (
         "typescript-language-server",
@@ -267,19 +340,136 @@ const INSTALLERS: &[(&str, &str)] = &[
         "vscode-html-language-server",
         "npm install -g vscode-langservers-extracted",
     ),
-    ("lua-language-server", "brew install lua-language-server"),
-    ("zls", "brew install zls"),
-    ("ols", "brew install ols"),
-    ("odinfmt", "brew install ols"),
-    ("jdtls", "brew install jdtls"),
     ("ruby-lsp", "gem install ruby-lsp"),
     ("intelephense", "npm install -g intelephense"),
-    ("marksman", "brew install marksman"),
     // Oxigen ships no package: build it from its own repo, cached under
     // ~/.cache/crow. `make install` picks /usr/local or ~/.local by itself,
     // so neither needs sudo.
     ("oxigen", OXIGEN_BUILD),
     ("oxigen-lsp", OXIGEN_LSP_BUILD),
+];
+
+/// Tools that come from the operating system: `(program, package name under
+/// each manager known to carry it, what to do where none does)`.
+///
+/// A manager is listed only where the package is really there, so a machine
+/// whose manager doesn't have the tool falls through to the third field —
+/// building it from its own ecosystem — rather than being told to install a
+/// package that doesn't exist. `None` there means we have nothing to suggest
+/// beyond Homebrew, which is consulted last and only if this machine has it.
+const PACKAGES: &[(&str, &[(Pm, &str)], Option<&str>)] = &[
+    (
+        "gofmt", // ships with the Go toolchain
+        &[
+            (Pm::Brew, "go"),
+            (Pm::Apt, "golang-go"),
+            (Pm::Dnf, "golang"),
+            (Pm::Pacman, "go"),
+            (Pm::Zypper, "go"),
+            (Pm::Apk, "go"),
+        ],
+        None,
+    ),
+    (
+        "gopls",
+        &[(Pm::Brew, "gopls"), (Pm::Pacman, "gopls")],
+        Some("go install golang.org/x/tools/gopls@latest"),
+    ),
+    (
+        "black",
+        &[
+            (Pm::Brew, "black"),
+            (Pm::Apt, "black"),
+            (Pm::Dnf, "python3-black"),
+            (Pm::Pacman, "python-black"),
+            (Pm::Zypper, "python3-black"),
+            (Pm::Apk, "py3-black"),
+        ],
+        Some("pipx install black"),
+    ),
+    (
+        "ruff",
+        &[
+            (Pm::Brew, "ruff"),
+            (Pm::Apt, "ruff"),
+            (Pm::Dnf, "ruff"),
+            (Pm::Pacman, "ruff"),
+            (Pm::Apk, "ruff"),
+        ],
+        Some("pipx install ruff"),
+    ),
+    (
+        "shfmt",
+        &[
+            (Pm::Brew, "shfmt"),
+            (Pm::Apt, "shfmt"),
+            (Pm::Dnf, "shfmt"),
+            (Pm::Pacman, "shfmt"),
+            (Pm::Apk, "shfmt"),
+        ],
+        Some("go install mvdan.cc/sh/v3/cmd/shfmt@latest"),
+    ),
+    (
+        "stylua",
+        &[(Pm::Brew, "stylua"), (Pm::Pacman, "stylua")],
+        Some("cargo install stylua"),
+    ),
+    (
+        "taplo",
+        &[(Pm::Brew, "taplo")],
+        Some("cargo install taplo-cli --locked"),
+    ),
+    (
+        "clang-format",
+        &[
+            (Pm::Brew, "clang-format"),
+            (Pm::Apt, "clang-format"),
+            (Pm::Dnf, "clang-tools-extra"),
+            (Pm::Pacman, "clang"),
+            (Pm::Zypper, "clang-tools"),
+            (Pm::Apk, "clang-extra-tools"),
+        ],
+        None,
+    ),
+    (
+        "clangd",
+        &[
+            (Pm::Brew, "llvm"),
+            (Pm::Apt, "clangd"),
+            (Pm::Dnf, "clang-tools-extra"),
+            (Pm::Pacman, "clang"),
+            (Pm::Zypper, "clang-tools"),
+            (Pm::Apk, "clang-extra-tools"),
+        ],
+        None,
+    ),
+    (
+        "zig",
+        &[
+            (Pm::Brew, "zig"),
+            (Pm::Dnf, "zig"),
+            (Pm::Pacman, "zig"),
+            (Pm::Zypper, "zig"),
+            (Pm::Apk, "zig"),
+        ],
+        None,
+    ),
+    ("zls", &[(Pm::Brew, "zls"), (Pm::Pacman, "zls")], None),
+    // Odin's language server carries odinfmt with it.
+    ("ols", &[(Pm::Brew, "ols")], None),
+    ("odinfmt", &[(Pm::Brew, "ols")], None),
+    ("jdtls", &[(Pm::Brew, "jdtls")], None),
+    (
+        "lua-language-server",
+        &[
+            (Pm::Brew, "lua-language-server"),
+            (Pm::Apt, "lua-language-server"),
+            (Pm::Dnf, "lua-language-server"),
+            (Pm::Pacman, "lua-language-server"),
+        ],
+        None,
+    ),
+    ("marksman", &[(Pm::Brew, "marksman")], None),
 ];
 
 const OXIGEN_BUILD: &str = concat!(
@@ -293,12 +483,32 @@ const OXIGEN_LSP_BUILD: &str = concat!(
     " make -C ~/.cache/crow/OxigenLang install-lsp"
 );
 
-/// The shell command that installs `program`, if we know one.
-pub fn installer(program: &str) -> Option<&'static str> {
-    INSTALLERS
-        .iter()
-        .find(|(p, _)| *p == program)
-        .map(|(_, c)| *c)
+/// The shell command that installs `program` on this machine, if we know one.
+pub fn installer(program: &str) -> Option<String> {
+    install_command(program, package_manager())
+}
+
+/// `installer`, with the manager passed in — so a test can ask what a Debian
+/// box would be told without being one.
+fn install_command(program: &str, pm: Option<Pm>) -> Option<String> {
+    if let Some((_, cmd)) = INSTALLERS.iter().find(|(p, _)| *p == program) {
+        return Some((*cmd).to_string());
+    }
+    let (_, names, fallback) = PACKAGES.iter().find(|(p, _, _)| *p == program)?;
+    let named = |pm: Pm| names.iter().find(|(m, _)| *m == pm).map(|(_, name)| *name);
+
+    // This machine's own manager first; then a build from the tool's own
+    // ecosystem; then Homebrew, which runs on Linux too — if it is installed
+    // there, someone put it there on purpose.
+    if let Some((pm, name)) = pm.and_then(|pm| Some((pm, named(pm)?))) {
+        return Some(pm.install(name));
+    }
+    if let Some(cmd) = fallback {
+        return Some((*cmd).to_string());
+    }
+    named(Pm::Brew)
+        .filter(|_| on_path("brew"))
+        .map(|name| Pm::Brew.install(name))
 }
 
 /// The formatter command line for a file extension: config entries first,
@@ -591,6 +801,65 @@ py = "pyright-langserver --stdio"
     fn formatter_lookup_falls_back_to_builtins() {
         assert_eq!(formatter("go").as_deref(), Some("gofmt"));
         assert!(formatter("xyz").is_none());
+    }
+
+    #[test]
+    fn ecosystem_tools_install_the_same_way_everywhere() {
+        for pm in [None, Some(Pm::Brew), Some(Pm::Apt), Some(Pm::Pacman)] {
+            assert_eq!(
+                install_command("prettier", pm).as_deref(),
+                Some("npm install -g prettier")
+            );
+        }
+        assert!(install_command("no-such-tool", Some(Pm::Apt)).is_none());
+    }
+
+    /// The thing this table exists to get right: a Linux box is told to use
+    /// the package manager it actually has, not Homebrew.
+    #[test]
+    fn a_system_package_uses_this_machines_manager() {
+        let arch = install_command("clangd", Some(Pm::Pacman)).unwrap();
+        assert!(
+            arch.ends_with("pacman -S --needed --noconfirm clang"),
+            "{arch}"
+        );
+        assert!(!arch.contains("brew"));
+        let debian = install_command("clangd", Some(Pm::Apt)).unwrap();
+        assert!(debian.ends_with("apt-get install -y clangd"), "{debian}");
+        // The package is whatever that manager calls it, not one name for all.
+        let fedora = install_command("clangd", Some(Pm::Dnf)).unwrap();
+        assert!(fedora.ends_with("clang-tools-extra"), "{fedora}");
+        assert_eq!(
+            install_command("clangd", Some(Pm::Brew)).as_deref(),
+            Some("brew install llvm")
+        );
+    }
+
+    /// Everything but Homebrew writes into system directories, so everything
+    /// but Homebrew is prefixed with sudo — unless we are already root.
+    #[test]
+    fn system_managers_need_root_and_homebrew_does_not() {
+        let sudo = |program, pm| install_command(program, Some(pm)).unwrap().starts_with("sudo ");
+        assert_eq!(sudo("clangd", Pm::Dnf), !is_root());
+        assert_eq!(sudo("clangd", Pm::Apk), !is_root());
+        assert!(!sudo("clangd", Pm::Brew));
+    }
+
+    /// A distro that has no package for a tool gets a build from the tool's
+    /// own ecosystem rather than an install command that would just fail.
+    #[test]
+    fn a_distro_without_the_package_builds_it_instead() {
+        assert!(install_command("stylua", Some(Pm::Pacman))
+            .unwrap()
+            .ends_with("pacman -S --needed --noconfirm stylua"));
+        assert_eq!(
+            install_command("stylua", Some(Pm::Apt)).as_deref(),
+            Some("cargo install stylua")
+        );
+        assert_eq!(
+            install_command("gopls", Some(Pm::Dnf)).as_deref(),
+            Some("go install golang.org/x/tools/gopls@latest")
+        );
     }
 
     #[test]
