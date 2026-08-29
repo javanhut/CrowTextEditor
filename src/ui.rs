@@ -12,6 +12,8 @@ use crossterm::style::{
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use crossterm::{cursor, queue};
 use ropey::RopeSlice;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::tab_width;
 use crate::editor::{Editor, Mode};
@@ -169,9 +171,14 @@ fn render_window(
     let len = doc.text.len_chars();
     let line_count = doc.line_count();
     let gutter = doc.line_count().to_string().len().max(3) + 1;
+    let display_cursor = if focused && editor.extend && anchor < cursor {
+        position::prev_grapheme_boundary(doc.text.slice(..), cursor)
+    } else {
+        cursor
+    };
     let width = (rw as usize).saturating_sub(gutter);
     let cursor_line = {
-        let l = doc.text.char_to_line(cursor.min(len));
+        let l = doc.text.char_to_line(display_cursor.min(len));
         l.min(line_count.saturating_sub(1))
     };
 
@@ -181,12 +188,24 @@ fn render_window(
     if focused {
         for &(a, c) in std::iter::once(&(anchor, cursor)).chain(extra.iter()) {
             if a != c {
-                sels.push((a.min(c).min(len), a.max(c).min(len)));
+                sels.push((
+                    position::grapheme_floor(doc.text.slice(..), a.min(c).min(len)),
+                    position::grapheme_ceil(doc.text.slice(..), a.max(c).min(len)),
+                ));
             }
         }
-        curs = extra.iter().map(|&(_, c)| c.min(len)).collect();
+        curs = extra
+            .iter()
+            .map(|&(a, c)| {
+                if editor.extend && a < c {
+                    position::prev_grapheme_boundary(doc.text.slice(..), c)
+                } else {
+                    c.min(len)
+                }
+            })
+            .collect();
         // The bracket matching the one under the cursor glows like a cursor.
-        if let Some(m) = crate::position::matching_bracket(doc.text.slice(..), cursor) {
+        if let Some(m) = crate::position::matching_bracket(doc.text.slice(..), display_cursor) {
             curs.push(m);
         }
     }
@@ -517,9 +536,7 @@ const ATTRS: [(u8, Attribute, Attribute); 4] = [
 ];
 
 fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum()
+    UnicodeWidthStr::width(s)
 }
 
 /// Where a line's trailing whitespace begins, if it has any and isn't blank.
@@ -551,23 +568,29 @@ fn styled_visible(
     style_of: impl Fn(usize) -> Style,
 ) -> Vec<(Style, String)> {
     let mut runs: Vec<(Style, String)> = Vec::new();
-    let push = |runs: &mut Vec<(Style, String)>, style: Style, piece: char| match runs.last_mut() {
-        Some((last, buf)) if *last == style => buf.push(piece),
+    let push = |runs: &mut Vec<(Style, String)>, style: Style, piece: &str| match runs.last_mut() {
+        Some((last, buf)) if *last == style => buf.push_str(piece),
         _ => runs.push((style, piece.to_string())),
     };
 
     let right_edge = view_col + width;
     let mut col = 0usize;
 
-    let mut chars = line.chars_at(range.start.min(line.len_chars()));
-    for i in range.clone() {
-        let Some(c) = chars.next() else { break };
-        if c == '\n' || c == '\r' {
-            break;
-        }
-
+    let text: String = line
+        .chars_at(range.start.min(line.len_chars()))
+        .take(range.end.saturating_sub(range.start))
+        .take_while(|&c| c != '\n' && c != '\r')
+        .collect();
+    let mut i = range.start;
+    for grapheme in text.graphemes(true) {
+        let grapheme_i = i;
+        i += grapheme.chars().count();
         let start = col;
-        let w = position::char_width(c, col, tab_width());
+        let w = if grapheme == "\t" {
+            position::char_width('\t', col, tab_width())
+        } else {
+            UnicodeWidthStr::width(grapheme)
+        };
         col += w;
 
         if col <= view_col {
@@ -577,22 +600,22 @@ fn styled_visible(
             break; // entirely right of it
         }
 
-        let style = style_of(i);
-        if c == '\t' || start < view_col || col > right_edge {
+        let style = style_of(grapheme_i);
+        if grapheme == "\t" || start < view_col || col > right_edge {
             let from = start.max(view_col);
             let to = col.min(right_edge);
             for _ in from..to {
-                push(&mut runs, style, ' ');
+                push(&mut runs, style, " ");
             }
         } else {
-            push(&mut runs, style, c);
+            push(&mut runs, style, grapheme);
         }
     }
 
     if last_row && col >= view_col && col < right_edge {
         let style = style_of(line_len);
         if style.0 != ST_NONE && style.0 != ST_TRAIL {
-            push(&mut runs, style, ' ');
+            push(&mut runs, style, " ");
         }
     }
 
@@ -1651,6 +1674,25 @@ mod tests {
                 ((ST_NONE, None, 0), "ab".to_string()),
                 ((ST_SEL, None, 0), "cd".to_string()),
                 ((ST_NONE, None, 0), "ef".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_grapheme_is_rendered_as_one_styled_run() {
+        let rope = Rope::from_str("👨\u{200d}👩\u{200d}👧x");
+        let runs = styled_visible(rope.line(0), 0..6, 6, true, 0, 10, |i| {
+            if i == 0 {
+                (ST_SEL, None, 0)
+            } else {
+                (ST_NONE, None, 0)
+            }
+        });
+        assert_eq!(
+            runs,
+            vec![
+                ((ST_SEL, None, 0), "👨\u{200d}👩\u{200d}👧".to_string()),
+                ((ST_NONE, None, 0), "x".to_string()),
             ]
         );
     }

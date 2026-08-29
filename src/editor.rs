@@ -1055,6 +1055,7 @@ impl Editor {
         // ponytail: keyed by character, so rebinding d/x/c in config leaves
         // the doubles where they are. Move them here too if that ever bites.
         if self.mode == Mode::Normal
+            && !self.extend
             && self.pending.is_empty()
             && !key.ctrl
             && !key.alt
@@ -1829,6 +1830,7 @@ impl Editor {
     /// autoclose, no per-key replay. That's the whole point of the bracket.
     pub fn handle_paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let pasted_something = !text.is_empty();
         match self.mode {
             Mode::Command | Mode::Search => {
                 // A path or a pattern: only the first line makes sense.
@@ -1844,9 +1846,31 @@ impl Editor {
                 if self.tree_focused || self.help_scroll.is_some() {
                     return;
                 }
-                self.doc_mut().insert_at_cursor(&text);
+                if self.mode == Mode::Normal && self.doc().anchor != self.doc().cursor {
+                    let from = crate::position::grapheme_floor(
+                        self.doc().text.slice(..),
+                        self.doc().anchor.min(self.doc().cursor),
+                    );
+                    let to = crate::position::grapheme_ceil(
+                        self.doc().text.slice(..),
+                        self.doc().anchor.max(self.doc().cursor),
+                    );
+                    let pasted_len = text.chars().count();
+                    let tx = crate::transaction::Transaction::change(
+                        &self.doc().text,
+                        std::iter::once((from, to, Some(text))),
+                    );
+                    self.extend = false;
+                    self.doc_mut().apply(tx, from + pasted_len);
+                } else {
+                    self.doc_mut().insert_at_cursor(&text);
+                }
                 if self.mode == Mode::Normal {
                     let doc = self.doc_mut();
+                    if pasted_something {
+                        doc.cursor =
+                            crate::position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor);
+                    }
                     doc.anchor = doc.cursor;
                     doc.commit_undo_group();
                 }
@@ -3102,7 +3126,12 @@ impl Editor {
         let (rx, ry, rw, rh) = self.focused_rect();
         let wrap = self.wrap_width();
         let doc = self.doc();
-        let (line, row, col) = doc.cursor_visual(wrap);
+        let cursor = if self.extend && doc.anchor < doc.cursor {
+            crate::position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor)
+        } else {
+            doc.cursor
+        };
+        let (line, row, col) = doc.position_visual(cursor, wrap);
         if line < doc.view_line || line > doc.view_line + rh as usize {
             return None;
         }
@@ -3124,7 +3153,13 @@ impl Editor {
     /// Human-readable cursor position for the status line, 1-indexed.
     pub fn cursor_indicator(&self) -> String {
         let doc = self.doc();
-        let (line, col) = doc.cursor_line_col();
+        let cursor = if self.extend && doc.anchor < doc.cursor {
+            crate::position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor)
+        } else {
+            doc.cursor
+        };
+        let line = doc.text.char_to_line(cursor.min(doc.text.len_chars()));
+        let col = cursor - doc.line_start(line);
         let display =
             crate::position::char_to_display_col(doc.line(line), col, crate::config::tab_width());
         format!("{}:{}", line + 1, display + 1)
@@ -3201,7 +3236,7 @@ pub(crate) mod tests {
     fn count_prefix_repeats_a_command() {
         let mut editor = editor_with("abcdef");
         press(&mut editor, "v3ld");
-        assert_eq!(editor.doc().text.to_string(), "def");
+        assert_eq!(editor.doc().text.to_string(), "ef");
     }
 
     #[test]
@@ -3217,7 +3252,7 @@ pub(crate) mod tests {
     fn zero_is_a_count_digit_after_another_digit() {
         let mut editor = editor_with("abcdefghijklm");
         press(&mut editor, "v10ld");
-        assert_eq!(editor.doc().text.to_string(), "klm");
+        assert_eq!(editor.doc().text.to_string(), "lm");
     }
 
     #[test]
@@ -3244,9 +3279,9 @@ pub(crate) mod tests {
     #[test]
     fn motions_collapse_the_selection() {
         let mut editor = editor_with("foo bar");
-        // w selects "foo ", h collapses onto the space; vl reselects just it.
+        // w selects "foo ", h collapses onto the space; v selects it.
         press(&mut editor, "wh");
-        press(&mut editor, "vld");
+        press(&mut editor, "vd");
         assert_eq!(editor.doc().text.to_string(), "foobar");
     }
 
@@ -3263,6 +3298,15 @@ pub(crate) mod tests {
         let mut editor = editor_with("one\ntwo");
         press(&mut editor, "Vcp");
         assert_eq!(editor.doc().text.to_string(), "one\none\ntwo");
+    }
+
+    #[test]
+    fn paste_replaces_a_characterwise_selection() {
+        let mut editor = editor_with("abc");
+        editor.register = "XY".into();
+        press(&mut editor, "vlp");
+        assert_eq!(editor.doc().text.to_string(), "XYc");
+        assert_eq!(editor.doc().cursor, 1);
     }
 
     #[test]
@@ -3400,15 +3444,51 @@ pub(crate) mod tests {
         assert_eq!(editor.doc().text.to_string(), "baz");
         // The delete dropped extend mode: l is a plain motion again, so vl
         // selects exactly one char.
-        press(&mut editor, "lvld");
+        press(&mut editor, "lvd");
         assert_eq!(editor.doc().text.to_string(), "bz");
+    }
+
+    #[test]
+    fn v_immediately_selects_the_character_under_the_cursor() {
+        let mut editor = editor_with("abc");
+        press(&mut editor, "vd");
+        assert_eq!(editor.doc().text.to_string(), "bc");
+    }
+
+    #[test]
+    fn characterwise_selection_is_inclusive_in_both_directions() {
+        let mut editor = editor_with("abcd");
+        press(&mut editor, "lvhd");
+        assert_eq!(editor.doc().text.to_string(), "cd");
+
+        let mut editor = editor_with("abcd");
+        press(&mut editor, "vld");
+        assert_eq!(editor.doc().text.to_string(), "cd");
+    }
+
+    #[test]
+    fn characterwise_selection_wraps_across_lines_in_both_directions() {
+        let mut editor = editor_with("ab\ncd");
+        press(&mut editor, "$vld");
+        assert_eq!(editor.doc().text.to_string(), "ad");
+
+        let mut editor = editor_with("ab\ncd");
+        press(&mut editor, "jvhd");
+        assert_eq!(editor.doc().text.to_string(), "ad");
+    }
+
+    #[test]
+    fn characterwise_selection_keeps_a_grapheme_whole() {
+        let mut editor = editor_with("👨\u{200d}👩\u{200d}👧x");
+        press(&mut editor, "vd");
+        assert_eq!(editor.doc().text.to_string(), "x");
     }
 
     #[test]
     fn plain_motions_extend_too_in_extend_mode() {
         let mut editor = editor_with("abcd");
         press(&mut editor, "vlld");
-        assert_eq!(editor.doc().text.to_string(), "cd");
+        assert_eq!(editor.doc().text.to_string(), "d");
     }
 
     #[test]
@@ -3419,6 +3499,15 @@ pub(crate) mod tests {
         // With extend off, l collapses and w selects from there only.
         press(&mut editor, "lwd");
         assert_eq!(editor.doc().text.to_string(), "a");
+    }
+
+    #[test]
+    fn a_second_v_collapses_and_leaves_select_mode() {
+        let mut editor = editor_with("abc");
+        press(&mut editor, "vlv");
+        assert!(!editor.extend);
+        assert_eq!(editor.doc().anchor, editor.doc().cursor);
+        assert_eq!(editor.doc().cursor, 1);
     }
 
     #[test]
@@ -3441,7 +3530,7 @@ pub(crate) mod tests {
         let mut editor = editor_with("foo bar");
         press(&mut editor, "w"); // select "foo "
         press(&mut editor, "\"ac"); // into register a; cursor back to 0
-        press(&mut editor, "vld"); // select "f", delete: unnamed register = "f"
+        press(&mut editor, "vd"); // select "f", delete: unnamed register = "f"
         assert_eq!(editor.doc().text.to_string(), "oo bar");
         assert_eq!(editor.register, "f");
         press(&mut editor, "\"aP");
@@ -4332,9 +4421,9 @@ pub(crate) mod tests {
     fn extend_mode_selects_across_lines() {
         let mut editor = editor_with("abc\ndef\nghi");
         press(&mut editor, "vjd"); // grow the selection down a line, delete
-        assert_eq!(editor.doc().text.to_string(), "def\nghi");
+        assert_eq!(editor.doc().text.to_string(), "ef\nghi");
         press(&mut editor, "vjd");
-        assert_eq!(editor.doc().text.to_string(), "ghi");
+        assert_eq!(editor.doc().text.to_string(), "hi");
     }
 
     #[test]

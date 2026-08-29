@@ -298,7 +298,14 @@ impl Document {
     /// that row). Without wrapping the row is always 0 and the column is the
     /// line's own display column.
     pub fn cursor_visual(&self, wrap: Option<usize>) -> (usize, usize, usize) {
-        let (line, col) = self.cursor_line_col();
+        self.position_visual(self.cursor, wrap)
+    }
+
+    /// Any document position in the same coordinates as `cursor_visual`.
+    pub fn position_visual(&self, pos: usize, wrap: Option<usize>) -> (usize, usize, usize) {
+        let pos = pos.min(self.text.len_chars());
+        let line = self.text.char_to_line(pos);
+        let col = pos - self.line_start(line);
         let slice = self.line(line);
         let Some(width) = wrap else {
             return (

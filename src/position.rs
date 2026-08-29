@@ -169,6 +169,31 @@ pub fn prev_grapheme_boundary(slice: RopeSlice, char_idx: usize) -> usize {
     }
 }
 
+/// The grapheme boundary at or before `char_idx`.
+pub fn grapheme_floor(slice: RopeSlice, char_idx: usize) -> usize {
+    let at = char_idx.min(slice.len_chars());
+    if at == 0 {
+        return 0;
+    }
+    let prev = prev_grapheme_boundary(slice, at);
+    if next_grapheme_boundary(slice, prev) == at {
+        at
+    } else {
+        prev
+    }
+}
+
+/// The grapheme boundary at or after `char_idx`.
+pub fn grapheme_ceil(slice: RopeSlice, char_idx: usize) -> usize {
+    let at = char_idx.min(slice.len_chars());
+    let floor = grapheme_floor(slice, at);
+    if floor == at {
+        at
+    } else {
+        next_grapheme_boundary(slice, floor)
+    }
+}
+
 /// The bracket matching the one at `pos`, by depth counting.
 ///
 /// `()`, `[]` and `{}` pair with their own kind only, so a `)` inside a
@@ -306,6 +331,16 @@ mod tests {
         assert_eq!(next_grapheme_boundary(s, 1), 6); // skips the whole family
         assert_eq!(prev_grapheme_boundary(s, 6), 1);
         assert_eq!(prev_grapheme_boundary(s, 7), 6);
+    }
+
+    #[test]
+    fn grapheme_floor_and_ceil_expand_an_interior_offset() {
+        let rope = Rope::from_str("ae\u{301}b");
+        let s = rope.slice(..);
+        assert_eq!(grapheme_floor(s, 2), 1);
+        assert_eq!(grapheme_ceil(s, 2), 3);
+        assert_eq!(grapheme_floor(s, 3), 3);
+        assert_eq!(grapheme_ceil(s, 3), 3);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::document::Document;
 use crate::editor::{Editor, Mode};
 use crate::position::{self, CharClass};
 use crate::transaction::Transaction;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub struct Command {
     pub name: &'static str,
@@ -229,10 +230,24 @@ pub static PER_CURSOR: &[&str] = &[
 fn move_left(editor: &mut Editor) {
     let count = editor.take_count();
     let past_end = editor.mode == Mode::Insert;
+    let extend = editor.extend && editor.mode == Mode::Normal;
     let doc = editor.doc_mut();
     for _ in 0..count {
         if doc.cursor == 0 {
             break;
+        }
+        // Characterwise select stores a forward selection as
+        // [origin, just-past-head).  Crossing left from its one-character
+        // form has to turn it around; a plain decrement would make it empty.
+        if extend
+            && doc.anchor < doc.cursor
+            && position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor) == doc.anchor
+        {
+            let origin_end = doc.cursor;
+            doc.cursor = position::prev_grapheme_boundary(doc.text.slice(..), doc.anchor);
+            doc.clamp_cursor(false);
+            doc.anchor = origin_end;
+            continue;
         }
         // Stepping left off the start of a line lands on the previous line's
         // newline; clamp_cursor pulls that back onto the line's last char
@@ -246,8 +261,46 @@ fn move_left(editor: &mut Editor) {
 fn move_right(editor: &mut Editor) {
     let count = editor.take_count();
     let past_end = editor.mode == Mode::Insert;
+    let extend = editor.extend && editor.mode == Mode::Normal;
     let doc = editor.doc_mut();
     for _ in 0..count {
+        if extend && doc.anchor < doc.cursor {
+            // In a forward selection cursor is the exclusive end, not the
+            // character under the caret. Extend it by one complete grapheme.
+            // A newline is crossed together with the first character of the
+            // next line, matching normal-mode `l` wrapping.
+            if doc.cursor >= doc.text.len_chars() {
+                break;
+            }
+            let mut end = doc.cursor;
+            if matches!(doc.text.char(end), '\n' | '\r') {
+                end = position::next_grapheme_boundary(doc.text.slice(..), end);
+            }
+            if end < doc.text.len_chars() {
+                end = position::next_grapheme_boundary(doc.text.slice(..), end);
+            }
+            doc.cursor = end;
+            doc.goal_col = None;
+            continue;
+        }
+        // Mirror the leftward crossing above.  In a backward selection the
+        // cursor is the head itself and anchor is just past the origin.
+        if extend
+            && doc.anchor > doc.cursor
+            && position::next_grapheme_boundary(doc.text.slice(..), doc.cursor) == doc.anchor
+        {
+            let origin = doc.cursor;
+            let mut end = doc.anchor;
+            if end < doc.text.len_chars() && matches!(doc.text.char(end), '\n' | '\r') {
+                end = position::next_grapheme_boundary(doc.text.slice(..), end);
+            }
+            if end < doc.text.len_chars() {
+                end = position::next_grapheme_boundary(doc.text.slice(..), end);
+            }
+            doc.cursor = end;
+            doc.anchor = origin;
+            continue;
+        }
         let line = doc.cursor_line();
         let next = position::next_grapheme_boundary(doc.text.slice(..), doc.cursor);
         if !past_end && next == doc.line_end(line) && line + 1 < doc.line_count() {
@@ -278,13 +331,47 @@ fn move_vertical(doc: &mut Document, delta: isize, past_end: bool) {
 fn move_up(editor: &mut Editor) {
     let count = editor.take_count() as isize;
     let past_end = editor.mode == Mode::Insert;
-    move_vertical(editor.doc_mut(), -count, past_end);
+    if editor.extend && editor.mode == Mode::Normal {
+        move_vertical_selection(editor.doc_mut(), -count);
+    } else {
+        move_vertical(editor.doc_mut(), -count, past_end);
+    }
 }
 
 fn move_down(editor: &mut Editor) {
     let count = editor.take_count() as isize;
     let past_end = editor.mode == Mode::Insert;
-    move_vertical(editor.doc_mut(), count, past_end);
+    if editor.extend && editor.mode == Mode::Normal {
+        move_vertical_selection(editor.doc_mut(), count);
+    } else {
+        move_vertical(editor.doc_mut(), count, past_end);
+    }
+}
+
+/// Move the active character of an inclusive characterwise selection while
+/// keeping Document's public selection representation half-open.
+fn move_vertical_selection(doc: &mut Document, delta: isize) {
+    let (origin, head) = if doc.anchor <= doc.cursor {
+        (
+            doc.anchor,
+            position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor),
+        )
+    } else {
+        (
+            position::prev_grapheme_boundary(doc.text.slice(..), doc.anchor),
+            doc.cursor,
+        )
+    };
+    doc.cursor = head;
+    move_vertical(doc, delta, false);
+    let head = doc.cursor;
+    if head >= origin {
+        doc.anchor = origin;
+        doc.cursor = position::next_grapheme_boundary(doc.text.slice(..), head);
+    } else {
+        doc.anchor = position::next_grapheme_boundary(doc.text.slice(..), origin);
+        doc.cursor = head;
+    }
 }
 
 fn move_line_start(editor: &mut Editor) {
@@ -338,7 +425,59 @@ fn goto_matching_bracket(editor: &mut Editor) {
 
 fn extend_mode(editor: &mut Editor) {
     editor.keep_selection = true;
-    editor.extend = !editor.extend;
+    if editor.extend {
+        let (primary, extras) = {
+            let doc = editor.doc();
+            let primary = if doc.anchor < doc.cursor {
+                position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor)
+            } else {
+                doc.cursor
+            };
+            let extras = doc
+                .extra
+                .iter()
+                .map(|&(anchor, cursor)| {
+                    if anchor < cursor {
+                        position::prev_grapheme_boundary(doc.text.slice(..), cursor)
+                    } else {
+                        cursor
+                    }
+                })
+                .collect::<Vec<_>>();
+            (primary, extras)
+        };
+        let doc = editor.doc_mut();
+        doc.cursor = primary;
+        doc.anchor = primary;
+        for ((anchor, cursor), at) in doc.extra.iter_mut().zip(extras) {
+            *anchor = at;
+            *cursor = at;
+        }
+        editor.extend = false;
+        return;
+    }
+    editor.extend = true;
+
+    // Entering SELECT selects the complete grapheme under every cursor.  Apart
+    // from being visible immediately, this prevents d/x/c from mistaking `v`
+    // for an empty selection and arming their doubled line operation.
+    let (primary_end, extra_ends) = {
+        let doc = editor.doc();
+        let end = position::next_grapheme_boundary(doc.text.slice(..), doc.cursor);
+        let extras = doc
+            .extra
+            .iter()
+            .map(|&(_, cursor)| position::next_grapheme_boundary(doc.text.slice(..), cursor))
+            .collect::<Vec<_>>();
+        (end, extras)
+    };
+    let doc = editor.doc_mut();
+    doc.anchor = doc.cursor;
+    doc.cursor = primary_end;
+    for ((anchor, cursor), end) in doc.extra.iter_mut().zip(extra_ends) {
+        *anchor = *cursor;
+        *cursor = end;
+    }
 }
 
 fn select_word_next(editor: &mut Editor) {
@@ -743,9 +882,12 @@ fn selection_range(doc: &Document) -> (usize, usize) {
     let a = doc.anchor.min(len);
     let c = doc.cursor.min(len);
     if a == c {
-        (c, (c + 1).min(len))
+        (c, position::next_grapheme_boundary(doc.text.slice(..), c))
     } else {
-        (a.min(c), a.max(c))
+        (
+            position::grapheme_floor(doc.text.slice(..), a.min(c)),
+            position::grapheme_ceil(doc.text.slice(..), a.max(c)),
+        )
     }
 }
 
@@ -834,6 +976,26 @@ fn paste(editor: &mut Editor, after: bool) {
         return;
     }
     let linewise = reg.ends_with('\n');
+
+    // Pasting over a visible selection replaces exactly what is highlighted.
+    // Both p and P use the selection start: "after" and "before" only have a
+    // meaning when there is a single cursor.
+    if editor.doc().anchor != editor.doc().cursor {
+        let (from, to) = selection_range(editor.doc());
+        let cursor_to = if linewise {
+            from
+        } else {
+            from + last_grapheme_start(&reg)
+        };
+        let tx = Transaction::change(&editor.doc().text, std::iter::once((from, to, Some(reg))));
+        editor.extend = false;
+        let doc = editor.doc_mut();
+        doc.apply(tx, cursor_to);
+        doc.clamp_cursor(false);
+        doc.goal_col = None;
+        return;
+    }
+
     let doc = editor.doc_mut();
     let line = doc.cursor_line();
 
@@ -855,18 +1017,26 @@ fn paste(editor: &mut Editor, after: bool) {
         }
     } else {
         let at = if after {
-            (doc.cursor + 1).min(doc.line_end(line))
+            position::next_grapheme_boundary(doc.text.slice(..), doc.cursor).min(doc.line_end(line))
         } else {
             doc.cursor
         };
-        let end = at + reg.chars().count();
-        (at, reg, end.saturating_sub(1))
+        let cursor_to = at + last_grapheme_start(&reg);
+        (at, reg, cursor_to)
     };
 
     let tx = Transaction::insert(&doc.text, at, text);
     doc.apply(tx, cursor_to);
     doc.clamp_cursor(false);
     doc.goal_col = None;
+}
+
+/// Character offset of the start of the final user-perceived character.
+fn last_grapheme_start(text: &str) -> usize {
+    text.grapheme_indices(true)
+        .last()
+        .map(|(byte, _)| text[..byte].chars().count())
+        .unwrap_or(0)
 }
 
 fn next_word_start(doc: &Document, mut pos: usize) -> usize {
@@ -1044,6 +1214,12 @@ fn normal_mode(editor: &mut Editor) {
     // insert keeps them, so the result of a multi-cursor edit stays visible.
     if editor.mode == Mode::Normal {
         editor.doc_mut().extra.clear();
+    }
+    if editor.extend {
+        let doc = editor.doc_mut();
+        if doc.anchor < doc.cursor {
+            doc.cursor = position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor);
+        }
     }
     editor.extend = false;
     editor.set_mode(Mode::Normal);
@@ -1774,7 +1950,7 @@ mod tests {
         assert_eq!(editor.status, "copied 3 chars");
         // And a selection copy replaces it in turn.
         press(&mut editor, "vlc");
-        assert_eq!(editor.register, "d");
+        assert_eq!(editor.register, "de");
     }
 
     #[test]
@@ -1862,6 +2038,17 @@ mod tests {
         press(&mut editor, "$ p");
         assert_eq!(editor.doc().text.to_string(), "abXY\ncd");
         assert_eq!(editor.doc().cursor, 3); // on the last pasted char
+
+        // Neither the insertion point nor the final cursor may split a
+        // user-perceived character.
+        let mut editor = editor_with("👨\u{200d}👩\u{200d}👧x");
+        editor.register = "e\u{301}".into();
+        press(&mut editor, "p");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "👨\u{200d}👩\u{200d}👧e\u{301}x"
+        );
+        assert_eq!(editor.doc().cursor, 5); // on the e, not its combining mark
     }
 
     #[test]
