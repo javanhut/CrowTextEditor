@@ -11,13 +11,16 @@ mod picker;
 mod position;
 mod search;
 mod syntax;
+mod terminal;
 mod theme;
 mod transaction;
 mod ui;
+mod vt;
 
 use std::io::{stdout, BufWriter, Write};
 use std::panic;
 use std::path::PathBuf;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
@@ -25,6 +28,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{cursor, execute};
+use terminal::Wake;
 
 use editor::Editor;
 use keymap::Key;
@@ -50,8 +54,9 @@ KEYS (normal mode):
     gd K         goto definition, hover        C-space  LSP complete (insert)
     gc  ms(      comment lines, surround selection
     space m  :md   live GitHub-style markdown preview beside the buffer
+    space t  :term shell in a split below; C-\\ C-n for normal mode there
     space e      file tree sidebar             (typing pops word completion)
-    space c/f/d/t  command palette, find file, browse dir, themes
+    space c/f/d/T  command palette, find file, browse dir, themes
 
     Motions select the text they cross; d/c/y act on the selection.
     Every motion, edit, and inserted keystroke applies at every cursor.
@@ -84,9 +89,11 @@ fn main() -> std::io::Result<()> {
 
     let result = run(&mut editor);
 
-    // Give the terminal back first: killing and reaping the language servers
-    // is the last thing `:q` does, and nobody should watch it happen.
+    // Give the terminal back first: hanging up on the shell and killing and
+    // reaping the language servers is the last thing `:q` does, and nobody
+    // should watch it happen.
     restore_terminal()?;
+    editor.close_terminal();
     editor.shutdown_lsps();
     result
 }
@@ -114,33 +121,34 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
     // on every idle poll tick is what made the cursor and text flicker.
     let mut dirty = true;
 
+    // Keys and shell output arrive on one channel, so the loop can sleep on
+    // both at once: a byte from the pty wakes it as promptly as a keypress.
+    let rx = editor
+        .wake_rx
+        .take()
+        .expect("the wake channel is taken once");
+    let tx = editor.wake_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            if tx.send(Wake::Input(ev)).is_err() {
+                break;
+            }
+        }
+    });
+
     loop {
-        // Drain everything the terminal already has before drawing anything.
-        // Key repeat and fast typing arrive as a burst, and rendering (plus
+        // Drain everything already queued before drawing anything. Key
+        // repeat and fast typing arrive as a burst, and rendering (plus
         // reparsing, plus syncing the language server) once per key in that
         // burst is what makes the editor lag a whole word behind the keyboard.
         let mut burst = 0;
-        while burst < MAX_BURST && event::poll(Duration::ZERO)? {
-            match event::read()? {
-                Event::Key(ev) => {
-                    if let Some(key) = Key::from_crossterm(ev) {
-                        editor.handle_key(key);
-                        dirty = true;
-                        burst += 1;
-                    }
-                }
-                Event::Paste(text) => {
-                    editor.handle_paste(&text);
-                    dirty = true;
-                    burst += 1;
-                }
-                Event::Resize(cols, rows) => {
-                    editor.size = (cols, rows);
-                    dirty = true;
-                    burst += 1;
-                }
-                _ => {}
-            }
+        while burst < MAX_BURST {
+            let Ok(wake) = rx.try_recv() else {
+                break;
+            };
+            apply(editor, wake);
+            dirty = true;
+            burst += 1;
             if editor.should_quit {
                 break;
             }
@@ -153,6 +161,9 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
             dirty = true;
         }
         if editor.deps_tick() {
+            dirty = true;
+        }
+        if editor.terminal_tick() {
             dirty = true;
         }
 
@@ -176,6 +187,7 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
             // visible part of it into colors.
             editor.refresh_highlights();
             editor.refresh_preview();
+            editor.refresh_terminal();
             ui::render(editor, &mut out)?;
             dirty = false;
         }
@@ -184,10 +196,32 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
         // but wake up regularly so language-server messages arriving while
         // idle still get drained and drawn — and sooner when a recolor is owed.
         let wait = if reparse_due { REPARSE_GAP } else { IDLE_POLL };
-        event::poll(wait)?;
+        match rx.recv_timeout(wait) {
+            Ok(wake) => {
+                apply(editor, wake);
+                dirty = true;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
 
     Ok(())
+}
+
+/// Feed one wake-up to the editor.
+fn apply(editor: &mut Editor, wake: Wake) {
+    match wake {
+        Wake::Input(Event::Key(ev)) => {
+            if let Some(key) = Key::from_crossterm(ev) {
+                editor.handle_key(key);
+            }
+        }
+        Wake::Input(Event::Paste(text)) => editor.handle_paste(&text),
+        Wake::Input(Event::Resize(cols, rows)) => editor.size = (cols, rows),
+        Wake::Input(_) => {}
+        Wake::Pty(generation, bytes) => editor.terminal_output(generation, &bytes),
+    }
 }
 
 fn setup_terminal() -> std::io::Result<()> {

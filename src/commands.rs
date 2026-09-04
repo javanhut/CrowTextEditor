@@ -109,6 +109,7 @@ commands! {
     surround => "wrap the selection in a bracket or quote — ms then the character",
     toggle_wrap => "turn soft wrapping of long lines on or off (:wrap)",
     markdown_preview => "render this buffer as markdown in a live split (:md)",
+    terminal => "open a shell in a split below; again to jump to it, or hide it (:term)",
     split_vertical => "split the window side by side",
     split_horizontal => "split the window stacked",
     next_window => "focus the next window",
@@ -160,6 +161,8 @@ pub fn help_lines(keymap: &crate::keymap::KeyTrie) -> Vec<HelpLine> {
             "install the tool for a name or extension (:lsp-install <ext> for servers)",
         ),
         (":bn  :bp", "next / previous buffer"),
+        (":md", "live markdown preview beside the buffer; again to close"),
+        (":term", "a shell in a split below; again to jump to it, or hide it"),
         (":theme [name]", "list themes, or switch to one"),
         (
             ":config  :config!",
@@ -175,6 +178,22 @@ pub fn help_lines(keymap: &crate::keymap::KeyTrie) -> Vec<HelpLine> {
     ] {
         out.push(HelpLine::Entry {
             keys: cmd.to_string(),
+            name: String::new(),
+            doc: doc.to_string(),
+        });
+    }
+    out.push(HelpLine::Header(
+        "Terminal — <space> t / :term opens a shell below; keys go to it",
+    ));
+    for (keys, doc) in [
+        ("C-\\ C-n  C-w N", "normal mode in the terminal window: j/k, C-u/C-d, gg/G scroll its history"),
+        ("i  a", "back into the shell from normal mode"),
+        ("C-w h/j/k/l", "straight from the shell: focus the window beside it (C-w : for a command, C-w . sends C-w)"),
+        ("<space> t  :q", "hide the terminal; the shell keeps running, and the next <space> t brings it back"),
+        ("exit", "in the shell: closes the terminal for good"),
+    ] {
+        out.push(HelpLine::Entry {
+            keys: keys.to_string(),
             name: String::new(),
             doc: doc.to_string(),
         });
@@ -1583,6 +1602,10 @@ fn prev_buffer(editor: &mut Editor) {
 
 fn markdown_preview(editor: &mut Editor) {
     editor.toggle_preview();
+}
+
+fn terminal(editor: &mut Editor) {
+    editor.toggle_terminal();
 }
 
 fn toggle_wrap(editor: &mut Editor) {

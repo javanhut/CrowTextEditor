@@ -23,6 +23,8 @@ pub struct Config {
     pub soft_wrap: bool,
     pub trailing_whitespace: bool,
     pub strip_trailing_whitespace: bool,
+    /// What `space t` runs; empty means `$SHELL`, falling back to `/bin/sh`.
+    pub shell: String,
     /// Extra bindings per mode: (key sequence, command name).
     pub keys_normal: Vec<(String, String)>,
     pub keys_insert: Vec<(String, String)>,
@@ -46,6 +48,7 @@ impl Default for Config {
             soft_wrap: true,
             trailing_whitespace: true,
             strip_trailing_whitespace: true,
+            shell: String::new(),
             keys_normal: Vec::new(),
             keys_insert: Vec::new(),
             lsp: vec![("rs".into(), "rust-analyzer".into())],
@@ -130,6 +133,7 @@ pub fn apply(config: &Config) -> bool {
     TRAILING_WHITESPACE.store(config.trailing_whitespace, Ordering::Relaxed);
     STRIP_TRAILING_WHITESPACE.store(config.strip_trailing_whitespace, Ordering::Relaxed);
     *FMT.lock().unwrap() = config.fmt.clone();
+    *SHELL.lock().unwrap() = config.shell.clone();
     crate::theme::set(&config.theme)
 }
 
@@ -138,6 +142,27 @@ pub fn apply(config: &Config) -> bool {
 /// ponytail: one lock taken on `:w` and `:fmt`, not per keystroke; an
 /// `RwLock` if a formatter ever ends up on a hot path.
 static FMT: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The `shell` option, read when a terminal is opened.
+static SHELL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The program and arguments the terminal split runs: the config's `shell`
+/// (split on whitespace, so `bash --login` works), else `$SHELL`, else
+/// `/bin/sh`.
+pub fn shell() -> (String, Vec<String>) {
+    let configured = SHELL.lock().unwrap().clone();
+    let line = if configured.trim().is_empty() {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "/bin/sh".to_string())
+    } else {
+        configured
+    };
+    let mut parts = line.split_whitespace().map(str::to_string);
+    let program = parts.next().unwrap_or_else(|| "/bin/sh".to_string());
+    (program, parts.collect())
+}
 
 /// Built-in formatters, all reading the buffer on stdin and writing the
 /// result to stdout. `{file}` becomes the buffer's path (for tools that
@@ -584,6 +609,7 @@ show_hidden = false      # dotfiles, .git, and build dirs everywhere (toggle: . 
 soft_wrap = true         # wrap long lines instead of scrolling sideways (toggle: :wrap)
 trailing_whitespace = true          # tint spaces left at the end of a line
 strip_trailing_whitespace = true    # and cut them on :w (never in markdown, where they mean a line break)
+# shell = "zsh"          # what space t / :term runs (default: $SHELL, then /bin/sh)
 
 # Language servers: file extension = server command. crow starts the first
 # server whose extension matches an open file.
@@ -670,6 +696,7 @@ fn parse(text: &str) -> Config {
                     config.strip_trailing_whitespace =
                         value.parse().unwrap_or(config.strip_trailing_whitespace)
                 }
+                "shell" => config.shell = value,
                 _ => {}
             },
             "keys.normal" => config.keys_normal.push((key, value)),

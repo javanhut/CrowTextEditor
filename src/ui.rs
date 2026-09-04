@@ -51,7 +51,7 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     // The cursor shape is the clearest signal of which mode you're in. Some
     // terminals visibly blink the cursor every time the style is set, so only
     // send it when it actually changed.
-    let insert = editor.mode == Mode::Insert;
+    let insert = matches!(editor.mode, Mode::Insert | Mode::Terminal);
     let style = if insert {
         cursor::SetCursorStyle::SteadyBar
     } else {
@@ -98,6 +98,8 @@ fn render_text(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
             queue!(out, ResetColor)?;
         } else if editor.preview_win() == Some(id) {
             render_preview(editor, rect, out)?;
+        } else if editor.terminal_win() == Some(id) {
+            render_terminal(editor, rect, out)?;
         } else {
             render_window(editor, id, rect, out)?;
         }
@@ -510,6 +512,120 @@ fn render_preview(
     Ok(())
 }
 
+/// The shell split: the emulated screen's cells, with the theme's colors
+/// standing in for the terminal defaults. Runs of one style go out as one
+/// print, so a plain prompt line costs a handful of escapes.
+fn render_terminal(
+    editor: &Editor,
+    rect: crate::editor::Rect,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    use crate::vt::{self, Col};
+
+    let (rx, ry, rw, rh) = rect;
+    let Some(term) = &editor.terminal else {
+        return Ok(());
+    };
+    let theme = crate::theme::current();
+    let base_bg = theme.bg.unwrap_or(Color::Reset);
+    let base_fg = theme.fg.unwrap_or(Color::Reset);
+    let color = |c: Col, default: Color| match c {
+        Col::Default => default,
+        Col::Idx(n) => ansi_color(n),
+        Col::Rgb(r, g, b) => Color::Rgb { r, g, b },
+    };
+    let (_, rows) = term.screen.size();
+    let width = rw as usize;
+
+    for row in 0..rh as usize {
+        queue!(
+            out,
+            cursor::MoveTo(rx, ry + row as u16),
+            SetAttribute(Attribute::Reset),
+            SetBackgroundColor(base_bg),
+            SetForegroundColor(base_fg)
+        )?;
+        if row >= rows {
+            queue!(out, Print(" ".repeat(width)))?;
+            continue;
+        }
+        let mut printed = 0usize;
+        let mut current: Option<(Color, Color, u8)> = None;
+        let mut run = String::new();
+        for cell in term.screen.row(term.scroll, row) {
+            if cell.is_wide_tail() {
+                continue;
+            }
+            let w = unicode_width::UnicodeWidthChar::width(cell.ch).unwrap_or(1);
+            if printed + w > width {
+                break;
+            }
+            let (mut fg, mut bg) = (color(cell.fg, base_fg), color(cell.bg, base_bg));
+            if cell.attrs & vt::REVERSE != 0 {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            let style = (fg, bg, cell.attrs & !vt::REVERSE);
+            if current != Some(style) {
+                if !run.is_empty() {
+                    queue!(out, Print(std::mem::take(&mut run)))?;
+                }
+                queue!(
+                    out,
+                    SetAttribute(Attribute::Reset),
+                    SetForegroundColor(fg),
+                    SetBackgroundColor(bg)
+                )?;
+                for (bit, attr) in [
+                    (vt::BOLD, Attribute::Bold),
+                    (vt::DIM, Attribute::Dim),
+                    (vt::ITALIC, Attribute::Italic),
+                    (vt::UNDERLINE, Attribute::Underlined),
+                    (vt::STRIKE, Attribute::CrossedOut),
+                ] {
+                    if style.2 & bit != 0 {
+                        queue!(out, SetAttribute(attr))?;
+                    }
+                }
+                current = Some(style);
+            }
+            run.push(cell.ch);
+            printed += w;
+        }
+        queue!(
+            out,
+            Print(run),
+            SetAttribute(Attribute::Reset),
+            SetBackgroundColor(base_bg),
+            Print(" ".repeat(width.saturating_sub(printed)))
+        )?;
+    }
+    queue!(out, ResetColor)
+}
+
+/// An indexed terminal color. The first sixteen go out by name so the
+/// user's own palette applies; the rest are the 256-color cube.
+fn ansi_color(n: u8) -> Color {
+    match n {
+        0 => Color::Black,
+        1 => Color::DarkRed,
+        2 => Color::DarkGreen,
+        3 => Color::DarkYellow,
+        4 => Color::DarkBlue,
+        5 => Color::DarkMagenta,
+        6 => Color::DarkCyan,
+        7 => Color::Grey,
+        8 => Color::DarkGrey,
+        9 => Color::Red,
+        10 => Color::Green,
+        11 => Color::Yellow,
+        12 => Color::Blue,
+        13 => Color::Magenta,
+        14 => Color::Cyan,
+        15 => Color::White,
+        n => Color::AnsiValue(n),
+    }
+}
+
 /// Markdown attribute bit -> the escape that turns it on, and the one that
 /// turns it off again without resetting the colors around it.
 const ATTRS: [(u8, Attribute, Attribute); 4] = [
@@ -641,6 +757,7 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
             Mode::Command => ("COMMAND", Color::Yellow),
             Mode::Search => ("SEARCH", Color::Yellow),
             Mode::Picker => ("PICKER", Color::Yellow),
+            Mode::Terminal => ("TERM", Color::Cyan),
         }
     };
     let (lsep, rsep) = if crate::config::icons() {
@@ -660,7 +777,14 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         Print(" ".repeat(width))
     )?;
 
-    let file = format!(" {}{}", doc.name(), if doc.modified { " [+]" } else { "" });
+    let term = editor
+        .terminal
+        .as_ref()
+        .filter(|_| editor.terminal_focused());
+    let file = match term {
+        Some(t) => format!(" {}", t.label()),
+        None => format!(" {}{}", doc.name(), if doc.modified { " [+]" } else { "" }),
+    };
     queue!(
         out,
         cursor::MoveTo(0, row),
@@ -741,8 +865,19 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
     };
 
     // Filetype segment: the tree's icon and color, so both agree on what a
-    // file is. Empty for a scratch buffer or an extensionless file.
-    let (ft_seg, ft_color) = if ft.is_empty() {
+    // file is. Empty for a scratch buffer or an extensionless file. The
+    // terminal shows its shell there instead.
+    let (ft_seg, ft_color) = if let Some(t) = term {
+        let icon = if crate::config::icons() {
+            "\u{f120} "
+        } else {
+            ""
+        };
+        (
+            format!("{icon}{}  ", t.name),
+            theme.syntax[4].unwrap_or(Color::Cyan),
+        )
+    } else if ft.is_empty() {
         (String::new(), fg)
     } else {
         let (icon, color) = file_icon(&doc.name(), false, false);
@@ -753,17 +888,33 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         }
     };
 
-    let pos = format!(
-        " {}  {}/{} ",
-        editor.cursor_indicator(),
-        editor.current + 1,
-        editor.documents.len()
-    );
-    let (line, _) = doc.cursor_line_col();
-    let pct = format!(
-        " {}% ",
-        ((line + 1) * 100 / doc.line_count().max(1)).min(100)
-    );
+    let (pos, pct) = match term {
+        // The shell's cursor, and how far back into its history you are.
+        Some(t) => {
+            let (row, col) = t.screen.cursor();
+            let back = if t.scroll == 0 {
+                " live ".to_string()
+            } else {
+                format!(" ↑{} ", t.scroll)
+            };
+            (format!(" {}:{} ", row + 1, col + 1), back)
+        }
+        None => {
+            let (line, _) = doc.cursor_line_col();
+            (
+                format!(
+                    " {}  {}/{} ",
+                    editor.cursor_indicator(),
+                    editor.current + 1,
+                    editor.documents.len()
+                ),
+                format!(
+                    " {}% ",
+                    ((line + 1) * 100 / doc.line_count().max(1)).min(100)
+                ),
+            )
+        }
+    };
 
     let left_w = 2 + label.chars().count() + lsep.chars().count() + file.chars().count() + diag_w;
     let right_w = info.chars().count()
@@ -1104,6 +1255,7 @@ fn leader_hint(name: &str) -> (&'static str, Color) {
         "tree_toggle" => ("\u{f07c}", syn(5, Color::Yellow)),   //  open folder
         "command_palette" => ("\u{f489}", syn(3, Color::Magenta)), //  terminal
         "theme_picker" => ("\u{f043}", syn(7, Color::Blue)),    //  tint
+        "terminal" => ("\u{f120}", syn(4, Color::Cyan)),        //  terminal
         n if n.starts_with("split") => ("\u{f0db}", syn(4, Color::Cyan)), //  columns
         _ => ("\u{f013}", syn(6, Color::DarkYellow)),           //  gear
     }

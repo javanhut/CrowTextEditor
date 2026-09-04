@@ -94,6 +94,7 @@ tab_width = 4
 scrolloff = 3
 soft_wrap = true             # wrap long lines instead of scrolling sideways
 strip_trailing_whitespace = true
+shell = "zsh"                # what space t runs; default $SHELL
 
 [lsp]                        # file extension = server command
 rs = "rust-analyzer"
@@ -103,6 +104,20 @@ py = "pyright-langserver --stdio"
 "C-p" = "search"
 gq = "quit"
 ```
+
+A shell lives in a split, like vim's `:terminal`. `space t` (or `:term`)
+opens one below the buffer and puts you in it; the status bar says `TERM`
+and every key goes to the shell. It is a real pseudo-terminal running your
+`$SHELL`, with colors, the alternate screen, and scrollback, so `git diff`,
+`cargo test`, `htop`, `less`, and a nested editor all behave. `C-\ C-n` (or
+`C-w N`) drops to normal mode in the same window, where `j`/`k`/`C-u`/`C-d`
+scroll the history and `i` goes back to the shell; `C-w` plus a window key
+works straight from the shell (`C-w j` for the buffer above, `C-w :` for a
+command, `C-w .` sends a literal `C-w`). `space t` from the terminal hides it
+without killing the shell; the next `space t` brings it back, history and
+running job intact. `exit` closes it. Output arrives as it happens: the
+shell's reads share the wake channel keys come in on, so the main loop
+sleeps on both and never polls.
 
 Plus splits (`C-w v/s/w/q`) with independent cursors per window, counts (`3x`,
 `10d`, `5C`), multi-key bindings (`gg`), transaction-based undo/redo with
@@ -147,8 +162,9 @@ an emoji ZWJ sequence or a combining stack.
 | `space c`                          | command palette: fuzzy-run any command                                                                                                                                                                                                      |
 | `space f`                          | fuzzy file finder                                                                                                                                                                                                                           |
 | `space d`                          | directory browser picker (Enter descends, Backspace goes up)                                                                                                                                                                                |
-| `space t`                          | theme picker with live preview                                                                                                                                                                                                              |
-| `:w` `:q` `:wq` `:q!` `:e f` `:42` | ex commands                                                                                                                                                                                                                                 |
+| `space t` `:term`                  | shell in a split below; `C-\ C-n` or `C-w N` for normal mode there, `i` back in, `space t` again hides it                                                                                                                                  |
+| `space T`                          | theme picker with live preview                                                                                                                                                                                                              |
+| `:w` `:q` `:wq` `:q!` `:e f` `:42` | ex commands; also `:md`, `:term`, `:theme`, `:help` for the full list                                                                                                                                                                                                                                 |
 | `:%s/pat/repl/g`                   | substitute: `%` = whole buffer (omit for the cursor line), `g` = every match (omit for first per line), `i` = ignore case; pattern is a regex with `\1` groups                                                                              |
 
 Any command in the registry is also callable by name, so `:join_lines` works.
@@ -163,6 +179,8 @@ keymap.rs        keys, and the trie mapping sequences to commands
 commands.rs      every action, as a named static value
 editor.rs        state, key dispatch, ex commands, scrolling
 markdown.rs      markdown -> styled rows, for the preview pane
+vt.rs            terminal emulator: pty bytes -> a grid of styled cells
+terminal.rs      the shell process on its pty, and the keys sent to it
 ui.rs            rendering
 ```
 

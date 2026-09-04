@@ -7,6 +7,7 @@ use crate::commands;
 use crate::document::Document;
 use crate::keymap::{Key, KeyCode, KeyTrie, KeymapResult};
 use crate::lsp;
+use crate::terminal::{Terminal, Wake};
 
 use crate::search;
 
@@ -17,6 +18,8 @@ pub enum Mode {
     Command,
     Search,
     Picker,
+    /// The terminal split has focus and keys go to the shell.
+    Terminal,
 }
 
 /// A pending file operation started from the tree sidebar.
@@ -343,7 +346,8 @@ impl Default for Keymaps {
         normal.bind_str("C-w k", "focus_down");
         normal.bind_str("C-w l", "focus_right");
         normal.bind_str("<space> d", "file_explorer");
-        normal.bind_str("<space> t", "theme_picker");
+        normal.bind_str("<space> t", "terminal");
+        normal.bind_str("<space> T", "theme_picker");
         normal.bind_str("<space> m", "markdown_preview");
         normal.bind_str("gc", "toggle_comment");
         normal.bind_str("ms", "surround");
@@ -499,6 +503,16 @@ pub struct Editor {
     deps_tx: Option<std::sync::mpsc::Sender<crate::deps::Info>>,
     /// Manifests already fetched this session.
     deps_fetched: std::collections::HashSet<PathBuf>,
+    /// The shell split (`space t`), running whether or not it is shown.
+    pub terminal: Option<Terminal>,
+    /// Counts terminals ever started, so output from a closed one is dropped.
+    terminal_generation: u64,
+    /// A `C-w` or `C-\` typed into the terminal, waiting for its second key.
+    term_pending: Option<Key>,
+    /// Everything that wakes the main loop: input, shell output.
+    pub wake_tx: std::sync::mpsc::Sender<Wake>,
+    /// The receiving end, taken by the main loop at startup.
+    pub wake_rx: Option<std::sync::mpsc::Receiver<Wake>>,
 }
 
 impl Editor {
@@ -518,6 +532,7 @@ impl Editor {
         }
 
         let (keymaps, bad_binds) = keymaps_from(config);
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
         let status = if bad_binds.is_empty() {
             String::new()
         } else {
@@ -587,6 +602,11 @@ impl Editor {
             deps_rx: None,
             deps_tx: None,
             deps_fetched: std::collections::HashSet::new(),
+            terminal: None,
+            terminal_generation: 0,
+            term_pending: None,
+            wake_tx,
+            wake_rx: Some(wake_rx),
         })
     }
 
@@ -730,6 +750,7 @@ impl Editor {
         self.layout.split(self.focused, vertical, new);
         self.focused = new_id;
         self.restore_focus_state();
+        self.sync_focus_mode();
     }
 
     pub fn window_count(&self) -> usize {
@@ -737,6 +758,12 @@ impl Editor {
     }
 
     pub fn close_focused_window(&mut self) {
+        // The shell keeps running: closing its window hides it, and
+        // `space t` brings it back.
+        if self.terminal_focused() {
+            self.hide_terminal();
+            return;
+        }
         // Closing the last text window would leave you alone in the preview,
         // which has no cursor. Take the preview down instead.
         if self.window_count() == 2 && self.preview.is_some() {
@@ -863,6 +890,7 @@ impl Editor {
         self.save_focus_state();
         self.focused = id;
         self.restore_focus_state();
+        self.sync_focus_mode();
         true
     }
 
@@ -877,6 +905,323 @@ impl Editor {
         self.save_focus_state();
         self.focused = ids[(pos + 1) % ids.len()];
         self.restore_focus_state();
+        self.sync_focus_mode();
+    }
+
+    // ---- terminal ----------------------------------------------------------
+
+    /// The window the terminal is shown in, if it is open and not hidden.
+    pub fn terminal_win(&self) -> Option<usize> {
+        self.terminal.as_ref().and_then(|t| t.win)
+    }
+
+    pub fn terminal_focused(&self) -> bool {
+        self.terminal_win() == Some(self.focused)
+    }
+
+    /// `space t` / `:term`: open a shell below the window, jump to it if it
+    /// is open elsewhere, or hide it if it has focus. Hiding keeps the shell
+    /// running; the next `space t` brings it back with its history.
+    pub fn toggle_terminal(&mut self) {
+        match self.terminal_win() {
+            Some(win) if win == self.focused => self.hide_terminal(),
+            Some(win) => {
+                self.save_focus_state();
+                self.focused = win;
+                self.restore_focus_state();
+                self.sync_focus_mode();
+            }
+            None => self.show_terminal(),
+        }
+    }
+
+    fn show_terminal(&mut self) {
+        // Split first, so the shell is born at the size it will be drawn at
+        // and its first prompt lays out correctly.
+        self.split_window(false);
+        let win = self.focused;
+        let (_, _, w, h) = self.focused_rect();
+        match self.terminal.as_mut() {
+            Some(t) => {
+                t.win = Some(win);
+                t.resize(w, h);
+            }
+            None => {
+                let (program, args) = crate::config::shell();
+                self.terminal_generation += 1;
+                let generation = self.terminal_generation;
+                match Terminal::spawn(&program, &args, w, h, generation, self.wake_tx.clone()) {
+                    Ok(mut t) => {
+                        t.win = Some(win);
+                        self.terminal = Some(t);
+                    }
+                    Err(e) => {
+                        self.detach_window(win);
+                        self.set_status(format!("Error: can't start {program}: {e}"));
+                        return;
+                    }
+                }
+            }
+        }
+        self.sync_focus_mode();
+        self.set_status("terminal — C-\\ C-n for normal mode, space t hides it, exit closes it");
+    }
+
+    /// Take the terminal's window down without touching the shell.
+    fn hide_terminal(&mut self) {
+        let Some(win) = self.terminal_win() else {
+            return;
+        };
+        if self.window_count() <= 1 {
+            self.set_status("the terminal is the last window — :q! quits, or exit the shell");
+            return;
+        }
+        self.detach_window(win);
+        if let Some(t) = self.terminal.as_mut() {
+            t.win = None;
+        }
+    }
+
+    /// Remove a window from the layout, moving focus off it first: to the
+    /// window above (the terminal lives below the text it was opened from),
+    /// else the next one along.
+    fn detach_window(&mut self, win: usize) {
+        if self.focused == win && !self.focus_window_dir(0, -1) {
+            self.focus_next_window();
+        }
+        self.layout.close(win);
+        if self.layout.find(self.focused).is_none() {
+            let mut ids = Vec::new();
+            self.layout.leaf_ids(&mut ids);
+            self.focused = ids.first().copied().unwrap_or(0);
+            self.restore_focus_state();
+        }
+        self.sync_focus_mode();
+    }
+
+    /// Hang up on the shell and drop its window.
+    pub fn close_terminal(&mut self) {
+        if let Some(win) = self.terminal_win() {
+            if self.window_count() > 1 {
+                self.detach_window(win);
+            }
+        }
+        self.terminal = None;
+        if self.mode == Mode::Terminal {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// Bytes from the pty, via the wake channel. An empty chunk is the
+    /// hangup at the end.
+    pub fn terminal_output(&mut self, generation: u64, bytes: &[u8]) {
+        let Some(t) = self.terminal.as_mut() else {
+            return;
+        };
+        if t.generation != generation {
+            return;
+        }
+        if bytes.is_empty() {
+            self.terminal_tick();
+        } else {
+            t.feed(bytes);
+        }
+    }
+
+    /// Notice a shell that has exited. True when something changed.
+    pub fn terminal_tick(&mut self) -> bool {
+        let Some(code) = self.terminal.as_mut().and_then(Terminal::poll_exit) else {
+            return false;
+        };
+        self.close_terminal();
+        self.set_status(match code {
+            0 => "shell exited".to_string(),
+            n => format!("shell exited with status {n}"),
+        });
+        true
+    }
+
+    /// Keep the shell's screen the size of its window. Once per frame; a
+    /// frame where nothing moved costs one compare.
+    pub fn refresh_terminal(&mut self) {
+        let Some(win) = self.terminal_win() else {
+            return;
+        };
+        let Some((_, (.., w, h))) = self.window_rects().0.into_iter().find(|&(id, _)| id == win)
+        else {
+            return;
+        };
+        if let Some(t) = self.terminal.as_mut() {
+            t.resize(w, h);
+        }
+    }
+
+    /// Entering the terminal window puts you in the shell, the way vim does;
+    /// leaving it puts you back in normal mode.
+    fn sync_focus_mode(&mut self) {
+        self.term_pending = None;
+        if self.terminal_focused() {
+            if matches!(self.mode, Mode::Normal | Mode::Insert) {
+                self.set_mode(Mode::Terminal);
+                self.extend = false;
+            }
+        } else if self.mode == Mode::Terminal {
+            self.mode = Mode::Normal;
+            self.pending.clear();
+        }
+    }
+
+    /// Opening a file while the shell has focus: put it in a text window.
+    fn leave_terminal_for_edit(&mut self) {
+        if !self.terminal_focused() {
+            return;
+        }
+        if self.window_count() == 1 || !self.focus_window_dir(0, -1) {
+            let mut ids = Vec::new();
+            self.layout.leaf_ids(&mut ids);
+            let text = ids
+                .into_iter()
+                .find(|&id| id != self.focused && Some(id) != self.preview_win());
+            match text {
+                Some(id) => {
+                    self.save_focus_state();
+                    self.focused = id;
+                    self.restore_focus_state();
+                    self.sync_focus_mode();
+                }
+                None => self.split_window(false),
+            }
+        }
+    }
+
+    /// A key while the shell has focus. Everything goes to the shell except
+    /// two prefixes borrowed from vim: `C-\ C-n` drops to normal mode, and
+    /// `C-w` plus a key runs that window command (`C-w N` is normal mode,
+    /// `C-w .` sends a literal `C-w`).
+    fn handle_terminal_key(&mut self, key: Key) {
+        if self.terminal.is_none() {
+            self.mode = Mode::Normal;
+            return;
+        }
+        let ctrl = |c: char| Key {
+            code: KeyCode::Char(c),
+            ctrl: true,
+            alt: false,
+        };
+        // Without the kitty keyboard protocol, `C-\` reaches us as the raw
+        // byte 0x1c, which crossterm reports as Ctrl-4.
+        let is_backslash = |k: Key| k == ctrl('\\') || k == ctrl('4');
+        if let Some(prefix) = self.term_pending.take() {
+            if is_backslash(prefix) {
+                if key == ctrl('n') {
+                    self.mode = Mode::Normal;
+                    self.set_status("normal mode — i returns to the shell, space t hides it");
+                } else if let Some(t) = self.terminal.as_mut() {
+                    t.send_key(prefix);
+                    t.send_key(key);
+                }
+                return;
+            }
+            match key.code {
+                KeyCode::Char('N') if !key.ctrl && !key.alt => {
+                    self.mode = Mode::Normal;
+                    self.set_status("normal mode — i returns to the shell, space t hides it");
+                }
+                KeyCode::Char('.') if !key.ctrl && !key.alt => {
+                    if let Some(t) = self.terminal.as_mut() {
+                        t.send_key(prefix);
+                    }
+                }
+                KeyCode::Char(':') if !key.ctrl && !key.alt => {
+                    (commands::find("command_mode").unwrap().func)(self);
+                }
+                KeyCode::Char('w') if key.ctrl => self.focus_next_window(),
+                _ => {
+                    if let KeymapResult::Matched(command) =
+                        self.keymaps.normal.lookup(&[prefix, key])
+                    {
+                        self.run_terminal_command(command);
+                    }
+                }
+            }
+            return;
+        }
+        if is_backslash(key) || key == ctrl('w') {
+            self.term_pending = Some(key);
+            return;
+        }
+        if let Some(t) = self.terminal.as_mut() {
+            t.send_key(key);
+        }
+    }
+
+    /// Normal mode inside the terminal window: the usual keymap, with the
+    /// motions scrolling the shell's history and the inserts returning to it.
+    fn handle_terminal_normal_key(&mut self, key: Key) {
+        if self.pending.is_empty() && !key.ctrl && !key.alt {
+            if let KeyCode::Char(c) = key.code {
+                if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) {
+                    let digit = c.to_digit(10).unwrap() as usize;
+                    self.count = Some(self.count.unwrap_or(0).saturating_mul(10) + digit);
+                    return;
+                }
+            }
+        }
+        self.pending.push(key);
+        match self.keymaps.normal.lookup(&self.pending) {
+            KeymapResult::Pending => {}
+            KeymapResult::Matched(command) => {
+                self.pending.clear();
+                self.run_terminal_command(command);
+                self.count = None;
+            }
+            KeymapResult::NotFound => {
+                self.pending.clear();
+                self.count = None;
+            }
+        }
+    }
+
+    /// What a normal-mode command means with the shell in front of you.
+    /// Editing commands have nothing to act on and do nothing.
+    fn run_terminal_command(&mut self, command: &'static commands::Command) {
+        let count = self.take_count() as isize;
+        let rows = self
+            .terminal
+            .as_ref()
+            .map(|t| t.screen.size().1 as isize)
+            .unwrap_or(1);
+        let scroll = |editor: &mut Editor, delta: isize| {
+            if let Some(t) = editor.terminal.as_mut() {
+                t.scroll_by(delta);
+            }
+        };
+        match command.name {
+            "move_up" => scroll(self, count),
+            "move_down" => scroll(self, -count),
+            "half_page_up" => scroll(self, rows / 2 * count),
+            "half_page_down" => scroll(self, -(rows / 2) * count),
+            "page_up" => scroll(self, rows * count),
+            "page_down" => scroll(self, -rows * count),
+            "goto_file_start" => scroll(self, isize::MAX / 2),
+            "goto_file_end" => scroll(self, isize::MIN / 2),
+            "insert_mode"
+            | "append"
+            | "insert_at_line_start"
+            | "append_at_line_end"
+            | "open_below"
+            | "open_above" => {
+                scroll(self, isize::MIN / 2);
+                self.mode = Mode::Terminal;
+            }
+            "quit" | "terminal" | "normal_mode" | "focus_left" | "focus_right" | "focus_up"
+            | "focus_down" | "next_window" | "split_vertical" | "split_horizontal"
+            | "command_mode" | "command_palette" | "find_files" | "grep_text" | "recent_files"
+            | "file_explorer" | "tree_toggle" | "toggle_hidden" | "theme_picker" => {
+                (command.func)(self)
+            }
+            _ => {}
+        }
     }
 
     // ---- geometry ----------------------------------------------------------
@@ -961,6 +1306,11 @@ impl Editor {
             }
         }
 
+        if self.mode == Mode::Terminal {
+            self.handle_terminal_key(key);
+            return;
+        }
+
         // A bare `d`, `x` or `c` is waiting: pressing it again acts on the
         // whole line; any other key cancels and is handled normally.
         if let Some((armed, count)) = self.pending_line_op.take() {
@@ -999,6 +1349,10 @@ impl Editor {
         }
         if self.tree_focused {
             self.handle_tree_key(key);
+            return;
+        }
+        if self.terminal_focused() {
+            self.handle_terminal_normal_key(key);
             return;
         }
         if self.mode == Mode::Insert && self.completion.is_some() && self.handle_completion_key(key)
@@ -1258,6 +1612,7 @@ impl Editor {
         "e",
         "help",
         "md",
+        "term",
         "wrap",
         "fmt",
         "bn",
@@ -1440,6 +1795,7 @@ impl Editor {
             "e" | "edit" => match arg {
                 Some(path) => match Document::open(path) {
                     Ok(doc) => {
+                        self.leave_terminal_for_edit();
                         crate::config::record_recent(Path::new(path));
                         self.documents.push(doc);
                         self.current = self.documents.len() - 1;
@@ -1451,6 +1807,7 @@ impl Editor {
             },
             "help" | "h" => self.help_scroll = Some(0),
             "md" | "preview" => self.toggle_preview(),
+            "term" | "terminal" => self.toggle_terminal(),
             "wrap" => (commands::find("toggle_wrap").unwrap().func)(self),
             "fmt" | "format" => (commands::find("format_buffer").unwrap().func)(self),
             "bn" => (commands::find("next_buffer").unwrap().func)(self),
@@ -1480,6 +1837,7 @@ impl Editor {
             },
             "config" => match Document::open(crate::config::path()) {
                 Ok(doc) => {
+                    self.leave_terminal_for_edit();
                     self.documents.push(doc);
                     self.current = self.documents.len() - 1;
                     self.set_status("editing crow.toml — :config! to reload it");
@@ -1837,6 +2195,11 @@ impl Editor {
                 }
             }
             Mode::Picker => {} // ponytail: paste into pickers when someone misses it
+            Mode::Terminal => {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.paste(&text);
+                }
+            }
             Mode::Insert | Mode::Normal => {
                 if self.tree_focused || self.help_scroll.is_some() {
                     return;
@@ -2962,6 +3325,7 @@ impl Editor {
             },
         };
         crate::config::record_recent(&canon);
+        self.leave_terminal_for_edit();
         self.current = idx;
         let doc = self.doc_mut();
         let line = line.min(doc.line_count().saturating_sub(1));
@@ -3116,6 +3480,19 @@ impl Editor {
             let (x, y, w) = self.prompt_rect();
             let col = 3 + self.command_line.chars().count();
             return Some((x + (col as u16).min(w.saturating_sub(2)), y + 1));
+        }
+        if self.terminal_focused() {
+            // The shell's own cursor, unless you've scrolled away from it.
+            let t = self.terminal.as_ref()?;
+            if t.scroll != 0 || !t.screen.cursor_visible {
+                return None;
+            }
+            let (rx, ry, rw, rh) = self.focused_rect();
+            let (row, col) = t.screen.cursor();
+            if row >= rh as usize || col >= rw as usize {
+                return None;
+            }
+            return Some((rx + col as u16, ry + row as u16));
         }
 
         let (rx, ry, rw, rh) = self.focused_rect();
@@ -3702,11 +4079,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn space_t_opens_a_shell_below_and_toggles_it_away_and_back() {
+        let mut editor = editor_with("text\n");
+        press(&mut editor, "<space> t");
+        assert_eq!(editor.window_count(), 2);
+        assert!(editor.terminal_focused());
+        assert_eq!(editor.mode, Mode::Terminal);
+        let term_win = editor.focused;
+        let (wins, _) = editor.window_rects();
+        let (_, (_, ty, ..)) = wins.iter().find(|(id, _)| *id == term_win).unwrap();
+        assert!(*ty > 0, "the shell sits below the text");
+        assert!(editor.screen_cursor().is_some());
+
+        // C-\ C-n drops to normal mode in the same window; i goes back.
+        press(&mut editor, "C-\\ C-n");
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.terminal_focused());
+        press(&mut editor, "i");
+        assert_eq!(editor.mode, Mode::Terminal);
+
+        // Hiding keeps the shell; showing brings it back into the shell.
+        press(&mut editor, "C-w N");
+        press(&mut editor, "<space> t");
+        assert_eq!(editor.window_count(), 1);
+        assert!(editor.terminal.is_some());
+        assert!(!editor.terminal_focused());
+        assert_eq!(editor.mode, Mode::Normal);
+        press(&mut editor, "<space> t");
+        assert_eq!(editor.window_count(), 2);
+        assert_eq!(editor.mode, Mode::Terminal);
+
+        // Moving focus out and back in switches modes with it.
+        press(&mut editor, "C-w j");
+        assert!(!editor.terminal_focused());
+        assert_eq!(editor.mode, Mode::Normal);
+        press(&mut editor, "<space> t");
+        assert!(editor.terminal_focused());
+        assert_eq!(editor.mode, Mode::Terminal);
+
+        // :q on the shell hides it rather than killing it; the buffer's
+        // window is untouched.
+        press(&mut editor, "C-w :");
+        assert_eq!(editor.mode, Mode::Command);
+        press(&mut editor, "q <enter>");
+        assert_eq!(editor.window_count(), 1);
+        assert!(editor.terminal.is_some());
+        assert_eq!(editor.doc().text.to_string(), "text\n");
+        editor.close_terminal();
+        assert!(editor.terminal.is_none());
+    }
+
+    #[test]
+    fn editing_keys_in_the_terminal_never_touch_the_buffer() {
+        let mut editor = editor_with("keep me\n");
+        press(&mut editor, "<space> t");
+        press(&mut editor, "C-\\ C-n");
+        press(&mut editor, "dd");
+        press(&mut editor, "x");
+        press(&mut editor, "p");
+        assert_eq!(editor.doc().text.to_string(), "keep me\n");
+        assert_eq!(editor.mode, Mode::Normal);
+        editor.close_terminal();
+    }
+
+    #[test]
+    fn opening_a_file_from_the_terminal_lands_in_a_text_window() {
+        let dir = std::env::temp_dir().join(format!("crow-term-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "opened\n").unwrap();
+        let mut editor = editor_with("");
+        press(&mut editor, "<space> t");
+        press(&mut editor, "C-w :");
+        for c in format!("e {}", path.display()).chars() {
+            editor.handle_key(Key::char(c));
+        }
+        press(&mut editor, "<enter>");
+        assert!(!editor.terminal_focused());
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.doc().text.to_string(), "opened\n");
+        editor.close_terminal();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn theme_picker_previews_live_and_esc_restores() {
         let _guard = crate::theme::TEST_LOCK.lock().unwrap();
         crate::theme::set("default");
         let mut editor = editor_with("hello");
-        press(&mut editor, "<space> t");
+        press(&mut editor, "<space> T");
         press(&mut editor, "<down>"); // move to the second theme: live preview
         assert_ne!(crate::theme::current().name, "default");
         press(&mut editor, "<esc>");

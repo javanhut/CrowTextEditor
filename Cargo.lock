@@ -63,6 +63,7 @@ name = "crow"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "libc",
  "regex",
  "ropey",
  "serde_json",
