@@ -241,16 +241,16 @@ mod tests {
             vec![(0, 2, "x".to_string()), (4, 6, "x".to_string())]
         );
         let rope = Rope::from_str("foo foo");
-        assert_eq!(substitutions(&rope, 4..7, "foo", "bar", true, false).len(), 1);
+        assert_eq!(
+            substitutions(&rope, 4..7, "foo", "bar", true, false).len(),
+            1
+        );
         assert!(substitutions(&rope, 4..7, "nope", "bar", true, false).is_empty());
     }
 
     #[test]
     fn substitution_case_insensitive_flag() {
         let rope = Rope::from_str("Foo FOO");
-        assert_eq!(
-            substitutions(&rope, 0..7, "foo", "x", true, true).len(),
-            2
-        );
+        assert_eq!(substitutions(&rope, 0..7, "foo", "x", true, true).len(), 2);
     }
 }

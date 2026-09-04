@@ -286,9 +286,8 @@ pub fn package_manager() -> Option<Pm> {
 
 /// Is `program` runnable? A walk of PATH rather than spawning `which`.
 fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
 
 /// Already root: the package manager needs no `sudo`, and a container that
@@ -839,7 +838,11 @@ py = "pyright-langserver --stdio"
     /// but Homebrew is prefixed with sudo — unless we are already root.
     #[test]
     fn system_managers_need_root_and_homebrew_does_not() {
-        let sudo = |program, pm| install_command(program, Some(pm)).unwrap().starts_with("sudo ");
+        let sudo = |program, pm| {
+            install_command(program, Some(pm))
+                .unwrap()
+                .starts_with("sudo ")
+        };
         assert_eq!(sudo("clangd", Pm::Dnf), !is_root());
         assert_eq!(sudo("clangd", Pm::Apk), !is_root());
         assert!(!sudo("clangd", Pm::Brew));

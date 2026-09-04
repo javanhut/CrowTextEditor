@@ -1608,10 +1608,7 @@ impl Editor {
         doc.clamp_cursor(false);
         doc.commit_undo_group();
         self.last_search = pat;
-        self.set_status(format!(
-            "{n} substitution{}",
-            if n == 1 { "" } else { "s" }
-        ));
+        self.set_status(format!("{n} substitution{}", if n == 1 { "" } else { "s" }));
     }
 
     /// `:config!` — re-read crow.toml and install as much of it as can be
@@ -1776,9 +1773,7 @@ impl Editor {
             // when that is what stopped it, hand over the command to run.
             Err(e) if e.contains("password") => {
                 let cmd = crate::config::installer(&program).unwrap_or_default();
-                self.set_status(format!(
-                    "{program}: needs root — run `{cmd}` in a terminal"
-                ));
+                self.set_status(format!("{program}: needs root — run `{cmd}` in a terminal"));
             }
             Err(e) => self.set_status(format!("{program}: install failed — {e}")),
         }
