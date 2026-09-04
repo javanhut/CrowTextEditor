@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Crow
+GenericName=Text Editor
+Comment=Selection-first modal text editor
+Exec=crow %F
+Icon=accessories-text-editor
+Categories=Utility;TextEditor;Development;
+Keywords=editor;text;code;modal;
+MimeType=text/plain;
+StartupWMClass=raven-terminal
+Terminal=true

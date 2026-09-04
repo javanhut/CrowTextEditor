@@ -18,6 +18,15 @@ mkdir -p "$BIN_DIR"
 cp target/release/crow "$BIN_DIR/crow"
 echo "Installed $BIN_DIR/crow"
 
+# Desktop entry (Linux): Terminal=true lets the launcher wrap crow in the
+# configured terminal itself, and the per-user dir shadows any system copy.
+if [ "$(uname)" = "Linux" ]; then
+  APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  mkdir -p "$APP_DIR"
+  cp crow.desktop "$APP_DIR/crow.desktop"
+  echo "Installed $APP_DIR/crow.desktop"
+fi
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo "Note: $BIN_DIR is not on your PATH — add: export PATH=\"$BIN_DIR:\$PATH\"" ;;
