@@ -2787,7 +2787,11 @@ impl Editor {
                 self.maybe_autocomplete();
                 true
             }
-            KeyCode::Char(c) if !key.ctrl && !key.alt => {
+            // Only identifier characters type through the menu. Anything
+            // else — brackets, quotes, operators, space — ends the word, so
+            // it falls to the catch-all below, which closes the menu and
+            // lets `insert_typed` handle the key with autoclose intact.
+            KeyCode::Char(c) if !key.ctrl && !key.alt && (c.is_alphanumeric() || c == '_') => {
                 // Type through the menu: insert the char and narrow the list.
                 completion.prefix.push(c);
                 let prefix = completion.prefix.to_lowercase();
@@ -3070,13 +3074,16 @@ impl Editor {
                 return;
             }
 
-            // Openers bring their closer; quotes only where a pair reads as
-            // one (not right after a word: don't, can't…).
+            // Openers bring their closer. The apostrophe is the one that
+            // has to read the room: right after a word it is a contraction
+            // (don't, can't…), not an opener. A double quote after a word
+            // char is not — `x="`, `f(a,"` — so it always pairs.
             let close = match c {
                 '(' => Some(')'),
                 '[' => Some(']'),
                 '{' => Some('}'),
-                '"' | '\'' if !prev.is_some_and(|p| p.is_alphanumeric() || p == '_') => Some(c),
+                '"' => Some('"'),
+                '\'' if !prev.is_some_and(|p| p.is_alphanumeric() || p == '_') => Some(c),
                 _ => None,
             };
             if let Some(close) = close {
@@ -4860,6 +4867,28 @@ pub(crate) mod tests {
         press(&mut editor, "<space>");
         press(&mut editor, "don't");
         assert_eq!(editor.doc().text.to_string(), "\"hi\" don't");
+    }
+
+    #[test]
+    fn autoclose_still_fires_with_the_completion_popup_open() {
+        // `main` in the buffer means typing `ma` opens the word popup; the
+        // bracket that follows must still bring its closer instead of being
+        // typed raw through the menu.
+        let mut editor = editor_with("mainly
+");
+        press(&mut editor, "i");
+        press(&mut editor, "ma");
+        assert!(editor.completion.is_some());
+        press(&mut editor, "(");
+        assert!(editor.completion.is_none());
+        assert_eq!(editor.doc().text.to_string(), "ma()mainly\n");
+
+        // Same for quotes: one `"` makes the pair, it does not take three.
+        let mut editor = editor_with("mainly\n");
+        press(&mut editor, "i");
+        press(&mut editor, "ma");
+        press(&mut editor, "\"");
+        assert_eq!(editor.doc().text.to_string(), "ma\"\"mainly\n");
     }
 
     #[test]
