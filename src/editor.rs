@@ -2039,6 +2039,11 @@ impl Editor {
                 .or_else(|| lsp_program(&self.lsp_table))
         };
         match program {
+            // Nothing to do — and a system package would only have asked for
+            // a password it can't get.
+            Some(p) if crate::config::on_path(&p) => {
+                self.set_status(format!("{p} is already installed"));
+            }
             Some(p) => match crate::config::installer(&p) {
                 Some(cmd) => self.start_install(&p, &cmd),
                 None => self.set_status(format!("don't know how to install {p}")),
@@ -4874,8 +4879,10 @@ pub(crate) mod tests {
         // `main` in the buffer means typing `ma` opens the word popup; the
         // bracket that follows must still bring its closer instead of being
         // typed raw through the menu.
-        let mut editor = editor_with("mainly
-");
+        let mut editor = editor_with(
+            "mainly
+",
+        );
         press(&mut editor, "i");
         press(&mut editor, "ma");
         assert!(editor.completion.is_some());

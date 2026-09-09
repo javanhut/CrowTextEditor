@@ -255,6 +255,8 @@ pub fn builtin_lsp(ext: &str) -> Option<&'static str> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Pm {
     Brew,
+    /// Raven's manager: a pacman front-end, so it carries pacman's packages.
+    Rvn,
     Apt,
     Dnf,
     Pacman,
@@ -265,10 +267,12 @@ pub enum Pm {
 impl Pm {
     /// The shell command that installs `pkg`, asking nothing. Homebrew owns
     /// its own prefix; every system manager writes into system directories,
-    /// so every system manager needs root.
+    /// so every system manager needs root — except rvn when its daemon is up,
+    /// which then does the privileged work on our behalf.
     fn install(self, pkg: &str) -> String {
         let (root, cmd) = match self {
             Pm::Brew => (false, format!("brew install {pkg}")),
+            Pm::Rvn => (!rvnd_running(), format!("rvn install -y {pkg}")),
             Pm::Apt => (true, format!("apt-get install -y {pkg}")),
             Pm::Dnf => (true, format!("dnf install -y {pkg}")),
             Pm::Pacman => (true, format!("pacman -S --needed --noconfirm {pkg}")),
@@ -288,7 +292,9 @@ impl Pm {
 /// macOS means Homebrew. On Linux the distro's own manager wins even when
 /// Homebrew is installed beside it: it is what owns /usr/bin, it is where
 /// every other package on the machine came from, and every Linux box has one.
-/// Homebrew is the answer there only when nothing else answered.
+/// Homebrew is the answer there only when nothing else answered. rvn comes
+/// before the pacman it wraps: a Raven box has both, and rvn is the one its
+/// user reaches for.
 pub fn package_manager() -> Option<Pm> {
     static PM: std::sync::OnceLock<Option<Pm>> = std::sync::OnceLock::new();
     *PM.get_or_init(|| {
@@ -296,6 +302,7 @@ pub fn package_manager() -> Option<Pm> {
             return Some(Pm::Brew);
         }
         [
+            ("rvn", Pm::Rvn),
             ("pacman", Pm::Pacman),
             ("apt-get", Pm::Apt),
             ("dnf", Pm::Dnf),
@@ -310,9 +317,19 @@ pub fn package_manager() -> Option<Pm> {
 }
 
 /// Is `program` runnable? A walk of PATH rather than spawning `which`.
-fn on_path(program: &str) -> bool {
+pub fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
+/// Is rvn's daemon up? Then `rvn install` needs no sudo: the client hands
+/// the job to rvnd over its control socket, and rvnd is the one running as
+/// root. The socket path is rvn's own default, or `$RVN_SOCKET` when set.
+fn rvnd_running() -> bool {
+    let socket = std::env::var_os("RVN_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/rvn/ctl"));
+    std::fs::metadata(socket).is_ok()
 }
 
 /// Already root: the package manager needs no `sudo`, and a container that
@@ -519,7 +536,18 @@ fn install_command(program: &str, pm: Option<Pm>) -> Option<String> {
         return Some((*cmd).to_string());
     }
     let (_, names, fallback) = PACKAGES.iter().find(|(p, _, _)| *p == program)?;
-    let named = |pm: Pm| names.iter().find(|(m, _)| *m == pm).map(|(_, name)| *name);
+    // rvn installs from pacman's repositories, so a package is called
+    // whatever pacman calls it — one column in the table covers both.
+    let named = |pm: Pm| {
+        let table_pm = match pm {
+            Pm::Rvn => Pm::Pacman,
+            pm => pm,
+        };
+        names
+            .iter()
+            .find(|(m, _)| *m == table_pm)
+            .map(|(_, name)| *name)
+    };
 
     // This machine's own manager first; then a build from the tool's own
     // ecosystem; then Homebrew, which runs on Linux too — if it is installed
@@ -873,6 +901,25 @@ py = "pyright-langserver --stdio"
         assert_eq!(sudo("clangd", Pm::Dnf), !is_root());
         assert_eq!(sudo("clangd", Pm::Apk), !is_root());
         assert!(!sudo("clangd", Pm::Brew));
+    }
+
+    /// Raven's rvn wraps pacman: same package names, its own command line,
+    /// and no sudo once its daemon is the one doing the writing.
+    #[test]
+    fn rvn_installs_pacmans_packages_its_own_way() {
+        let raven = install_command("clang-format", Some(Pm::Rvn)).unwrap();
+        assert!(raven.ends_with("rvn install -y clang"), "{raven}");
+        assert!(!raven.contains("pacman"));
+        assert_eq!(
+            raven.starts_with("sudo "),
+            !is_root() && !rvnd_running(),
+            "{raven}"
+        );
+        // A package pacman lacks is one rvn lacks too: build it instead.
+        assert_eq!(
+            install_command("taplo", Some(Pm::Rvn)).as_deref(),
+            Some("cargo install taplo-cli --locked")
+        );
     }
 
     /// A distro that has no package for a tool gets a build from the tool's
