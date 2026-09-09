@@ -496,6 +496,11 @@ pub struct Editor {
     pub pending_install: Option<(String, String)>,
     /// A background install in flight: (program, its result channel).
     install: Option<(String, std::sync::mpsc::Receiver<Result<(), String>>)>,
+    /// An install running in the terminal split, where sudo can ask for a
+    /// password: (program, whether the terminal is ours — spawned for the
+    /// install and closed when it ends — or the user's own shell, which was
+    /// handed the command and is watched for the program to appear).
+    terminal_install: Option<(String, bool)>,
     /// Manifest badges: (ecosystem, dep name) -> (current version, latest).
     pub dep_info: HashMap<(crate::deps::Kind, String), (Option<String>, Option<String>)>,
     /// All in-flight registry fetches stream over this one channel.
@@ -598,6 +603,7 @@ impl Editor {
             hover: None,
             pending_install: None,
             install: None,
+            terminal_install: None,
             dep_info: HashMap::new(),
             deps_rx: None,
             deps_tx: None,
@@ -936,6 +942,14 @@ impl Editor {
     }
 
     fn show_terminal(&mut self) {
+        let (program, args) = crate::config::shell();
+        self.show_terminal_running(&program, &args);
+        self.set_status("terminal — C-\\ C-n for normal mode, space t hides it, exit closes it");
+    }
+
+    /// Open the terminal split: bring back the hidden shell if there is one,
+    /// else start `program` in a fresh one. Focus lands in it either way.
+    fn show_terminal_running(&mut self, program: &str, args: &[String]) {
         // Split first, so the shell is born at the size it will be drawn at
         // and its first prompt lays out correctly.
         self.split_window(false);
@@ -947,10 +961,9 @@ impl Editor {
                 t.resize(w, h);
             }
             None => {
-                let (program, args) = crate::config::shell();
                 self.terminal_generation += 1;
                 let generation = self.terminal_generation;
-                match Terminal::spawn(&program, &args, w, h, generation, self.wake_tx.clone()) {
+                match Terminal::spawn(program, args, w, h, generation, self.wake_tx.clone()) {
                     Ok(mut t) => {
                         t.win = Some(win);
                         self.terminal = Some(t);
@@ -964,7 +977,6 @@ impl Editor {
             }
         }
         self.sync_focus_mode();
-        self.set_status("terminal — C-\\ C-n for normal mode, space t hides it, exit closes it");
     }
 
     /// Take the terminal's window down without touching the shell.
@@ -1034,6 +1046,25 @@ impl Editor {
             return false;
         };
         self.close_terminal();
+        match self.terminal_install.take() {
+            // The terminal was ours: its exit status is the install's.
+            Some((program, true)) => {
+                if code != 0 {
+                    self.set_status(format!(
+                        "{program}: install failed — :install {program} to retry"
+                    ));
+                } else if crate::config::on_path(&program) {
+                    self.install_done(&program);
+                } else {
+                    self.set_status(format!("{program}: installed, but not on PATH"));
+                }
+                return true;
+            }
+            // The user's shell went away with the install still unseen: they
+            // know, and the status line has nothing to add.
+            Some((_, false)) => return true,
+            None => {}
+        }
         self.set_status(match code {
             0 => "shell exited".to_string(),
             n => format!("shell exited with status {n}"),
@@ -2017,7 +2048,7 @@ impl Editor {
     /// `:install x` — x is a tool name, or a file extension whose formatter
     /// (or, with `lsp_only`, language server) gets resolved and installed.
     fn install_named(&mut self, name: &str, lsp_only: bool) {
-        if self.install.is_some() {
+        if self.install_running() {
             self.set_status("an install is already running");
             return;
         }
@@ -2060,7 +2091,7 @@ impl Editor {
         let Some(cmd) = crate::config::installer(program) else {
             return false;
         };
-        if self.install.is_some() {
+        if self.install_running() {
             return false;
         }
         self.set_status(format!("{program} not installed — run `{cmd}`? (y/N)"));
@@ -2068,17 +2099,21 @@ impl Editor {
         true
     }
 
-    /// Run `cmd` in a background thread; `install_tick` picks up the result.
+    /// Is an install underway that another would collide with?
+    fn install_running(&self) -> bool {
+        self.install.is_some() || matches!(self.terminal_install, Some((_, true)))
+    }
+
+    /// Run `cmd`: in the terminal split when it needs root, so sudo has a
+    /// tty to ask for the password on; else in a background thread that
+    /// `install_tick` picks the result up from.
     fn start_install(&mut self, program: &str, cmd: &str) {
+        if cmd.starts_with("sudo ") {
+            self.start_install_in_terminal(program, cmd);
+            return;
+        }
+        let shell_cmd = cmd.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
-        // A system package manager needs root, and `sudo` here has no terminal
-        // to ask for a password on: the prompt would go nowhere and the install
-        // would hang for the rest of the session. `-n` turns that into an
-        // immediate failure `install_tick` can explain instead.
-        let shell_cmd = match cmd.strip_prefix("sudo ") {
-            Some(rest) => format!("sudo -n {rest}"),
-            None => cmd.to_string(),
-        };
         std::thread::spawn(move || {
             let result = match std::process::Command::new("sh")
                 .args(["-c", &shell_cmd])
@@ -2102,9 +2137,68 @@ impl Editor {
         self.install = Some((program.to_string(), rx));
     }
 
-    /// Poll the background install from the main loop. True when the status
-    /// changed and a redraw is due.
+    /// A system package manager needs root, and a headless `sudo` has
+    /// nowhere to ask for the password: it would hang for the rest of the
+    /// session. So the command runs in the terminal split, in front of the
+    /// user. With no shell open, one is started just for this and closes
+    /// itself when done; an open shell is handed the command instead, and
+    /// the program is watched for on PATH.
+    fn start_install_in_terminal(&mut self, program: &str, cmd: &str) {
+        if self.terminal.is_some() {
+            if !self.terminal_focused() {
+                self.toggle_terminal();
+            }
+            if let Some(t) = self.terminal.as_mut() {
+                t.write(format!("{cmd}\n").as_bytes());
+            }
+            self.terminal_install = Some((program.to_string(), false));
+            self.set_status(format!("installing {program} in the terminal…"));
+            return;
+        }
+        // A failed install would otherwise vanish with its output; hold the
+        // window so the reason can be read.
+        let script = format!(
+            "{cmd} || {{ printf '\\n{program}: install failed — press Enter to close\\n'; read _; exit 1; }}"
+        );
+        self.show_terminal_running("sh", &["-c".to_string(), script]);
+        if self.terminal.is_none() {
+            return; // the spawn failure is already on the status line
+        }
+        self.terminal_install = Some((program.to_string(), true));
+        self.set_status(format!("installing {program}… (`{cmd}`)"));
+    }
+
+    /// `program` is now installed: retry what needed it.
+    fn install_done(&mut self, program: &str) {
+        // A server that failed to spawn earlier can be retried now.
+        self.lsp_failed.clear();
+        self.set_status(format!("{program} installed"));
+        // If it formats the current buffer, finish what :fmt started.
+        let formats_this = self
+            .doc()
+            .path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(crate::config::formatter)
+            .is_some_and(|c| c.split_whitespace().next() == Some(program));
+        if formats_this {
+            (commands::find("format_buffer").unwrap().func)(self);
+        }
+    }
+
+    /// Poll the installs from the main loop. True when the status changed
+    /// and a redraw is due.
     pub fn install_tick(&mut self) -> bool {
+        // An install typed into the user's own shell reports nothing back;
+        // the program turning up on PATH is the signal.
+        if let Some((program, false)) = &self.terminal_install {
+            if crate::config::on_path(program) {
+                let (program, _) = self.terminal_install.take().unwrap();
+                self.install_done(&program);
+                return true;
+            }
+        }
         let Some((_, rx)) = self.install.as_ref() else {
             return false;
         };
@@ -2115,29 +2209,7 @@ impl Editor {
         };
         let (program, _) = self.install.take().unwrap();
         match result {
-            Ok(()) => {
-                // A server that failed to spawn earlier can be retried now.
-                self.lsp_failed.clear();
-                self.set_status(format!("{program} installed"));
-                // If it formats the current buffer, finish what :fmt started.
-                let formats_this = self
-                    .doc()
-                    .path
-                    .as_ref()
-                    .and_then(|p| p.extension())
-                    .and_then(|e| e.to_str())
-                    .and_then(crate::config::formatter)
-                    .is_some_and(|c| c.split_whitespace().next() == Some(program.as_str()));
-                if formats_this {
-                    (commands::find("format_buffer").unwrap().func)(self);
-                }
-            }
-            // `sudo -n` above rather than a password prompt nobody can answer:
-            // when that is what stopped it, hand over the command to run.
-            Err(e) if e.contains("password") => {
-                let cmd = crate::config::installer(&program).unwrap_or_default();
-                self.set_status(format!("{program}: needs root — run `{cmd}` in a terminal"));
-            }
+            Ok(()) => self.install_done(&program),
             Err(e) => self.set_status(format!("{program}: install failed — {e}")),
         }
         true
@@ -4139,6 +4211,80 @@ pub(crate) mod tests {
         assert_eq!(editor.doc().text.to_string(), "text\n");
         editor.close_terminal();
         assert!(editor.terminal.is_none());
+    }
+
+    /// Wait for the install terminal to finish, the way the main loop would.
+    fn settle_install(editor: &mut Editor) {
+        for _ in 0..200 {
+            if editor.terminal_tick() || editor.install_tick() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the install never finished: {:?}", editor.status);
+    }
+
+    /// A root install runs in a terminal of its own, so sudo has somewhere
+    /// to ask; when it succeeds the terminal goes away and the tool counts
+    /// as installed.
+    #[test]
+    fn a_root_install_runs_in_its_own_terminal_and_closes_on_success() {
+        let mut editor = editor_with("text\n");
+        // `true` stands in for the package manager: it is on every PATH.
+        editor.start_install_in_terminal("true", "true");
+        assert_eq!(editor.window_count(), 2);
+        assert!(editor.terminal_focused(), "the password prompt needs focus");
+        assert_eq!(editor.mode, Mode::Terminal);
+        assert!(editor.install_running());
+        settle_install(&mut editor);
+        assert_eq!(editor.status, "true installed");
+        assert!(editor.terminal.is_none());
+        assert_eq!(editor.window_count(), 1);
+        assert!(!editor.install_running());
+    }
+
+    /// A failed install holds its terminal until Enter, so the error can be
+    /// read, then reports the failure.
+    #[test]
+    fn a_failed_root_install_waits_for_enter_then_reports() {
+        let mut editor = editor_with("text\n");
+        editor.start_install_in_terminal("crow-no-such-tool", "false");
+        // Still there, waiting on the read.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!editor.terminal_tick());
+        assert!(editor.terminal.is_some());
+        editor.terminal.as_mut().unwrap().write(b"\n");
+        settle_install(&mut editor);
+        assert!(editor.terminal.is_none());
+        assert!(
+            editor
+                .status
+                .starts_with("crow-no-such-tool: install failed"),
+            "{}",
+            editor.status
+        );
+    }
+
+    /// With a shell already open the command is typed into it instead, and
+    /// the tool showing up on PATH is what marks the install done.
+    #[test]
+    fn a_root_install_uses_the_open_shell_and_watches_path() {
+        let mut editor = editor_with("text\n");
+        press(&mut editor, "<space> t");
+        assert!(editor.focus_window_dir(0, -1));
+        editor.sync_focus_mode();
+        assert!(!editor.terminal_focused());
+        editor.start_install_in_terminal("true", ": would be sudo");
+        assert!(editor.terminal_focused(), "the password prompt needs focus");
+        assert_eq!(editor.terminal_install, Some(("true".to_string(), false)));
+        assert!(
+            !editor.install_running(),
+            "the user's shell is not ours to wait on"
+        );
+        assert!(editor.install_tick());
+        assert_eq!(editor.status, "true installed");
+        assert!(editor.terminal.is_some(), "the user's shell stays");
+        editor.close_terminal();
     }
 
     #[test]

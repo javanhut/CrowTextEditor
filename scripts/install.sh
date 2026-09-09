@@ -15,7 +15,10 @@ echo "Building crow (release)…"
 cargo build --release
 
 mkdir -p "$BIN_DIR"
-cp target/release/crow "$BIN_DIR/crow"
+# Rename over the old binary rather than writing into it: a crow that is
+# running keeps its own copy, and cp would fail with "text file busy".
+cp target/release/crow "$BIN_DIR/crow.new"
+mv -f "$BIN_DIR/crow.new" "$BIN_DIR/crow"
 echo "Installed $BIN_DIR/crow"
 
 # Desktop entry (Linux): Terminal=true lets the launcher wrap crow in the
