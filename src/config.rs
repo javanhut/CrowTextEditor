@@ -367,14 +367,28 @@ pub fn on_path(program: &str) -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
 
-/// Is rvn's daemon up? Then `rvn install` needs no sudo: the client hands
-/// the job to rvnd over its control socket, and rvnd is the one running as
-/// root. The socket path is rvn's own default, or `$RVN_SOCKET` when set.
+/// Is rvn's daemon up, and will it talk to us? Then `rvn install` needs no
+/// sudo: the client hands the job to rvnd over its control socket, and rvnd
+/// is the one running as root. The socket path is rvn's own default, or
+/// `$RVN_SOCKET` when set; it is group-writable, so a user outside that
+/// group still needs sudo.
 fn rvnd_running() -> bool {
     let socket = std::env::var_os("RVN_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/run/rvn/ctl"));
-    std::fs::metadata(socket).is_ok()
+    writable(&socket)
+}
+
+#[cfg(unix)]
+fn writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .is_ok_and(|p| unsafe { libc::access(p.as_ptr(), libc::W_OK) } == 0)
+}
+
+#[cfg(not(unix))]
+fn writable(_: &Path) -> bool {
+    false
 }
 
 /// Already root: the package manager needs no `sudo`, and a container that
@@ -390,44 +404,10 @@ fn is_root() -> bool {
     false
 }
 
-/// How to install a missing tool, keyed by the program :fmt or the LSP
-/// tries to spawn. Powers `:install` and the "install? (y/N)" offer.
-///
-/// Anything its own ecosystem ships — rustup, npm, gem, a source build — is
-/// installed that way on every platform, so it is one command here. Tools
-/// that come from the operating system live in `PACKAGES` instead, where
-/// each manager gets to name them itself.
+/// How to install a missing tool that no package manager carries, keyed by
+/// the program :fmt or the LSP tries to spawn. Everything else lives in
+/// `PACKAGES`, where this machine's own manager gets the first say.
 const INSTALLERS: &[(&str, &str)] = &[
-    ("prettier", "npm install -g prettier"),
-    ("rustfmt", "rustup component add rustfmt"),
-    ("rust-analyzer", "rustup component add rust-analyzer"),
-    ("pyright-langserver", "npm install -g pyright"),
-    (
-        "typescript-language-server",
-        "npm install -g typescript typescript-language-server",
-    ),
-    (
-        "bash-language-server",
-        "npm install -g bash-language-server",
-    ),
-    (
-        "yaml-language-server",
-        "npm install -g yaml-language-server",
-    ),
-    (
-        "vscode-json-language-server",
-        "npm install -g vscode-langservers-extracted",
-    ),
-    (
-        "vscode-css-language-server",
-        "npm install -g vscode-langservers-extracted",
-    ),
-    (
-        "vscode-html-language-server",
-        "npm install -g vscode-langservers-extracted",
-    ),
-    ("ruby-lsp", "gem install ruby-lsp"),
-    ("intelephense", "npm install -g intelephense"),
     // Oxigen ships no package: build it from its own repo, cached under
     // ~/.cache/crow. `make install` picks /usr/local or ~/.local by itself,
     // so neither needs sudo.
@@ -435,8 +415,12 @@ const INSTALLERS: &[(&str, &str)] = &[
     ("oxigen-lsp", OXIGEN_LSP_BUILD),
 ];
 
-/// Tools that come from the operating system: `(program, package name under
-/// each manager known to carry it, what to do where none does)`.
+/// Tools a package manager may carry: `(program, package name under each
+/// manager known to carry it, what to do where none does)`. Powers `:install`
+/// and the "install? (y/N)" offer.
+///
+/// The manager comes first even for tools npm or rustup also ship: a machine
+/// whose manager has prettier should not need npm installed to get it.
 ///
 /// A manager is listed only where the package is really there, so a machine
 /// whose manager doesn't have the tool falls through to the third field —
@@ -451,6 +435,66 @@ type PackageRow = (
 );
 
 const PACKAGES: &[PackageRow] = &[
+    (
+        "prettier",
+        &[(Pm::Pacman, "prettier")],
+        Some("npm install -g prettier"),
+    ),
+    (
+        "rustfmt", // ships with the Rust toolchain
+        &[(Pm::Pacman, "rust")],
+        Some(RUSTUP_RUSTFMT),
+    ),
+    (
+        "rust-analyzer",
+        &[(Pm::Pacman, "rust-analyzer")],
+        Some(RUSTUP_RUST_ANALYZER),
+    ),
+    (
+        "pyright-langserver",
+        &[(Pm::Pacman, "pyright")],
+        Some("npm install -g pyright"),
+    ),
+    (
+        "typescript-language-server",
+        &[(Pm::Pacman, "typescript-language-server")],
+        Some("npm install -g typescript typescript-language-server"),
+    ),
+    (
+        "bash-language-server",
+        &[(Pm::Pacman, "bash-language-server")],
+        Some("npm install -g bash-language-server"),
+    ),
+    (
+        "yaml-language-server",
+        &[(Pm::Pacman, "yaml-language-server")],
+        Some("npm install -g yaml-language-server"),
+    ),
+    (
+        "vscode-json-language-server",
+        &[(Pm::Pacman, "vscode-json-languageserver")],
+        Some("npm install -g vscode-langservers-extracted"),
+    ),
+    (
+        "vscode-css-language-server",
+        &[(Pm::Pacman, "vscode-css-languageserver")],
+        Some("npm install -g vscode-langservers-extracted"),
+    ),
+    (
+        "vscode-html-language-server",
+        &[(Pm::Pacman, "vscode-html-languageserver")],
+        Some("npm install -g vscode-langservers-extracted"),
+    ),
+    (
+        "ruby-lsp",
+        &[(Pm::Pacman, "ruby-lsp")],
+        Some("gem install ruby-lsp"),
+    ),
+    (
+        "intelephense",
+        &[(Pm::Rvn, "nodejs-intelephense")], // AUR
+        Some("npm install -g intelephense"),
+    ),
     (
         "gofmt", // ships with the Go toolchain
         &[
@@ -509,7 +553,7 @@ const PACKAGES: &[PackageRow] = &[
     ),
     (
         "taplo",
-        &[(Pm::Brew, "taplo")],
+        &[(Pm::Brew, "taplo"), (Pm::Pacman, "taplo-cli")],
         Some("cargo install taplo-cli --locked"),
     ),
     (
@@ -549,9 +593,14 @@ const PACKAGES: &[PackageRow] = &[
     ),
     ("zls", &[(Pm::Brew, "zls"), (Pm::Pacman, "zls")], None),
     // Odin's language server carries odinfmt with it.
-    ("ols", &[(Pm::Brew, "ols")], None),
-    ("odinfmt", &[(Pm::Brew, "ols")], None),
-    ("jdtls", &[(Pm::Brew, "jdtls")], None),
+    ("ols", &[(Pm::Brew, "ols"), (Pm::Pacman, "ols")], None),
+    (
+        "odinfmt",
+        &[(Pm::Brew, "ols"), (Pm::Pacman, "odinfmt")],
+        None,
+    ),
+    // rvn reaches the AUR, which plain pacman does not.
+    ("jdtls", &[(Pm::Brew, "jdtls"), (Pm::Rvn, "jdtls")], None),
     (
         "lua-language-server",
         &[
@@ -562,8 +611,15 @@ const PACKAGES: &[PackageRow] = &[
         ],
         None,
     ),
-    ("marksman", &[(Pm::Brew, "marksman")], None),
+    (
+        "marksman",
+        &[(Pm::Brew, "marksman"), (Pm::Pacman, "marksman")],
+        None,
+    ),
 ];
+
+const RUSTUP_RUSTFMT: &str = "rustup component add rustfmt";
+const RUSTUP_RUST_ANALYZER: &str = "rustup component add rust-analyzer";
 
 const OXIGEN_BUILD: &str = concat!(
     "git clone --depth 1 https://github.com/javanhut/OxigenLang.git ~/.cache/crow/OxigenLang",
@@ -578,6 +634,15 @@ const OXIGEN_LSP_BUILD: &str = concat!(
 
 /// The shell command that installs `program` on this machine, if we know one.
 pub fn installer(program: &str) -> Option<String> {
+    // A rustup toolchain owns its own components: a distro's rust-analyzer
+    // beside it would be the wrong version, or collide with rustup's proxy.
+    if on_path("rustup") {
+        match program {
+            "rustfmt" => return Some(RUSTUP_RUSTFMT.to_string()),
+            "rust-analyzer" => return Some(RUSTUP_RUST_ANALYZER.to_string()),
+            _ => {}
+        }
+    }
     install_command(program, package_manager())
 }
 
@@ -589,16 +654,14 @@ fn install_command(program: &str, pm: Option<Pm>) -> Option<String> {
     }
     let (_, names, fallback) = PACKAGES.iter().find(|(p, _, _)| *p == program)?;
     // rvn installs from pacman's repositories, so a package is called
-    // whatever pacman calls it — one column in the table covers both.
+    // whatever pacman calls it — one column covers both. Its own column
+    // holds only what it alone can reach: the AUR.
     let named = |pm: Pm| {
-        let table_pm = match pm {
-            Pm::Rvn => Pm::Pacman,
-            pm => pm,
-        };
-        names
-            .iter()
-            .find(|(m, _)| *m == table_pm)
-            .map(|(_, name)| *name)
+        let column = |pm: Pm| names.iter().find(|(m, _)| *m == pm).map(|(_, name)| *name);
+        match pm {
+            Pm::Rvn => column(Pm::Rvn).or_else(|| column(Pm::Pacman)),
+            pm => column(pm),
+        }
     };
 
     // This machine's own manager first; then a build from the tool's own
@@ -932,12 +995,29 @@ py = "pyright-langserver --stdio"
         assert!(formatter("xyz").is_none());
     }
 
+    /// npm is the fallback, not the rule: a manager that carries the tool
+    /// installs it without npm having to be there.
     #[test]
-    fn ecosystem_tools_install_the_same_way_everywhere() {
-        for pm in [None, Some(Pm::Brew), Some(Pm::Apt), Some(Pm::Pacman)] {
+    fn ecosystem_tools_prefer_the_package_manager() {
+        for pm in [None, Some(Pm::Apt)] {
             assert_eq!(
                 install_command("prettier", pm).as_deref(),
                 Some("npm install -g prettier")
+            );
+        }
+        for (program, package) in [
+            ("prettier", "prettier"),
+            ("rust-analyzer", "rust-analyzer"),
+            ("rustfmt", "rust"),
+            ("gopls", "gopls"),
+            ("pyright-langserver", "pyright"),
+            ("vscode-json-language-server", "vscode-json-languageserver"),
+            ("taplo", "taplo-cli"),
+        ] {
+            let raven = install_command(program, Some(Pm::Rvn)).unwrap();
+            assert!(
+                raven.ends_with(&format!("rvn install -y {package}")),
+                "{raven}"
             );
         }
         assert!(install_command("no-such-tool", Some(Pm::Apt)).is_none());
@@ -990,11 +1070,11 @@ py = "pyright-langserver --stdio"
             !is_root() && !rvnd_running(),
             "{raven}"
         );
-        // A package pacman lacks is one rvn lacks too: build it instead.
-        assert_eq!(
-            install_command("taplo", Some(Pm::Rvn)).as_deref(),
-            Some("cargo install taplo-cli --locked")
-        );
+        // rvn reaches the AUR; the pacman it wraps does not.
+        assert!(install_command("jdtls", Some(Pm::Rvn))
+            .unwrap()
+            .ends_with("rvn install -y jdtls"));
+        assert!(install_command("jdtls", Some(Pm::Pacman)).is_none());
     }
 
     /// A distro that has no package for a tool gets a build from the tool's
