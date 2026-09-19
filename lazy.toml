@@ -15,6 +15,13 @@
 
 [commands]
 
+# The VCS checkout doesn't preserve the executable bit on scripts/, so the
+# tasks that run a script fail with "Permission denied". They all depend on
+# this. No elevation needed: the files belong to the user.
+[commands.permission]
+desc = "Make the scripts in scripts/ executable"
+run = ["chmod +x scripts/*.sh"]
+
 [commands.example]
 desc = "An example command"
 run = ["echo Hello from imlazy!"]
@@ -55,8 +62,10 @@ run = ["cargo check"]
 
 [commands.install]
 desc = "Installs crow"
+dep = ["permission"]
 run = ["./scripts/install.sh"]
 
 [commands.uninstall]
 desc = "Uninstalls crow"
+dep = ["permission"]
 run = ["./scripts/uninstall.sh"]
