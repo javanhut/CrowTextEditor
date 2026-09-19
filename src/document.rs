@@ -25,6 +25,22 @@ struct HistoryEntry {
     group: usize,
 }
 
+/// One edit as the language server wants to hear about it: a range in the
+/// text as the server last saw it, in (line, UTF-16 column), and what replaces
+/// it. Changes are logged in the order they must be applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspChange {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+    pub text: String,
+}
+
+/// More logged changes than this and a full resync is cheaper to send.
+const LSP_LOG_CAP: usize = 2000;
+
+/// Undo entries kept in the persistent undo file; older ones are dropped.
+const UNDO_FILE_ENTRIES: usize = 1000;
+
 pub struct Document {
     pub text: Rope,
     pub path: Option<PathBuf>,
@@ -51,6 +67,26 @@ pub struct Document {
     /// filesystem would not say. A write refuses when disk disagrees, which is
     /// how a `git checkout` under an open buffer stops being silent data loss.
     pub disk_mtime: Option<SystemTime>,
+    /// An mtime we've already told the user about, so a modified buffer whose
+    /// file changed on disk is flagged once rather than on every check.
+    pub disk_conflict: Option<SystemTime>,
+
+    /// Edits since the language server was last synced (see `LspChange`),
+    /// starting from revision `lsp_base`. `lsp_overflow` means the log was
+    /// abandoned and the next sync must send the whole text.
+    lsp_log: Vec<LspChange>,
+    lsp_base: u64,
+    lsp_overflow: bool,
+
+    /// The revision last written to this buffer's swap file.
+    pub swap_revision: u64,
+    /// An earlier session left a swap file here that differs from the file.
+    pub swap_found: bool,
+    /// The user has been told about `swap_found`.
+    pub swap_notified: bool,
+
+    /// Change markers against the last ivaldi seal.
+    pub vcs: crate::vcs::DocState,
 
     /// First visible line.
     pub view_line: usize,
@@ -80,6 +116,14 @@ impl Document {
             goal_col: None,
             modified: false,
             disk_mtime: None,
+            disk_conflict: None,
+            lsp_log: Vec::new(),
+            lsp_base: 0,
+            lsp_overflow: false,
+            swap_revision: 0,
+            swap_found: false,
+            swap_notified: false,
+            vcs: crate::vcs::DocState::default(),
             view_line: 0,
             view_row: 0,
             view_col: 0,
@@ -106,7 +150,79 @@ impl Document {
             ..Document::empty()
         };
         doc.refresh_syntax();
+        if crate::config::persistent_undo() {
+            doc.load_undo();
+        }
+        if crate::config::swap_files() {
+            match doc.read_swap() {
+                Some(swapped) if doc.text != swapped.as_str() => doc.swap_found = true,
+                Some(_) => doc.remove_swap(), // nothing it could restore
+                None => {}
+            }
+        }
         Ok(doc)
+    }
+
+    /// Re-read the file from disk as one undoable edit, so a reload you
+    /// didn't want is a `u` away and cursors outside the changed stretch stay
+    /// where they were. False when disk and buffer already agree.
+    pub fn reload(&mut self) -> std::io::Result<bool> {
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| std::io::Error::other("buffer has no filename"))?;
+        let new = std::fs::read_to_string(&path)?;
+        let mtime = disk_mtime(&path);
+        let changed = self.replace_all(&new);
+        self.modified = false;
+        self.disk_mtime = mtime;
+        self.disk_conflict = None;
+        Ok(changed)
+    }
+
+    /// Make the buffer read `new`, as one undo step touching only the stretch
+    /// that differs. False when it already did.
+    pub fn replace_all(&mut self, new: &str) -> bool {
+        // Both sides are walked as iterators — forwards from the start, then
+        // backwards from the end — so a reload costs one pass over the text
+        // rather than a `Vec<char>` copy of the whole file on each side.
+        let old_len = self.text.len_chars();
+        let new_len = new.chars().count();
+        let prefix = self
+            .text
+            .chars()
+            .zip(new.chars())
+            .take_while(|&(a, b)| a == b)
+            .count();
+        if prefix == old_len && prefix == new_len {
+            return false;
+        }
+        // The shared tail, stopping before it can overlap the shared head.
+        let mut suffix = 0;
+        let longest = (old_len - prefix).min(new_len - prefix);
+        let mut old_back = self.text.chars_at(old_len);
+        let mut new_back = new.chars().rev();
+        while suffix < longest {
+            match (old_back.prev(), new_back.next()) {
+                (Some(a), Some(b)) if a == b => suffix += 1,
+                _ => break,
+            }
+        }
+        let inserted: String = new
+            .chars()
+            .skip(prefix)
+            .take(new_len - suffix - prefix)
+            .collect();
+        self.commit_undo_group();
+        let tx = Transaction::change(&self.text, [(prefix, old_len - suffix, Some(inserted))]);
+        // Positions at the start of the changed stretch stay there rather
+        // than being pushed past the new text.
+        let (cursor, anchor) = (tx.map_pos(self.cursor, true), tx.map_pos(self.anchor, true));
+        self.apply(tx, cursor);
+        self.anchor = anchor.min(self.text.len_chars());
+        self.clamp_cursor(false);
+        self.commit_undo_group();
+        true
     }
 
     /// Mark the buffer's coloring stale. The parse itself is deferred to
@@ -171,7 +287,14 @@ impl Document {
         };
         let lines = self.text.len_lines();
         let from = self.text.line_to_char(first_line.min(lines - 1));
-        let to = self.text.line_to_char((last_line + 1).min(lines - 1));
+        // `min(lines)` would be out of range; the text's end is the same
+        // thing and keeps the last line — which has no line after it to
+        // borrow an end from — inside the range that gets coloured.
+        let to = if last_line + 1 >= lines {
+            self.text.len_chars()
+        } else {
+            self.text.line_to_char(last_line + 1)
+        };
         syntax.update(&self.text, from, to.max(from));
         self.syntax = Some(syntax);
     }
@@ -209,6 +332,16 @@ impl Document {
         self.disk_mtime = disk_mtime(&path);
         wrote?;
         self.modified = false;
+        self.disk_conflict = None;
+        // Our own text is on disk now, so our swap file has done its job —
+        // but one holding an earlier session's work keeps it until `:recover`
+        // or `:recover!` says what to do with it.
+        if !self.swap_found {
+            self.remove_swap();
+        }
+        if crate::config::persistent_undo() {
+            self.save_undo();
+        }
         Ok(())
     }
 
@@ -223,8 +356,12 @@ impl Document {
         if !force && path.exists() {
             return Err(std::io::Error::other("file exists — use :w! to overwrite"));
         }
+        // The swap file belongs to the file we are leaving, not the one we
+        // are about to write; `save` below would remove the new path's.
+        self.remove_swap();
         self.path = Some(path);
         self.disk_mtime = None;
+        self.swap_revision = 0;
         self.refresh_syntax();
         self.save(force)
     }
@@ -409,6 +546,7 @@ impl Document {
         let cursor_before = self.cursor;
         let range = tx.changed_range();
         let before = self.text.clone(); // ropes are copy-on-write: this is cheap
+        self.log_lsp(&tx);
 
         tx.apply(&mut self.text);
         self.cursor = new_cursor.min(self.text.len_chars());
@@ -474,6 +612,7 @@ impl Document {
             let entry = self.history.pop().unwrap();
             let before = self.text.clone();
             let range = entry.inverse.changed_range();
+            self.log_lsp(&entry.inverse);
             entry.inverse.apply(&mut self.text);
             self.edit_syntax(&before, range);
             self.cursor = entry.cursor_before.min(self.text.len_chars());
@@ -504,6 +643,7 @@ impl Document {
             let entry = self.redo_stack.pop().unwrap();
             let before = self.text.clone();
             let range = entry.forward.changed_range();
+            self.log_lsp(&entry.forward);
             entry.forward.apply(&mut self.text);
             self.edit_syntax(&before, range);
             self.cursor = entry.cursor_after.min(self.text.len_chars());
@@ -515,6 +655,204 @@ impl Document {
         self.goal_col = None;
         self.revision += 1;
         true
+    }
+
+    // ---- language-server sync ----------------------------------------------
+
+    /// Record `tx` in the change log, in the coordinates of the text it is
+    /// about to be applied to. A multi-cursor transaction logs its changes
+    /// last-first: each one then only moves text after the ones still to come,
+    /// so all of them can be stated against the same original text.
+    fn log_lsp(&mut self, tx: &Transaction) {
+        if self.lsp_overflow {
+            return;
+        }
+        let changes = tx.changes();
+        if self.lsp_log.len() + changes.len() > LSP_LOG_CAP {
+            self.lsp_overflow = true;
+            self.lsp_log.clear();
+            return;
+        }
+        let text = &self.text;
+        let at = |pos: usize| {
+            let line = text.char_to_line(pos);
+            let col = text.char_to_utf16_cu(pos) - text.char_to_utf16_cu(text.line_to_char(line));
+            (line, col)
+        };
+        for (from, to, inserted) in changes.into_iter().rev() {
+            self.lsp_log.push(LspChange {
+                start: at(from),
+                end: at(to),
+                text: inserted,
+            });
+        }
+    }
+
+    /// The edits since the server was synced at `synced_revision`, if the log
+    /// covers exactly that span; `None` means send the whole text. Either way
+    /// the log restarts from the current revision.
+    pub fn take_lsp_changes(&mut self, synced_revision: u64) -> Option<Vec<LspChange>> {
+        let usable = !self.lsp_overflow && self.lsp_base == synced_revision;
+        let log = std::mem::take(&mut self.lsp_log);
+        self.reset_lsp_log();
+        usable.then_some(log)
+    }
+
+    /// The server has just been sent the whole text.
+    pub fn reset_lsp_log(&mut self) {
+        self.lsp_log.clear();
+        self.lsp_overflow = false;
+        self.lsp_base = self.revision;
+    }
+
+    // ---- persistent undo ----------------------------------------------------
+
+    /// Write the undo history beside nothing: into the state dir, keyed by
+    /// the file's path and stamped with a hash of the text it applies to.
+    fn save_undo(&self) {
+        let Some(file) = self.path.as_deref().and_then(state_file("undo", "")) else {
+            return;
+        };
+        if self.history.is_empty() && self.redo_stack.is_empty() {
+            let _ = std::fs::remove_file(&file);
+            return;
+        }
+        let entry = |e: &HistoryEntry| {
+            serde_json::json!({
+                "f": e.forward.to_json(),
+                "i": e.inverse.to_json(),
+                "cb": e.cursor_before,
+                "ca": e.cursor_after,
+                "g": e.group,
+            })
+        };
+        let keep = self.history.len().saturating_sub(UNDO_FILE_ENTRIES);
+        let body = serde_json::json!({
+            "version": 1,
+            "hash": format!("{:016x}", rope_hash(&self.text)),
+            "len": self.text.len_chars(),
+            "group": self.group,
+            "history": self.history[keep..].iter().map(entry).collect::<Vec<_>>(),
+            "redo": self.redo_stack.iter().map(entry).collect::<Vec<_>>(),
+        });
+        write_atomically(&file, body.to_string().as_bytes());
+    }
+
+    /// Bring back the history `save_undo` wrote — only if the file on disk is
+    /// the very text it was written for. Anything else (edited elsewhere, a
+    /// checkout) and the history would replay onto the wrong text.
+    fn load_undo(&mut self) {
+        let Some(file) = self.path.as_deref().and_then(state_file("undo", "")) else {
+            return;
+        };
+        let Ok(raw) = std::fs::read_to_string(&file) else {
+            return;
+        };
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return;
+        };
+        let len = self.text.len_chars();
+        if body["hash"].as_str() != Some(format!("{:016x}", rope_hash(&self.text)).as_str())
+            || body["len"].as_u64() != Some(len as u64)
+        {
+            return;
+        }
+        let entry = |v: &serde_json::Value| {
+            Some(HistoryEntry {
+                forward: Transaction::from_json(&v["f"])?,
+                inverse: Transaction::from_json(&v["i"])?,
+                cursor_before: v["cb"].as_u64()? as usize,
+                cursor_after: v["ca"].as_u64()? as usize,
+                group: v["g"].as_u64()? as usize,
+            })
+        };
+        let list = |key: &str| -> Option<Vec<HistoryEntry>> {
+            body[key].as_array()?.iter().map(entry).collect()
+        };
+        let (Some(history), Some(redo)) = (list("history"), list("redo")) else {
+            return;
+        };
+        // Every entry has to fit the text the one before it leaves behind,
+        // walking each stack from the top down. A single bad length anywhere
+        // would otherwise panic ropey on the undo that reaches it.
+        let chain_ok = |entries: &[HistoryEntry], undoing: bool| {
+            let mut expect = len;
+            for e in entries.iter().rev() {
+                let (input, output) = if undoing {
+                    (&e.inverse, &e.forward)
+                } else {
+                    (&e.forward, &e.inverse)
+                };
+                if input.input_len() != expect {
+                    return false;
+                }
+                expect = output.input_len();
+            }
+            true
+        };
+        if !chain_ok(&history, true) || !chain_ok(&redo, false) {
+            return;
+        }
+        let top = history
+            .iter()
+            .chain(&redo)
+            .map(|e| e.group)
+            .max()
+            .unwrap_or(0);
+        self.group = (body["group"].as_u64().unwrap_or(0) as usize).max(top + 1);
+        self.history = history;
+        self.redo_stack = redo;
+    }
+
+    // ---- swap files ---------------------------------------------------------
+
+    /// Save the unsaved text aside, if it moved since the last time. True
+    /// when something was written.
+    pub fn write_swap(&mut self) -> bool {
+        // `swap_found` means the file holds an earlier session's unsaved work
+        // that has not been recovered or discarded yet. Writing over it would
+        // destroy exactly what it exists to keep.
+        if !crate::config::swap_files()
+            || self.swap_found
+            || !self.modified
+            || self.revision == self.swap_revision
+        {
+            return false;
+        }
+        let Some(path) = self.path.clone() else {
+            return false;
+        };
+        let Some(file) = state_file("swap", ".swp")(&path) else {
+            return false;
+        };
+        let mut body = format!(
+            "crow-swap\n{}\n",
+            path.canonicalize().unwrap_or(path).display()
+        );
+        body.push_str(&self.text.to_string());
+        write_atomically(&file, body.as_bytes());
+        self.swap_revision = self.revision;
+        true
+    }
+
+    /// The text a swap file holds for this buffer's file, if there is one.
+    pub fn read_swap(&self) -> Option<String> {
+        let path = self.path.as_deref()?;
+        let raw = std::fs::read_to_string(state_file("swap", ".swp")(path)?).ok()?;
+        let rest = raw.strip_prefix("crow-swap\n")?;
+        let (named, text) = rest.split_once('\n')?;
+        // Two paths can hash to one file name; the header says which file the
+        // text belongs to, and text from another file must not be offered.
+        let mine = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        (named == mine.to_string_lossy()).then(|| text.to_string())
+    }
+
+    pub fn remove_swap(&mut self) {
+        if let Some(file) = self.path.as_deref().and_then(state_file("swap", ".swp")) {
+            let _ = std::fs::remove_file(file);
+        }
+        self.swap_found = false;
+        self.swap_revision = self.revision;
     }
 
     // ---- convenience edits -------------------------------------------------
@@ -584,6 +922,50 @@ fn same_file(current: Option<&Path>, target: &Path) -> bool {
             (current.canonicalize(), target.canonicalize()),
             (Ok(a), Ok(b)) if a == b
         )
+}
+
+/// FNV-1a over the rope's bytes: stable across runs and Rust versions,
+/// which `DefaultHasher` does not promise, and that is all it is for.
+fn rope_hash(text: &Rope) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for chunk in text.chunks() {
+        for b in chunk.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// `state_dir/<kind>/<hash of the file's absolute path><ext>`, as a closure
+/// so it reads the same at every call site.
+fn state_file(kind: &'static str, ext: &'static str) -> impl Fn(&Path) -> Option<PathBuf> {
+    move |path: &Path| {
+        let abs = path
+            .canonicalize()
+            .ok()
+            .or_else(|| std::env::current_dir().ok().map(|d| d.join(path)))?;
+        let key = rope_hash(&Rope::from_str(&abs.to_string_lossy()));
+        Some(
+            crate::config::state_dir()
+                .join(kind)
+                .join(format!("{key:016x}{ext}")),
+        )
+    }
+}
+
+/// Write via a temp file and a rename, so a crash mid-write leaves the old
+/// file rather than half a new one. Best effort: these files are a safety net,
+/// and failing to write one must never interrupt an edit.
+fn write_atomically(file: &Path, bytes: &[u8]) {
+    let Some(dir) = file.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, file).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 #[cfg(test)]
@@ -750,6 +1132,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `replace_all` has to find the smallest middle that differs — the
+    /// cursors outside it are the ones that stay put on a reload.
+    #[test]
+    fn replace_all_edits_only_the_stretch_that_differs() {
+        let case = |before: &str, after: &str| {
+            let mut d = doc(before);
+            d.cursor = before.chars().count();
+            d.anchor = d.cursor;
+            let changed = d.replace_all(after);
+            assert_eq!(d.text.to_string(), after, "{before:?} -> {after:?}");
+            changed
+        };
+        assert!(case("one\ntwo\n", "one\nTWO\nthree\n"));
+        assert!(case("", "new"));
+        assert!(case("gone", ""));
+        assert!(case("head tail", "head middle tail"));
+        assert!(case("abab", "ab")); // the tail could be double-counted
+        assert!(case("ab", "abab"));
+        assert!(case("héllo wörld", "héllo wörld!")); // multi-byte chars
+        assert!(!case("same\n", "same\n"), "no edit when they already agree");
+
+        // The change covers the middle only: a cursor before it does not move.
+        let mut d = doc("keep this: old\n");
+        d.cursor = 4;
+        d.anchor = 4;
+        d.replace_all("keep this: new\n");
+        assert_eq!(d.cursor, 4);
+        assert_eq!(d.text.to_string(), "keep this: new\n");
+        d.undo();
+        assert_eq!(d.text.to_string(), "keep this: old\n");
+    }
+
     #[test]
     fn normal_mode_cursor_stops_before_line_end() {
         let mut d = doc("abc\ndef");
@@ -797,7 +1211,10 @@ mod bench {
         let start = std::time::Instant::now();
         for _ in 0..10 {
             doc.insert_at_cursor("x");
+            // `refresh_syntax` only marks the buffer stale; the reparse
+            // itself is `settle_syntax`, and that is the cost to beat.
             doc.refresh_syntax();
+            doc.settle_syntax();
         }
         let full = start.elapsed() / 10;
 

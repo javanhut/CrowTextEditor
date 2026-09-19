@@ -11,6 +11,20 @@ use crate::terminal::{Terminal, Wake};
 
 use crate::search;
 
+mod completion;
+mod jumps;
+mod lsp_features;
+mod lsp_glue;
+mod mouse;
+mod objects;
+mod picker_keys;
+mod repeat;
+mod selections;
+mod terminal_split;
+mod tools;
+mod tree;
+mod watch;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -20,6 +34,44 @@ pub enum Mode {
     Picker,
     /// The terminal split has focus and keys go to the shell.
     Terminal,
+}
+
+/// One recorded input, for `.` and macros.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input {
+    Key(Key),
+    Paste(String),
+    /// A completion was accepted: delete this many chars before the cursor,
+    /// then insert the text. Recorded as its effect, because replaying the
+    /// keys would depend on what the menu happened to offer at the time.
+    Complete(usize, String),
+}
+
+/// What the next typed character is for, after a key that asks for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharWait {
+    /// `mi` / `ma`: select inside / around the object named by the char.
+    Inside,
+    Around,
+    /// `md`: delete the surrounding pair.
+    SurroundDelete,
+    /// `mr`: replace the surrounding pair — first the old, then the new.
+    SurroundReplace(Option<char>),
+    /// `q`: start recording a macro into the named register.
+    MacroRecord,
+    /// `@`: replay the named macro this many times.
+    MacroPlay(usize),
+}
+
+/// Which selection operation the regex prompt is collecting a pattern for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectPrompt {
+    /// Split every selection on the pattern's matches.
+    Split,
+    /// Keep only the selections that contain a match.
+    Keep,
+    /// Drop the selections that contain a match.
+    Remove,
 }
 
 /// A pending file operation started from the tree sidebar.
@@ -96,7 +148,7 @@ pub enum Layout {
 pub type Rect = (u16, u16, u16, u16);
 
 impl Layout {
-    fn leaf_ids(&self, out: &mut Vec<usize>) {
+    pub(crate) fn leaf_ids(&self, out: &mut Vec<usize>) {
         match self {
             Layout::Leaf(w) => out.push(w.id),
             Layout::Split { children, .. } => {
@@ -313,6 +365,35 @@ impl Default for Keymaps {
         normal.bind_str("J", "join_lines");
         normal.bind_str("u", "undo");
         normal.bind_str("C-r", "redo");
+        normal.bind_str(".", "repeat_last_change");
+        normal.bind_str("q", "macro_record");
+        normal.bind_str("@", "macro_play");
+
+        // text objects and surround
+        normal.bind_str("mi", "select_inside");
+        normal.bind_str("ma", "select_around");
+        normal.bind_str("md", "surround_delete");
+        normal.bind_str("mr", "surround_replace");
+
+        // selections
+        normal.bind_str("A-s", "split_selection_lines");
+        normal.bind_str("A-S", "split_selection");
+        normal.bind_str("A-k", "keep_selections");
+        normal.bind_str("A-K", "remove_selections");
+        normal.bind_str("&", "align_selections");
+        normal.bind_str(")", "rotate_selections_forward");
+        normal.bind_str("(", "rotate_selections_backward");
+        normal.bind_str("_", "trim_selections");
+
+        // jumps
+        normal.bind_str("C-o", "jump_back");
+        normal.bind_str("C-i", "jump_forward");
+        // Most terminals can't tell C-i from Tab.
+        normal.bind_str("<tab>", "jump_forward");
+        normal.bind_str("]d", "next_diagnostic");
+        normal.bind_str("[d", "prev_diagnostic");
+        normal.bind_str("]g", "next_change");
+        normal.bind_str("[g", "prev_change");
 
         // windows, buffers, files, lifecycle
         normal.bind_str("C-w v", "split_vertical");
@@ -322,7 +403,13 @@ impl Default for Keymaps {
         normal.bind_str("gn", "next_buffer");
         normal.bind_str("gp", "prev_buffer");
         normal.bind_str("gd", "goto_definition");
+        normal.bind_str("gr", "goto_references");
         normal.bind_str("K", "hover");
+        normal.bind_str("<space> a", "code_action");
+        normal.bind_str("<space> R", "rename");
+        normal.bind_str("<space> s s", "document_symbols");
+        normal.bind_str("<space> S", "workspace_symbols");
+        normal.bind_str("<space> x", "diagnostics");
 
         // space leader: pickers
         normal.bind_str("<space> c", "command_palette");
@@ -428,6 +515,36 @@ pub struct Editor {
     pub awaiting_register: bool,
     /// `ms` has been pressed; the next key is the pair to surround with.
     pub awaiting_surround: bool,
+    /// Another key is waiting for a character (text objects, macros…).
+    pub awaiting_char: Option<CharWait>,
+    /// The search prompt is collecting a pattern for a selection operation.
+    pub select_prompt: Option<SelectPrompt>,
+    /// `.`: the inputs of the last change, and of the command in progress.
+    pub last_change: Vec<Input>,
+    change_keys: Vec<Input>,
+    /// Selecting commands since the last change, kept to prefix the next one.
+    selection_prefix: Vec<Input>,
+    /// (buffer, revision) when the command in progress began.
+    change_start: (usize, u64),
+    /// The command in progress went through a prompt or picker, so it isn't
+    /// a change `.` can repeat.
+    change_via_prompt: bool,
+    /// The last command a keymap dispatched, so `.` can skip undo and itself.
+    last_command: Option<&'static str>,
+    /// What accepting a completion did, for the recorder to note in place
+    /// of the key that accepted it.
+    completion_effect: Option<Input>,
+    /// Replaying `.` or a macro: nothing new is recorded meanwhile.
+    pub replaying: bool,
+    /// How deep replays are nested (a macro calling a macro), to stop runaways.
+    replay_depth: usize,
+    /// The macro being recorded: its register and the inputs so far.
+    pub macro_rec: Option<(char, Vec<Input>)>,
+    pub macros: HashMap<char, Vec<Input>>,
+    last_macro: Option<char>,
+    /// Places jumped from, as (buffer, char offset); `C-o`/`C-i` walk them.
+    jumps: Vec<(usize, usize)>,
+    jump_idx: usize,
     /// True until the first register capture of the current keypress, so the
     /// captures of one multi-cursor edit accumulate instead of overwriting.
     pub register_fresh: bool,
@@ -492,6 +609,28 @@ pub struct Editor {
     pub pending_line_op: Option<(char, usize)>,
     /// The hover docs popup: its lines and scroll offset (K to open).
     pub hover: Option<(Vec<String>, usize)>,
+    /// Signature help owed to the server on the next tick.
+    lsp_signature_pending: bool,
+    /// The signature being typed, with its active parameter's char range.
+    pub signature: Option<(String, Option<(usize, usize)>)>,
+    /// A `textDocument/formatting` in flight: (buffer, its revision then).
+    pending_format: Option<(usize, u64)>,
+    /// The file a document-symbol request was made for.
+    symbols_path: Option<PathBuf>,
+    /// Sealed-text lookups from ivaldi, answered from background threads,
+    /// as (the buffer asked about, the path asked about, the answer).
+    vcs_tx: std::sync::mpsc::Sender<(usize, PathBuf, crate::vcs::Base)>,
+    vcs_rx: std::sync::mpsc::Receiver<(usize, PathBuf, crate::vcs::Base)>,
+    /// When the change markers were last refreshed from ivaldi.
+    vcs_refreshed: std::time::Instant,
+    /// When open files were last checked for changes on disk.
+    disk_checked: std::time::Instant,
+    /// When swap files were last written.
+    swap_written: std::time::Instant,
+    /// A mouse drag is extending the selection in the focused window.
+    mouse_drag: bool,
+    /// `:q!` — leave without keeping anything, swap files included.
+    pub quit_discarding: bool,
     /// A "not installed — run `…`? (y/N)" offer; the next keypress answers it.
     pub pending_install: Option<(String, String)>,
     /// A background install in flight: (program, its result channel).
@@ -538,6 +677,10 @@ impl Editor {
 
         let (keymaps, bad_binds) = keymaps_from(config);
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let (vcs_tx, vcs_rx) = std::sync::mpsc::channel();
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or_else(std::time::Instant::now);
         let status = if bad_binds.is_empty() {
             String::new()
         } else {
@@ -569,6 +712,22 @@ impl Editor {
             active_register: None,
             awaiting_register: false,
             awaiting_surround: false,
+            awaiting_char: None,
+            select_prompt: None,
+            last_change: Vec::new(),
+            change_keys: Vec::new(),
+            selection_prefix: Vec::new(),
+            change_start: (0, 0),
+            change_via_prompt: false,
+            last_command: None,
+            completion_effect: None,
+            replaying: false,
+            replay_depth: 0,
+            macro_rec: None,
+            macros: HashMap::new(),
+            last_macro: None,
+            jumps: Vec::new(),
+            jump_idx: 0,
             register_fresh: true,
             last_search: String::new(),
             search_select: false,
@@ -601,6 +760,17 @@ impl Editor {
                 .unwrap_or_else(std::time::Instant::now),
             pending_line_op: None,
             hover: None,
+            lsp_signature_pending: false,
+            signature: None,
+            pending_format: None,
+            symbols_path: None,
+            vcs_tx,
+            vcs_rx,
+            vcs_refreshed: std::time::Instant::now(),
+            disk_checked: std::time::Instant::now(),
+            swap_written: long_ago,
+            mouse_drag: false,
+            quit_discarding: false,
             pending_install: None,
             install: None,
             terminal_install: None,
@@ -914,347 +1084,6 @@ impl Editor {
         self.sync_focus_mode();
     }
 
-    // ---- terminal ----------------------------------------------------------
-
-    /// The window the terminal is shown in, if it is open and not hidden.
-    pub fn terminal_win(&self) -> Option<usize> {
-        self.terminal.as_ref().and_then(|t| t.win)
-    }
-
-    pub fn terminal_focused(&self) -> bool {
-        self.terminal_win() == Some(self.focused)
-    }
-
-    /// `space t` / `:term`: open a shell below the window, jump to it if it
-    /// is open elsewhere, or hide it if it has focus. Hiding keeps the shell
-    /// running; the next `space t` brings it back with its history.
-    pub fn toggle_terminal(&mut self) {
-        match self.terminal_win() {
-            Some(win) if win == self.focused => self.hide_terminal(),
-            Some(win) => {
-                self.save_focus_state();
-                self.focused = win;
-                self.restore_focus_state();
-                self.sync_focus_mode();
-            }
-            None => self.show_terminal(),
-        }
-    }
-
-    fn show_terminal(&mut self) {
-        let (program, args) = crate::config::shell();
-        self.show_terminal_running(&program, &args);
-        self.set_status("terminal — C-\\ C-n for normal mode, space t hides it, exit closes it");
-    }
-
-    /// Open the terminal split: bring back the hidden shell if there is one,
-    /// else start `program` in a fresh one. Focus lands in it either way.
-    fn show_terminal_running(&mut self, program: &str, args: &[String]) {
-        // Split first, so the shell is born at the size it will be drawn at
-        // and its first prompt lays out correctly.
-        self.split_window(false);
-        let win = self.focused;
-        let (_, _, w, h) = self.focused_rect();
-        match self.terminal.as_mut() {
-            Some(t) => {
-                t.win = Some(win);
-                t.resize(w, h);
-            }
-            None => {
-                self.terminal_generation += 1;
-                let generation = self.terminal_generation;
-                match Terminal::spawn(program, args, w, h, generation, self.wake_tx.clone()) {
-                    Ok(mut t) => {
-                        t.win = Some(win);
-                        self.terminal = Some(t);
-                    }
-                    Err(e) => {
-                        self.detach_window(win);
-                        self.set_status(format!("Error: can't start {program}: {e}"));
-                        return;
-                    }
-                }
-            }
-        }
-        self.sync_focus_mode();
-    }
-
-    /// Take the terminal's window down without touching the shell.
-    fn hide_terminal(&mut self) {
-        let Some(win) = self.terminal_win() else {
-            return;
-        };
-        if self.window_count() <= 1 {
-            self.set_status("the terminal is the last window — :q! quits, or exit the shell");
-            return;
-        }
-        self.detach_window(win);
-        if let Some(t) = self.terminal.as_mut() {
-            t.win = None;
-        }
-    }
-
-    /// Remove a window from the layout, moving focus off it first: to the
-    /// window above (the terminal lives below the text it was opened from),
-    /// else the next one along.
-    fn detach_window(&mut self, win: usize) {
-        if self.focused == win && !self.focus_window_dir(0, -1) {
-            self.focus_next_window();
-        }
-        self.layout.close(win);
-        if self.layout.find(self.focused).is_none() {
-            let mut ids = Vec::new();
-            self.layout.leaf_ids(&mut ids);
-            self.focused = ids.first().copied().unwrap_or(0);
-            self.restore_focus_state();
-        }
-        self.sync_focus_mode();
-    }
-
-    /// Hang up on the shell and drop its window.
-    pub fn close_terminal(&mut self) {
-        if let Some(win) = self.terminal_win() {
-            if self.window_count() > 1 {
-                self.detach_window(win);
-            }
-        }
-        self.terminal = None;
-        if self.mode == Mode::Terminal {
-            self.mode = Mode::Normal;
-        }
-    }
-
-    /// Bytes from the pty, via the wake channel. An empty chunk is the
-    /// hangup at the end.
-    pub fn terminal_output(&mut self, generation: u64, bytes: &[u8]) {
-        let Some(t) = self.terminal.as_mut() else {
-            return;
-        };
-        if t.generation != generation {
-            return;
-        }
-        if bytes.is_empty() {
-            self.terminal_tick();
-        } else {
-            t.feed(bytes);
-        }
-    }
-
-    /// Notice a shell that has exited. True when something changed.
-    pub fn terminal_tick(&mut self) -> bool {
-        let Some(code) = self.terminal.as_mut().and_then(Terminal::poll_exit) else {
-            return false;
-        };
-        self.close_terminal();
-        match self.terminal_install.take() {
-            // The terminal was ours: its exit status is the install's.
-            Some((program, true)) => {
-                if code != 0 {
-                    self.set_status(format!(
-                        "{program}: install failed — :install {program} to retry"
-                    ));
-                } else if crate::config::on_path(&program) {
-                    self.install_done(&program);
-                } else {
-                    self.set_status(format!("{program}: installed, but not on PATH"));
-                }
-                return true;
-            }
-            // The user's shell went away with the install still unseen: they
-            // know, and the status line has nothing to add.
-            Some((_, false)) => return true,
-            None => {}
-        }
-        self.set_status(match code {
-            0 => "shell exited".to_string(),
-            n => format!("shell exited with status {n}"),
-        });
-        true
-    }
-
-    /// Keep the shell's screen the size of its window. Once per frame; a
-    /// frame where nothing moved costs one compare.
-    pub fn refresh_terminal(&mut self) {
-        let Some(win) = self.terminal_win() else {
-            return;
-        };
-        let Some((_, (.., w, h))) = self.window_rects().0.into_iter().find(|&(id, _)| id == win)
-        else {
-            return;
-        };
-        if let Some(t) = self.terminal.as_mut() {
-            t.resize(w, h);
-        }
-    }
-
-    /// Entering the terminal window puts you in the shell, the way vim does;
-    /// leaving it puts you back in normal mode.
-    fn sync_focus_mode(&mut self) {
-        self.term_pending = None;
-        if self.terminal_focused() {
-            if matches!(self.mode, Mode::Normal | Mode::Insert) {
-                self.set_mode(Mode::Terminal);
-                self.extend = false;
-            }
-        } else if self.mode == Mode::Terminal {
-            self.mode = Mode::Normal;
-            self.pending.clear();
-        }
-    }
-
-    /// Opening a file while the shell has focus: put it in a text window.
-    fn leave_terminal_for_edit(&mut self) {
-        if !self.terminal_focused() {
-            return;
-        }
-        if self.window_count() == 1 || !self.focus_window_dir(0, -1) {
-            let mut ids = Vec::new();
-            self.layout.leaf_ids(&mut ids);
-            let text = ids
-                .into_iter()
-                .find(|&id| id != self.focused && Some(id) != self.preview_win());
-            match text {
-                Some(id) => {
-                    self.save_focus_state();
-                    self.focused = id;
-                    self.restore_focus_state();
-                    self.sync_focus_mode();
-                }
-                None => self.split_window(false),
-            }
-        }
-    }
-
-    /// A key while the shell has focus. Everything goes to the shell except
-    /// two prefixes borrowed from vim: `C-\ C-n` drops to normal mode, and
-    /// `C-w` plus a key runs that window command (`C-w N` is normal mode,
-    /// `C-w .` sends a literal `C-w`).
-    fn handle_terminal_key(&mut self, key: Key) {
-        if self.terminal.is_none() {
-            self.mode = Mode::Normal;
-            return;
-        }
-        let ctrl = |c: char| Key {
-            code: KeyCode::Char(c),
-            ctrl: true,
-            alt: false,
-        };
-        // Without the kitty keyboard protocol, `C-\` reaches us as the raw
-        // byte 0x1c, which crossterm reports as Ctrl-4.
-        let is_backslash = |k: Key| k == ctrl('\\') || k == ctrl('4');
-        if let Some(prefix) = self.term_pending.take() {
-            if is_backslash(prefix) {
-                if key == ctrl('n') {
-                    self.mode = Mode::Normal;
-                    self.set_status("normal mode — i returns to the shell, space t hides it");
-                } else if let Some(t) = self.terminal.as_mut() {
-                    t.send_key(prefix);
-                    t.send_key(key);
-                }
-                return;
-            }
-            match key.code {
-                KeyCode::Char('N') if !key.ctrl && !key.alt => {
-                    self.mode = Mode::Normal;
-                    self.set_status("normal mode — i returns to the shell, space t hides it");
-                }
-                KeyCode::Char('.') if !key.ctrl && !key.alt => {
-                    if let Some(t) = self.terminal.as_mut() {
-                        t.send_key(prefix);
-                    }
-                }
-                KeyCode::Char(':') if !key.ctrl && !key.alt => {
-                    (commands::find("command_mode").unwrap().func)(self);
-                }
-                KeyCode::Char('w') if key.ctrl => self.focus_next_window(),
-                _ => {
-                    if let KeymapResult::Matched(command) =
-                        self.keymaps.normal.lookup(&[prefix, key])
-                    {
-                        self.run_terminal_command(command);
-                    }
-                }
-            }
-            return;
-        }
-        if is_backslash(key) || key == ctrl('w') {
-            self.term_pending = Some(key);
-            return;
-        }
-        if let Some(t) = self.terminal.as_mut() {
-            t.send_key(key);
-        }
-    }
-
-    /// Normal mode inside the terminal window: the usual keymap, with the
-    /// motions scrolling the shell's history and the inserts returning to it.
-    fn handle_terminal_normal_key(&mut self, key: Key) {
-        if self.pending.is_empty() && !key.ctrl && !key.alt {
-            if let KeyCode::Char(c) = key.code {
-                if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) {
-                    let digit = c.to_digit(10).unwrap() as usize;
-                    self.count = Some(self.count.unwrap_or(0).saturating_mul(10) + digit);
-                    return;
-                }
-            }
-        }
-        self.pending.push(key);
-        match self.keymaps.normal.lookup(&self.pending) {
-            KeymapResult::Pending => {}
-            KeymapResult::Matched(command) => {
-                self.pending.clear();
-                self.run_terminal_command(command);
-                self.count = None;
-            }
-            KeymapResult::NotFound => {
-                self.pending.clear();
-                self.count = None;
-            }
-        }
-    }
-
-    /// What a normal-mode command means with the shell in front of you.
-    /// Editing commands have nothing to act on and do nothing.
-    fn run_terminal_command(&mut self, command: &'static commands::Command) {
-        let count = self.take_count() as isize;
-        let rows = self
-            .terminal
-            .as_ref()
-            .map(|t| t.screen.size().1 as isize)
-            .unwrap_or(1);
-        let scroll = |editor: &mut Editor, delta: isize| {
-            if let Some(t) = editor.terminal.as_mut() {
-                t.scroll_by(delta);
-            }
-        };
-        match command.name {
-            "move_up" => scroll(self, count),
-            "move_down" => scroll(self, -count),
-            "half_page_up" => scroll(self, rows / 2 * count),
-            "half_page_down" => scroll(self, -(rows / 2) * count),
-            "page_up" => scroll(self, rows * count),
-            "page_down" => scroll(self, -rows * count),
-            "goto_file_start" => scroll(self, isize::MAX / 2),
-            "goto_file_end" => scroll(self, isize::MIN / 2),
-            "insert_mode"
-            | "append"
-            | "insert_at_line_start"
-            | "append_at_line_end"
-            | "open_below"
-            | "open_above" => {
-                scroll(self, isize::MIN / 2);
-                self.mode = Mode::Terminal;
-            }
-            "quit" | "terminal" | "normal_mode" | "focus_left" | "focus_right" | "focus_up"
-            | "focus_down" | "next_window" | "split_vertical" | "split_horizontal"
-            | "command_mode" | "command_palette" | "find_files" | "grep_text" | "recent_files"
-            | "file_explorer" | "tree_toggle" | "toggle_hidden" | "theme_picker" => {
-                (command.func)(self)
-            }
-            _ => {}
-        }
-    }
-
     // ---- geometry ----------------------------------------------------------
 
     /// Rows of document text in the focused window.
@@ -1275,6 +1104,7 @@ impl Editor {
 
     pub fn set_mode(&mut self, mode: Mode) {
         if self.mode == Mode::Insert && mode != Mode::Insert {
+            self.signature = None;
             let doc = self.doc_mut();
             // A typing burst becomes one undo step.
             doc.commit_undo_group();
@@ -1300,7 +1130,20 @@ impl Editor {
             .map(|(_, cmd)| *cmd)
     }
 
+    /// One keypress: handled, and recorded for `.` and any macro being
+    /// recorded — unless it is itself part of a replay.
     pub fn handle_key(&mut self, key: Key) {
+        let recording = !self.replaying;
+        if recording {
+            self.record(Input::Key(key));
+        }
+        self.handle_key_inner(key);
+        if recording {
+            self.finish_change_record();
+        }
+    }
+
+    fn handle_key_inner(&mut self, key: Key) {
         self.last_key_at = std::time::Instant::now();
         // An armed install offer eats exactly one key: y runs it, anything
         // else declines and the key is not replayed.
@@ -1402,6 +1245,18 @@ impl Editor {
             return;
         }
 
+        // Text objects, surround edits and macros name their target with
+        // one more character; anything else (Esc) cancels.
+        if let Some(wait) = self.awaiting_char.take() {
+            self.status.clear();
+            if let KeyCode::Char(c) = key.code {
+                if !key.ctrl && !key.alt {
+                    self.char_wait(wait, c);
+                }
+            }
+            return;
+        }
+
         // `"x` names the register for the next capture or paste.
         if self.mode == Mode::Normal && self.pending.is_empty() {
             if self.awaiting_register {
@@ -1478,6 +1333,9 @@ impl Editor {
                 } else {
                     (command.func)(self);
                 }
+                // After the call: a replay (`.`, `@`) dispatches commands of
+                // its own, and the one to remember is the replay itself.
+                self.last_command = Some(command.name);
                 if !self.keep_selection && !(self.extend && self.mode == Mode::Normal) {
                     let doc = self.doc_mut();
                     doc.anchor = doc.cursor;
@@ -1653,6 +1511,11 @@ impl Editor {
         "lsp-install",
         "config",
         "config!",
+        "wa",
+        "e!",
+        "rename",
+        "recover",
+        "recover!",
     ];
 
     /// Fuzzy matches for the command word being typed at the `:` prompt.
@@ -1679,23 +1542,33 @@ impl Editor {
         match key.code {
             KeyCode::Esc => {
                 self.command_line.clear();
+                self.select_prompt = None;
                 self.restore_search_origin();
                 self.mode = Mode::Normal;
             }
             KeyCode::Enter => {
                 let query = std::mem::take(&mut self.command_line);
                 self.mode = Mode::Normal;
+                if let Some(kind) = self.select_prompt.take() {
+                    self.restore_search_origin();
+                    self.apply_select_prompt(kind, &query);
+                    return;
+                }
                 if !query.is_empty() {
                     self.last_search = query;
                 }
                 if self.search_select {
                     self.select_all_matches();
+                } else if (self.doc().anchor, self.doc().cursor) != self.search_origin {
+                    // `/` moved us: the place we left is worth a C-o.
+                    self.push_jump_at(self.current, self.search_origin.1);
                 }
                 // For `/`, the incremental preview already put the selection
                 // on the match; Enter just keeps it.
             }
             KeyCode::Backspace => {
                 if self.command_line.pop().is_none() {
+                    self.select_prompt = None;
                     self.restore_search_origin();
                     self.mode = Mode::Normal;
                 } else {
@@ -1813,8 +1686,12 @@ impl Editor {
                     None => commands::save_with(self, force),
                 }
             }
+            "wa" | "wall" => self.write_all(),
             "q" | "quit" => (commands::find("quit").unwrap().func)(self),
-            "q!" | "quit!" => self.should_quit = true,
+            "q!" | "quit!" => {
+                self.quit_discarding = true;
+                self.should_quit = true;
+            }
             "wq" | "x" | "wq!" | "x!" => {
                 commands::save_with(self, cmd.ends_with('!'));
                 // A refused write leaves `modified` set, so a stale-file :wq
@@ -1836,6 +1713,20 @@ impl Editor {
                 },
                 None => self.set_status("Usage: :e <file>"),
             },
+            "e!" | "edit!" => match self.doc_mut().reload() {
+                Ok(true) => self.set_status("reloaded from disk (u undoes)"),
+                Ok(false) => self.set_status("already the same as the file on disk"),
+                Err(e) => self.set_status(format!("Error: {e}")),
+            },
+            "rename" => match arg {
+                Some(name) => self.rename_symbol(name),
+                None => self.set_status("Usage: :rename <new name>"),
+            },
+            "recover" => self.recover_swap(),
+            "recover!" => {
+                self.doc_mut().remove_swap();
+                self.set_status("swap file discarded");
+            }
             "help" | "h" => self.help_scroll = Some(0),
             "md" | "preview" => self.toggle_preview(),
             "term" | "terminal" => self.toggle_terminal(),
@@ -1879,6 +1770,7 @@ impl Editor {
             other => {
                 // `:42` jumps to a line.
                 if let Ok(n) = other.parse::<usize>() {
+                    self.push_jump();
                     let doc = self.doc_mut();
                     let target = n.saturating_sub(1).min(doc.line_count().saturating_sub(1));
                     doc.cursor = doc.line_start(target);
@@ -2017,7 +1909,19 @@ impl Editor {
     /// the reindex ever becomes annoying.
     fn reload_config(&mut self) {
         let config = crate::config::load();
+        let was_mouse = crate::config::mouse();
         let theme_ok = crate::config::apply(&config);
+        if config.mouse != was_mouse {
+            crate::ui::set_mouse_capture(config.mouse);
+        }
+        // Markers turned off go away; turned on, they are fetched again.
+        for i in 0..self.documents.len() {
+            if config.vcs_gutter {
+                self.documents[i].vcs.base = crate::vcs::Base::Unknown;
+            } else {
+                self.documents[i].vcs = crate::vcs::DocState::default();
+            }
+        }
         let (keymaps, bad_binds) = keymaps_from(&config);
         self.keymaps = keymaps;
         // A command whose typo you just fixed deserves another spawn attempt.
@@ -2043,222 +1947,22 @@ impl Editor {
         self.set_status(status);
     }
 
-    // ---- tool installs -----------------------------------------------------
-
-    /// `:install x` — x is a tool name, or a file extension whose formatter
-    /// (or, with `lsp_only`, language server) gets resolved and installed.
-    fn install_named(&mut self, name: &str, lsp_only: bool) {
-        if self.install_running() {
-            self.set_status("an install is already running");
-            return;
-        }
-        let lsp_program = |table: &[(String, String)]| {
-            table
-                .iter()
-                .find(|(e, _)| e == name)
-                .map(|(_, c)| c.as_str())
-                .or_else(|| crate::config::builtin_lsp(name))
-                .and_then(|c| c.split_whitespace().next().map(str::to_string))
-        };
-        let program = if crate::config::installer(name).is_some() {
-            Some(name.to_string())
-        } else if lsp_only {
-            lsp_program(&self.lsp_table)
-        } else {
-            crate::config::formatter(name)
-                .and_then(|c| c.split_whitespace().next().map(str::to_string))
-                .or_else(|| lsp_program(&self.lsp_table))
-        };
-        match program {
-            // Nothing to do — and a system package would only have asked for
-            // a password it can't get.
-            Some(p) if crate::config::on_path(&p) => {
-                self.set_status(format!("{p} is already installed"));
-            }
-            Some(p) => match crate::config::installer(&p) {
-                Some(cmd) => self.start_install(&p, &cmd),
-                None => self.set_status(format!("don't know how to install {p}")),
-            },
-            None => self.set_status(format!(
-                "nothing known for {name:?} — use a tool name or a file extension"
-            )),
-        }
-    }
-
-    /// Offer to install a missing `program` if we know how: arms the (y/N)
-    /// prompt and puts it in the status line. False when we can't help.
-    pub fn offer_install(&mut self, program: &str) -> bool {
-        let Some(cmd) = crate::config::installer(program) else {
-            return false;
-        };
-        if self.install_running() {
-            return false;
-        }
-        self.set_status(format!("{program} not installed — run `{cmd}`? (y/N)"));
-        self.pending_install = Some((program.to_string(), cmd.to_string()));
-        true
-    }
-
-    /// Is an install underway that another would collide with?
-    fn install_running(&self) -> bool {
-        self.install.is_some() || matches!(self.terminal_install, Some((_, true)))
-    }
-
-    /// Run `cmd`: in the terminal split when it needs root, so sudo has a
-    /// tty to ask for the password on; else in a background thread that
-    /// `install_tick` picks the result up from.
-    fn start_install(&mut self, program: &str, cmd: &str) {
-        if cmd.starts_with("sudo ") {
-            self.start_install_in_terminal(program, cmd);
-            return;
-        }
-        let shell_cmd = cmd.to_string();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = match std::process::Command::new("sh")
-                .args(["-c", &shell_cmd])
-                .output()
-            {
-                Ok(o) if o.status.success() => Ok(()),
-                Ok(o) => {
-                    let err = String::from_utf8_lossy(&o.stderr);
-                    Err(err
-                        .lines()
-                        .rev()
-                        .find(|l| !l.trim().is_empty())
-                        .unwrap_or("failed")
-                        .to_string())
-                }
-                Err(e) => Err(e.to_string()),
-            };
-            let _ = tx.send(result);
-        });
-        self.set_status(format!("installing {program}… (`{cmd}`)"));
-        self.install = Some((program.to_string(), rx));
-    }
-
-    /// A system package manager needs root, and a headless `sudo` has
-    /// nowhere to ask for the password: it would hang for the rest of the
-    /// session. So the command runs in the terminal split, in front of the
-    /// user. With no shell open, one is started just for this and closes
-    /// itself when done; an open shell is handed the command instead, and
-    /// the program is watched for on PATH.
-    fn start_install_in_terminal(&mut self, program: &str, cmd: &str) {
-        if self.terminal.is_some() {
-            if !self.terminal_focused() {
-                self.toggle_terminal();
-            }
-            if let Some(t) = self.terminal.as_mut() {
-                t.write(format!("{cmd}\n").as_bytes());
-            }
-            self.terminal_install = Some((program.to_string(), false));
-            self.set_status(format!("installing {program} in the terminal…"));
-            return;
-        }
-        // A failed install would otherwise vanish with its output; hold the
-        // window so the reason can be read.
-        let script = format!(
-            "{cmd} || {{ printf '\\n{program}: install failed — press Enter to close\\n'; read _; exit 1; }}"
-        );
-        self.show_terminal_running("sh", &["-c".to_string(), script]);
-        if self.terminal.is_none() {
-            return; // the spawn failure is already on the status line
-        }
-        self.terminal_install = Some((program.to_string(), true));
-        self.set_status(format!("installing {program}… (`{cmd}`)"));
-    }
-
-    /// `program` is now installed: retry what needed it.
-    fn install_done(&mut self, program: &str) {
-        // A server that failed to spawn earlier can be retried now.
-        self.lsp_failed.clear();
-        self.set_status(format!("{program} installed"));
-        // If it formats the current buffer, finish what :fmt started.
-        let formats_this = self
-            .doc()
-            .path
-            .as_ref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .and_then(crate::config::formatter)
-            .is_some_and(|c| c.split_whitespace().next() == Some(program));
-        if formats_this {
-            (commands::find("format_buffer").unwrap().func)(self);
-        }
-    }
-
-    /// Poll the installs from the main loop. True when the status changed
-    /// and a redraw is due.
-    pub fn install_tick(&mut self) -> bool {
-        // An install typed into the user's own shell reports nothing back;
-        // the program turning up on PATH is the signal.
-        if let Some((program, false)) = &self.terminal_install {
-            if crate::config::on_path(program) {
-                let (program, _) = self.terminal_install.take().unwrap();
-                self.install_done(&program);
-                return true;
-            }
-        }
-        let Some((_, rx)) = self.install.as_ref() else {
-            return false;
-        };
-        let result = match rx.try_recv() {
-            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
-            Err(_) => Err("install process vanished".to_string()),
-            Ok(r) => r,
-        };
-        let (program, _) = self.install.take().unwrap();
-        match result {
-            Ok(()) => self.install_done(&program),
-            Err(e) => self.set_status(format!("{program}: install failed — {e}")),
-        }
-        true
-    }
-
-    // ---- dependency versions -------------------------------------------------
-
-    /// Poll the registry fetches from the main loop, starting one for any
-    /// open package manifest not yet fetched. True on new badges.
-    pub fn deps_tick(&mut self) -> bool {
-        let pending: Vec<(crate::deps::Kind, PathBuf, String)> = self
-            .documents
-            .iter()
-            .filter_map(|d| {
-                let path = d.path.as_ref()?;
-                let kind = crate::deps::manifest_kind(path.file_name()?.to_str()?)?;
-                (!self.deps_fetched.contains(path))
-                    .then(|| (kind, path.clone(), d.text.to_string()))
-            })
-            .collect();
-        for (kind, path, text) in pending {
-            self.deps_fetched.insert(path.clone());
-            let tx = match &self.deps_tx {
-                Some(tx) => tx.clone(),
-                None => {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    self.deps_rx = Some(rx);
-                    self.deps_tx = Some(tx.clone());
-                    tx
-                }
-            };
-            crate::deps::fetch(kind, path, text, tx);
-        }
-        let Some(rx) = self.deps_rx.as_ref() else {
-            return false;
-        };
-        let mut changed = false;
-        while let Ok((kind, name, current, latest)) = rx.try_recv() {
-            self.dep_info.insert((kind, name), (current, latest));
-            changed = true;
-        }
-        changed
-    }
-
     // ---- paste -------------------------------------------------------------
 
     /// Bracketed paste: the text goes in verbatim — no auto-indent, no
     /// autoclose, no per-key replay. That's the whole point of the bracket.
     pub fn handle_paste(&mut self, text: &str) {
+        let recording = !self.replaying;
+        if recording {
+            self.record(Input::Paste(text.to_string()));
+        }
+        self.handle_paste_inner(text);
+        if recording {
+            self.finish_change_record();
+        }
+    }
+
+    fn handle_paste_inner(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let pasted_something = !text.is_empty();
         match self.mode {
@@ -2313,1133 +2017,6 @@ impl Editor {
         }
     }
 
-    // ---- picker ------------------------------------------------------------
-
-    pub fn open_picker(&mut self, picker: crate::picker::Picker) {
-        self.picker = Some(picker);
-        self.set_mode(Mode::Picker);
-    }
-
-    fn close_picker(&mut self) {
-        self.picker = None;
-        self.set_mode(Mode::Normal);
-    }
-
-    fn handle_picker_key(&mut self, key: Key) {
-        use crate::picker::Kind;
-        let Some(picker) = self.picker.as_mut() else {
-            self.mode = Mode::Normal;
-            return;
-        };
-        match key.code {
-            KeyCode::Esc => self.picker_cancel(),
-            // The focus keys work from here too: cancel, then move.
-            KeyCode::Char('h') | KeyCode::Left if key.ctrl => {
-                self.picker_cancel();
-                (crate::commands::find("focus_left").unwrap().func)(self);
-            }
-            KeyCode::Char('l') | KeyCode::Right if key.ctrl => {
-                self.picker_cancel();
-                (crate::commands::find("focus_right").unwrap().func)(self);
-            }
-            KeyCode::Enter => self.picker_accept(),
-            KeyCode::Down => self.picker_move(1),
-            KeyCode::Up => self.picker_move(-1),
-            KeyCode::Char('n') if key.ctrl => self.picker_move(1),
-            KeyCode::Char('p') if key.ctrl => self.picker_move(-1),
-            KeyCode::Backspace => {
-                if picker.query.pop().is_some() {
-                    picker.requery();
-                    self.picker_preview();
-                } else if let Kind::Explorer { dir } = &picker.kind {
-                    // Empty query: backspace climbs to the parent directory.
-                    let parent = dir.parent().map(Path::to_path_buf);
-                    if let Some(parent) = parent {
-                        *picker = crate::picker::Picker::explorer(parent);
-                    }
-                }
-            }
-            KeyCode::Char(c) if !key.ctrl && !key.alt => {
-                picker.query.push(c);
-                picker.requery();
-                self.picker_preview();
-            }
-            _ => {}
-        }
-    }
-
-    /// Close the picker without accepting, undoing any live theme preview.
-    fn picker_cancel(&mut self) {
-        if let Some(picker) = &self.picker {
-            if let crate::picker::Kind::Theme { original } = &picker.kind {
-                crate::theme::set(original);
-            }
-        }
-        self.close_picker();
-    }
-
-    fn picker_move(&mut self, delta: isize) {
-        if let Some(picker) = self.picker.as_mut() {
-            picker.move_selection(delta);
-        }
-        self.picker_preview();
-    }
-
-    /// Theme picking previews live: the highlighted theme is applied at once.
-    fn picker_preview(&mut self) {
-        let Some(picker) = &self.picker else {
-            return;
-        };
-        if matches!(picker.kind, crate::picker::Kind::Theme { .. }) {
-            if let Some(item) = picker.selected_item() {
-                let name = item.label.clone();
-                crate::theme::set(&name);
-            }
-        }
-    }
-
-    fn picker_accept(&mut self) {
-        use crate::picker::Kind;
-        let Some(picker) = self.picker.take() else {
-            return;
-        };
-        let Some(item) = picker.selected_item() else {
-            self.close_picker();
-            return;
-        };
-        let label = item.label.clone();
-        self.close_picker();
-        match picker.kind {
-            Kind::Command => {
-                if let Some(command) = commands::find(&label) {
-                    self.register_fresh = true;
-                    (command.func)(self);
-                }
-            }
-            Kind::Theme { .. } => {
-                crate::theme::set(&label);
-                self.set_status(format!("theme: {label}"));
-            }
-            Kind::Files { root } => self.jump_to(root.join(label), 0, 0),
-            Kind::Grep { root, .. } => {
-                if let Some((path, line)) = label.rsplit_once(':') {
-                    let line = line.parse::<usize>().unwrap_or(1).saturating_sub(1);
-                    self.jump_to(root.join(path), line, 0);
-                }
-            }
-            Kind::Recent => {
-                let path = match label.strip_prefix("~/") {
-                    Some(rest) => {
-                        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest)
-                    }
-                    None => PathBuf::from(label),
-                };
-                self.jump_to(path, 0, 0);
-            }
-            Kind::Explorer { dir } => {
-                if label == "../" {
-                    if let Some(parent) = dir.parent() {
-                        self.open_picker(crate::picker::Picker::explorer(parent.to_path_buf()));
-                    }
-                } else if let Some(subdir) = label.strip_suffix('/') {
-                    self.open_picker(crate::picker::Picker::explorer(dir.join(subdir)));
-                } else {
-                    self.jump_to(dir.join(label), 0, 0);
-                }
-            }
-        }
-    }
-
-    /// The floating `:`/`/` prompt: (x, y, width), centered near the top.
-    pub fn prompt_rect(&self) -> (u16, u16, u16) {
-        let w = ((self.size.0 as usize) * 3 / 5).clamp(20, 70) as u16;
-        let x = (self.size.0.saturating_sub(w)) / 2;
-        (x, 1, w)
-    }
-
-    /// Overlay rectangle for the picker, centered near the top.
-    pub fn picker_rect(&self) -> Rect {
-        let w = ((self.size.0 as usize) * 3 / 4).clamp(20, 80) as u16;
-        let h = 12.min(self.size.1.saturating_sub(4)).max(2);
-        let x = (self.size.0.saturating_sub(w)) / 2;
-        (x, 1, w, h)
-    }
-
-    // ---- file tree ---------------------------------------------------------
-
-    /// `space e` from anywhere: hidden -> shown+focused, unfocused -> focused,
-    /// focused -> closed. Every state reaches every other with the same key.
-    pub fn tree_toggle(&mut self) {
-        match (&self.tree, self.tree_focused) {
-            (None, _) => {
-                let root = std::env::current_dir().unwrap_or_default();
-                self.tree = Some(crate::filetree::FileTree::new(root));
-                self.tree_focused = true;
-            }
-            (Some(_), false) => self.tree_focused = true,
-            (Some(_), true) => {
-                self.tree = None;
-                self.tree_focused = false;
-            }
-        }
-    }
-
-    fn handle_tree_key(&mut self, key: Key) {
-        if self.tree_input.is_some() {
-            self.handle_tree_input_key(key);
-            return;
-        }
-        // The tree owns the keyboard while focused, so it must recognize the
-        // `space e` toggle itself — otherwise the sidebar could never close.
-        if self.tree_leader {
-            self.tree_leader = false;
-            if key.code == KeyCode::Char('e') && !key.ctrl && !key.alt {
-                self.tree_toggle();
-            }
-            return;
-        }
-        if key.code == KeyCode::Char(' ') && !key.ctrl && !key.alt {
-            self.tree_leader = true;
-            return;
-        }
-        let Some(tree) = self.tree.as_mut() else {
-            self.tree_focused = false;
-            return;
-        };
-        match key.code {
-            KeyCode::Char('l') | KeyCode::Right if key.ctrl => self.tree_focused = false,
-            KeyCode::Char('t') if key.ctrl => self.tree_toggle(),
-            KeyCode::Esc => self.tree_focused = false,
-            KeyCode::Char('q') => {
-                self.tree = None;
-                self.tree_focused = false;
-            }
-            KeyCode::Up | KeyCode::Char('k') => tree.move_selection(-1),
-            KeyCode::Down | KeyCode::Char('j') => tree.move_selection(1),
-            KeyCode::Char('h') | KeyCode::Left => tree.collapse_or_parent(),
-            KeyCode::Char('R') => tree.rebuild(),
-            KeyCode::Char('.') => {
-                (crate::commands::find("toggle_hidden").unwrap().func)(self);
-            }
-            KeyCode::Char('r') => {
-                if let Some(row) = tree.selected_row() {
-                    if row.path == tree.root {
-                        self.set_status("the root can't be renamed from here");
-                    } else {
-                        self.tree_input = Some(TreeInput::Rename {
-                            path: row.path.clone(),
-                            name: row.name.clone(),
-                        });
-                    }
-                }
-            }
-            KeyCode::Char('a') => {
-                // New entries go into the selected directory, or beside the
-                // selected file.
-                let dir = match tree.selected_row() {
-                    Some(row) if row.is_dir => row.path.clone(),
-                    Some(row) => row.path.parent().unwrap_or(&tree.root).to_path_buf(),
-                    None => tree.root.clone(),
-                };
-                self.tree_input = Some(TreeInput::Create {
-                    dir,
-                    name: String::new(),
-                });
-            }
-            KeyCode::Char('d') => {
-                if let Some(row) = tree.selected_row() {
-                    if row.path == tree.root {
-                        self.set_status("not deleting the project root");
-                    } else {
-                        self.tree_input = Some(TreeInput::Delete {
-                            path: row.path.clone(),
-                        });
-                    }
-                }
-            }
-            KeyCode::Char('x') | KeyCode::Char('c') => {
-                if let Some(row) = tree.selected_row() {
-                    if row.path == tree.root {
-                        self.set_status("the root can't be cut or copied");
-                        return;
-                    }
-                    let cut = key.code == KeyCode::Char('x');
-                    let name = row.name.clone();
-                    self.tree_clipboard = Some((row.path.clone(), cut));
-                    self.set_status(format!(
-                        "{} {name} — p pastes",
-                        if cut { "cut" } else { "copied" }
-                    ));
-                }
-            }
-            KeyCode::Char('p') => self.tree_paste(),
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                let Some(row) = tree.selected_row() else {
-                    return;
-                };
-                if row.is_dir {
-                    tree.toggle_selected();
-                } else {
-                    let path = row.path.clone();
-                    self.tree_focused = false;
-                    self.jump_to(path, 0, 0);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Keys while a tree create/delete prompt is open. `take` + re-store
-    /// keeps the borrow checker out of the way.
-    fn handle_tree_input_key(&mut self, key: Key) {
-        let Some(input) = self.tree_input.take() else {
-            return;
-        };
-        match input {
-            TreeInput::Create { dir, mut name } => match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Enter => self.tree_create(&dir, name.trim()),
-                KeyCode::Backspace => {
-                    name.pop();
-                    self.tree_input = Some(TreeInput::Create { dir, name });
-                }
-                KeyCode::Char(c) if !key.ctrl && !key.alt => {
-                    name.push(c);
-                    self.tree_input = Some(TreeInput::Create { dir, name });
-                }
-                _ => self.tree_input = Some(TreeInput::Create { dir, name }),
-            },
-            TreeInput::Delete { path } => {
-                if key.code == KeyCode::Char('y') {
-                    self.tree_delete(&path);
-                }
-            }
-            TreeInput::Rename { path, mut name } => match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Enter => self.tree_rename(&path, name.trim()),
-                KeyCode::Backspace => {
-                    name.pop();
-                    self.tree_input = Some(TreeInput::Rename { path, name });
-                }
-                KeyCode::Char(c) if !key.ctrl && !key.alt => {
-                    name.push(c);
-                    self.tree_input = Some(TreeInput::Rename { path, name });
-                }
-                _ => self.tree_input = Some(TreeInput::Rename { path, name }),
-            },
-        }
-    }
-
-    fn tree_create(&mut self, dir: &Path, name: &str) {
-        if name.is_empty() {
-            return;
-        }
-        let target = dir.join(name);
-        let result = if name.ends_with('/') {
-            std::fs::create_dir_all(&target)
-        } else {
-            // `a src/deep/new.rs` works: intermediate directories appear too.
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            // create_new: never truncate something that already exists.
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)
-                .map(|_| ())
-        };
-        match result {
-            Ok(()) => {
-                if let Some(tree) = self.tree.as_mut() {
-                    tree.reveal(&target);
-                }
-                self.set_status(format!("created {name}"));
-            }
-            Err(e) => self.set_status(format!("Error: {e}")),
-        }
-    }
-
-    fn tree_rename(&mut self, path: &Path, name: &str) {
-        if name.is_empty() {
-            return;
-        }
-        let target = path.parent().unwrap_or(Path::new("")).join(name);
-        if target == path {
-            return;
-        }
-        if target.exists() {
-            self.set_status(format!("Error: {name:?} already exists"));
-            return;
-        }
-        // A name with slashes is a move; the intermediate directories appear.
-        if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match std::fs::rename(path, &target) {
-            Ok(()) => {
-                self.retarget_buffers(path, &target);
-                if let Some(tree) = self.tree.as_mut() {
-                    tree.reveal(&target);
-                }
-                self.set_status(format!("renamed to {name}"));
-            }
-            Err(e) => self.set_status(format!("Error: {e}")),
-        }
-    }
-
-    fn tree_paste(&mut self) {
-        let Some((src, cut)) = self.tree_clipboard.clone() else {
-            self.set_status("nothing cut or copied");
-            return;
-        };
-        let Some(tree) = self.tree.as_ref() else {
-            return;
-        };
-        // Same landing rule as `a`: the selected directory, or beside the
-        // selected file.
-        let dir = match tree.selected_row() {
-            Some(row) if row.is_dir => row.path.clone(),
-            Some(row) => row.path.parent().unwrap_or(&tree.root).to_path_buf(),
-            None => tree.root.clone(),
-        };
-        let Some(name) = src.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-            return;
-        };
-        let target = dir.join(&name);
-        if target == src {
-            self.set_status("already there");
-            return;
-        }
-        if target.exists() {
-            self.set_status(format!("Error: {name:?} already exists here"));
-            return;
-        }
-        if src.is_dir() && dir.starts_with(&src) {
-            self.set_status("Error: can't paste a directory into itself");
-            return;
-        }
-
-        let result = if cut {
-            std::fs::rename(&src, &target)
-        } else {
-            crate::filetree::copy_recursively(&src, &target)
-        };
-        match result {
-            Ok(()) => {
-                if cut {
-                    // The move is done: open buffers follow, and a second
-                    // paste would be meaningless.
-                    self.retarget_buffers(&src, &target);
-                    self.tree_clipboard = None;
-                }
-                if let Some(tree) = self.tree.as_mut() {
-                    tree.reveal(&target);
-                }
-                self.set_status(format!("{} {name}", if cut { "moved" } else { "copied" }));
-            }
-            Err(e) => self.set_status(format!("Error: {e}")),
-        }
-    }
-
-    /// Point any open buffer at a file's new location after a move.
-    fn retarget_buffers(&mut self, old: &Path, new: &Path) {
-        for doc in &mut self.documents {
-            if doc.path.as_deref() == Some(old) {
-                doc.path = Some(new.to_path_buf());
-                doc.refresh_syntax();
-            }
-        }
-    }
-
-    fn tree_delete(&mut self, path: &Path) {
-        // ponytail: a real delete, not a trash can — the y/n prompt names
-        // exactly what goes.
-        let result = if path.is_dir() {
-            std::fs::remove_dir_all(path)
-        } else {
-            std::fs::remove_file(path)
-        };
-        match result {
-            Ok(()) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if let Some(tree) = self.tree.as_mut() {
-                    tree.rebuild();
-                }
-                self.set_status(format!("deleted {name}"));
-            }
-            Err(e) => self.set_status(format!("Error: {e}")),
-        }
-    }
-
-    // ---- completion --------------------------------------------------------
-
-    /// Handle a key while the completion menu is open. Returns true if the
-    /// key was consumed.
-    fn handle_completion_key(&mut self, key: Key) -> bool {
-        let consumed = self.completion_key_inner(key);
-        if consumed {
-            self.maybe_resolve_completion();
-        }
-        consumed
-    }
-
-    fn completion_key_inner(&mut self, key: Key) -> bool {
-        let Some(completion) = self.completion.as_mut() else {
-            return false;
-        };
-        let next = |c: &mut Completion| {
-            c.selected = (c.selected + 1) % c.items.len();
-        };
-        let prev = |c: &mut Completion| {
-            c.selected = (c.selected + c.items.len() - 1) % c.items.len();
-        };
-        match key.code {
-            KeyCode::Enter if !completion.navigated => {
-                self.completion = None;
-                false // the newline happens normally
-            }
-            KeyCode::Enter => {
-                self.completion_accept();
-                true
-            }
-            KeyCode::Esc => {
-                self.completion = None;
-                // Not consumed: one Esc both closes the menu and leaves
-                // insert mode via the keymap, not two.
-                false
-            }
-            // Tab steps into the list (first press selects the top item),
-            // then Tab/S-Tab cycle; Enter accepts.
-            KeyCode::Tab => {
-                if completion.navigated {
-                    next(completion);
-                } else {
-                    completion.navigated = true;
-                }
-                true
-            }
-            KeyCode::BackTab => {
-                if completion.navigated {
-                    prev(completion);
-                } else {
-                    completion.navigated = true;
-                }
-                true
-            }
-            KeyCode::Down => {
-                completion.navigated = true;
-                next(completion);
-                true
-            }
-            KeyCode::Up => {
-                completion.navigated = true;
-                prev(completion);
-                true
-            }
-            KeyCode::Char('n') if key.ctrl => {
-                completion.navigated = true;
-                next(completion);
-                true
-            }
-            KeyCode::Char('p') if key.ctrl => {
-                completion.navigated = true;
-                prev(completion);
-                true
-            }
-            KeyCode::Char('.' | ':') if !key.ctrl && !key.alt => {
-                // Member access ends this menu; `insert_typed` sees the key
-                // and asks the language server for the members.
-                self.completion = None;
-                false
-            }
-            KeyCode::Char('/') if !key.ctrl && !key.alt => {
-                // A slash ends the current word; for paths it descends, so
-                // start over and list the next directory.
-                self.completion = None;
-                self.doc_mut().insert_at_cursor("/");
-                self.maybe_autocomplete();
-                true
-            }
-            // Only identifier characters type through the menu. Anything
-            // else — brackets, quotes, operators, space — ends the word, so
-            // it falls to the catch-all below, which closes the menu and
-            // lets `insert_typed` handle the key with autoclose intact.
-            KeyCode::Char(c) if !key.ctrl && !key.alt && (c.is_alphanumeric() || c == '_') => {
-                // Type through the menu: insert the char and narrow the list.
-                completion.prefix.push(c);
-                let prefix = completion.prefix.to_lowercase();
-                completion
-                    .items
-                    .retain(|(label, _)| label.to_lowercase().starts_with(&prefix));
-                completion.selected = 0;
-                let empty = completion.items.is_empty();
-                self.doc_mut().insert_at_cursor(&c.to_string());
-                if empty {
-                    self.completion = None;
-                }
-                true
-            }
-            _ => {
-                // Anything else (backspace, arrows, escape sequences…) closes
-                // the menu and is handled normally.
-                self.completion = None;
-                false
-            }
-        }
-    }
-
-    /// The highlighted completion has no docs yet: ask the server to
-    /// resolve them, once. rust-analyzer and friends defer documentation to
-    /// `completionItem/resolve` so the initial list stays fast.
-    fn maybe_resolve_completion(&mut self) {
-        let Some(c) = self.completion.as_ref() else {
-            return;
-        };
-        if !c.navigated {
-            return;
-        }
-        let Some((label, _)) = c.items.get(c.selected) else {
-            return;
-        };
-        if c.docs.contains_key(label) {
-            return;
-        }
-        let label = label.clone();
-        let Some(lsp) = self.current_client() else {
-            return;
-        };
-        lsp.resolve_completion(&label);
-        // A placeholder, so cycling back over the item doesn't re-request;
-        // the resolve response overwrites it.
-        if let Some(c) = self.completion.as_mut() {
-            c.docs.insert(label, String::new());
-        }
-    }
-
-    fn completion_accept(&mut self) {
-        let Some(completion) = self.completion.take() else {
-            return;
-        };
-        let Some((_, text)) = completion.items.get(completion.selected) else {
-            return;
-        };
-        let prefix_chars = completion.prefix.chars().count();
-        let entered_dir = text.ends_with('/');
-        if text
-            .to_lowercase()
-            .starts_with(&completion.prefix.to_lowercase())
-        {
-            // The typed prefix stands; append the rest at every cursor.
-            let suffix: String = text.chars().skip(prefix_chars).collect();
-            self.doc_mut().insert_at_cursor(&suffix);
-        } else {
-            // ponytail: replacement completions rewrite the primary cursor
-            // only; per-cursor replacement when multi-cursor completion itches.
-            let doc = self.doc_mut();
-            let from = doc.cursor.saturating_sub(prefix_chars);
-            doc.delete_range(from, doc.cursor);
-            let text = text.clone();
-            self.doc_mut().insert_at_cursor(&text);
-        }
-        // Accepting a directory rolls straight into listing its contents.
-        if entered_dir {
-            self.maybe_autocomplete();
-        }
-    }
-
-    /// The identifier fragment just before the cursor.
-    fn word_prefix(&self) -> String {
-        let doc = self.doc();
-        let (line, col) = doc.cursor_line_col();
-        let slice = doc.line(line);
-        let mut start = col;
-        while start > 0 {
-            let c = slice.char(start - 1);
-            if c.is_alphanumeric() || c == '_' {
-                start -= 1;
-            } else {
-                break;
-            }
-        }
-        (start..col).map(|i| slice.char(i)).collect()
-    }
-
-    // ---- lsp ---------------------------------------------------------------
-
-    /// The configured server command for the current buffer, if any.
-    fn current_server_command(&self) -> Option<String> {
-        let path = self.doc().path.as_deref()?;
-        server_for(&self.lsp_table, path).map(str::to_string)
-    }
-
-    /// True when a language server is up for the current buffer (status line).
-    pub fn lsp_active(&self) -> bool {
-        self.current_server_command()
-            .is_some_and(|cmd| self.lsps.iter().any(|c| c.command() == cmd))
-    }
-
-    /// The running client that serves the current buffer's language.
-    pub fn current_client(&mut self) -> Option<&mut lsp::Client> {
-        let command = self.current_server_command()?;
-        self.lsps.iter_mut().find(|c| c.command() == command)
-    }
-
-    /// Shut every language server down (quit path).
-    pub fn shutdown_lsps(&mut self) {
-        for lsp in self.lsps.drain(..) {
-            lsp.shutdown();
-        }
-    }
-
-    /// Called from the main loop between keystrokes: keep the server in sync
-    /// with edited buffers and apply anything it sent back.
-    /// Drains language-server messages. Returns true when anything on screen
-    /// may have changed, so the main loop knows a redraw is needed.
-    pub fn lsp_tick(&mut self) -> bool {
-        // `didChange` serialises the entire buffer to JSON and writes it down a
-        // pipe. Hold it until typing pauses — unless a completion is owed, and
-        // then the server has to see the edit that prompted it first.
-        if self.lsp_completion_pending.is_some()
-            || self.last_key_at.elapsed() >= std::time::Duration::from_millis(120)
-        {
-            self.lsp_sync();
-        }
-        if let Some(tag) = self.lsp_completion_pending.take() {
-            if self.mode == Mode::Insert {
-                if let Some(path) = self.doc().path.clone() {
-                    let (line, col) = self.doc().cursor_line_col();
-                    let utf16_col = crate::position::char_to_utf16(self.doc().line(line), col);
-                    if let Some(lsp) = self.current_client() {
-                        lsp.request_position(
-                            tag,
-                            "textDocument/completion",
-                            &path,
-                            line,
-                            utf16_col,
-                        );
-                    }
-                }
-            }
-        }
-        let mut events = Vec::new();
-        let mut i = 0;
-        while i < self.lsps.len() {
-            events.extend(self.lsps[i].poll());
-            if self.lsps[i].is_dead() {
-                // The server exited (crashed, or was a broken shim): stop
-                // syncing it and don't respawn every tick.
-                let dead = self.lsps.remove(i);
-                self.lsp_failed.insert(dead.command().to_string());
-            } else {
-                i += 1;
-            }
-        }
-        let changed = !events.is_empty();
-        for event in events {
-            match event {
-                lsp::Event::Definition(path, line, col) => self.jump_to(path, line, col),
-                lsp::Event::Hover(text) => self.open_hover(&text),
-                lsp::Event::Status(text) => self.set_status(text),
-                lsp::Event::Diagnostics(path, diags) => {
-                    self.diagnostics.insert(path, diags);
-                }
-                lsp::Event::Completions(items, typed) => self.show_completions(items, typed),
-                lsp::Event::CompletionResolved(label, info) => {
-                    if let Some(c) = self.completion.as_mut() {
-                        if !info.is_empty() {
-                            c.docs.insert(label, info);
-                        }
-                    }
-                }
-            }
-        }
-        changed
-    }
-
-    /// Open the hover docs popup — signature, description, examples — or
-    /// fall back to the status line when the buffer isn't in normal mode.
-    pub fn open_hover(&mut self, text: &str) {
-        if self.mode != Mode::Normal {
-            self.set_status(text.lines().next().unwrap_or("").to_string());
-            return;
-        }
-        self.hover = Some((text.lines().map(str::to_string).collect(), 0));
-    }
-
-    /// `typed` marks the list crow asked for on its own while an identifier
-    /// was being typed, rather than one the user asked for.
-    fn show_completions(&mut self, items: Vec<(String, String, String)>, typed: bool) {
-        if self.mode != Mode::Insert {
-            return; // the answer arrived after insert mode ended
-        }
-        let prefix = self.word_prefix();
-        let lower = prefix.to_lowercase();
-        let mut docs = std::collections::HashMap::new();
-        let mut items: Vec<(String, String)> = items
-            .into_iter()
-            .filter(|(label, _, _)| label.to_lowercase().starts_with(&lower))
-            .map(|(label, text, info)| {
-                if !info.is_empty() {
-                    docs.insert(label.clone(), info);
-                }
-                (label, text)
-            })
-            .collect();
-        items.truncate(50);
-        if items.is_empty() {
-            // An unasked-for list that no longer matches what has been typed
-            // since must not close the popup that is up, nor say anything.
-            if !typed {
-                self.set_status("no completions");
-                self.completion = None;
-            }
-            return;
-        }
-        self.completion = Some(Completion {
-            items,
-            selected: 0,
-            prefix,
-            // Asked for (C-space, or a `.`/`<`/`::` trigger): the list is the
-            // point, so Enter accepts. Offered while typing: Enter stays
-            // Enter and Tab accepts, like the buffer-word popup it replaced.
-            navigated: !typed,
-            docs,
-        });
-        // Docs for the item highlighted on open, if the server defers them.
-        self.maybe_resolve_completion();
-    }
-
-    /// One typed character in insert mode: bracket/quote pairs close
-    /// themselves, retyping a closer steps over it, and identifier chars
-    /// feed the intellisense popup.
-    fn insert_typed(&mut self, c: char) {
-        // A closer typed on a whitespace-only line dedents it one level first.
-        if matches!(c, ')' | ']' | '}') && self.doc().extra.is_empty() {
-            let doc = self.doc();
-            let (line, col) = doc.cursor_line_col();
-            let slice = doc.line(line);
-            if col > 0 && (0..col).all(|i| matches!(slice.char(i), ' ' | '\t')) {
-                let take = if slice.char(col - 1) == '\t' {
-                    1
-                } else {
-                    crate::config::tab_width().min(col)
-                };
-                let to = doc.cursor;
-                self.doc_mut().delete_range(to - take, to);
-            }
-        }
-
-        if crate::config::autoclose() {
-            let doc = self.doc();
-            let next = (doc.cursor < doc.text.len_chars()).then(|| doc.text.char(doc.cursor));
-            let prev = (doc.cursor > 0).then(|| doc.text.char(doc.cursor - 1));
-
-            // Retyping the closer that's already there steps over it.
-            if matches!(c, ')' | ']' | '}' | '"' | '\'') && next == Some(c) {
-                let doc = self.doc_mut();
-                let len = doc.text.len_chars();
-                doc.cursor = (doc.cursor + 1).min(len);
-                doc.anchor = doc.cursor;
-                for (a, cur) in &mut doc.extra {
-                    *cur = (*cur + 1).min(len);
-                    *a = *cur;
-                }
-                return;
-            }
-
-            // Openers bring their closer. The apostrophe is the one that
-            // has to read the room: right after a word it is a contraction
-            // (don't, can't…), not an opener. A double quote after a word
-            // char is not — `x="`, `f(a,"` — so it always pairs.
-            let close = match c {
-                '(' => Some(')'),
-                '[' => Some(']'),
-                '{' => Some('}'),
-                '"' => Some('"'),
-                '\'' if !prev.is_some_and(|p| p.is_alphanumeric() || p == '_') => Some(c),
-                _ => None,
-            };
-            if let Some(close) = close {
-                let pair: String = [c, close].iter().collect();
-                self.doc_mut().insert_at_cursor(&pair);
-                // Every cursor steps back between its pair.
-                let doc = self.doc_mut();
-                doc.cursor = doc.cursor.saturating_sub(1);
-                doc.anchor = doc.cursor;
-                for (a, cur) in &mut doc.extra {
-                    *cur = cur.saturating_sub(1);
-                    *a = *cur;
-                }
-                return;
-            }
-        }
-
-        let prev = {
-            let doc = self.doc();
-            (doc.cursor > 0).then(|| doc.text.char(doc.cursor - 1))
-        };
-        self.doc_mut().insert_at_cursor(&c.to_string());
-        if c.is_alphanumeric() || c == '_' || c == '/' {
-            self.maybe_autocomplete();
-            // With a server up, ask it as well: buffer words can only offer
-            // what the file already says, so `println` is invisible until
-            // something types it first. Its answer lands in the same popup a
-            // tick later, filtered by whatever the prefix is by then.
-            //
-            // ponytail: one request per identifier keystroke, held to one in
-            // flight by the single slot; a real debounce timer if a server
-            // ever starts falling behind.
-            if self.lsp_completion_pending.is_none()
-                && self.word_prefix().chars().count() >= 2
-                && self.current_server_command().is_some()
-            {
-                self.lsp_completion_pending = Some("completion_typed");
-            }
-        }
-        // Member access: `.` or a second `:` asks the server what's inside.
-        // Deferred to `lsp_tick` so the request follows this edit's didChange.
-        // A digit before the dot is a float literal, not member access.
-        let member_dot = c == '.' && !prev.is_some_and(|p| p.is_ascii_digit());
-        // Plus whatever else the server itself calls a trigger — `<` opens
-        // Oxigen's type list, and nothing but the server knows that.
-        let declared = c != '.'
-            && self
-                .current_client()
-                .is_some_and(|lsp| lsp.triggers_completion(c));
-        if (member_dot || declared || (c == ':' && prev == Some(':')))
-            && self.current_server_command().is_some()
-        {
-            self.completion = None;
-            self.lsp_completion_pending = Some("completion");
-        }
-    }
-
-    /// Intellisense while typing: once two identifier chars are down, offer
-    /// matching words from every open buffer. Instant and offline; `C-space`
-    /// still asks the language server for the smart list.
-    fn maybe_autocomplete(&mut self) {
-        if self.completion.is_some() {
-            return;
-        }
-        if let Some(completion) = self.path_completion() {
-            self.completion = Some(completion);
-            return;
-        }
-        let prefix = self.word_prefix();
-        if prefix.chars().count() < 2 {
-            return;
-        }
-        let items = self.buffer_words(&prefix);
-        if !items.is_empty() {
-            self.completion = Some(Completion {
-                items,
-                selected: 0,
-                prefix,
-                navigated: false,
-                docs: std::collections::HashMap::new(),
-            });
-        }
-    }
-
-    /// Words from all open buffers matching `prefix`, excluding the prefix
-    /// itself. ponytail: a full scan per popup; a word index maintained on
-    /// edit when huge buffers itch.
-    fn buffer_words(&self, prefix: &str) -> Vec<(String, String)> {
-        let lower = prefix.to_lowercase();
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for doc in &self.documents {
-            let mut word = String::new();
-            for c in doc.text.chars().chain(std::iter::once(' ')) {
-                if c.is_alphanumeric() || c == '_' {
-                    word.push(c);
-                    continue;
-                }
-                if word.chars().count() >= 3
-                    && word.to_lowercase().starts_with(&lower)
-                    && word != prefix
-                    && seen.insert(word.clone())
-                {
-                    out.push((word.clone(), word.clone()));
-                }
-                word.clear();
-            }
-            if out.len() >= 50 {
-                break;
-            }
-        }
-        out.sort();
-        out.truncate(50);
-        out
-    }
-
-    /// Filesystem completion for a `./`, `../` or absolute path being typed.
-    /// Returns None when the text before the cursor doesn't look like one.
-    fn path_completion(&self) -> Option<Completion> {
-        let doc = self.doc();
-        let (line, col) = doc.cursor_line_col();
-        let slice = doc.line(line);
-        let mut start = col;
-        while start > 0 {
-            let c = slice.char(start - 1);
-            if c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~') {
-                start -= 1;
-            } else {
-                break;
-            }
-        }
-        let token: String = (start..col).map(|i| slice.char(i)).collect();
-        // A bare "/" (division, say) doesn't count; "./", "../", "~/" and "/usr" do.
-        let looks_like_path = token.starts_with("./")
-            || token.starts_with("../")
-            || token.starts_with("~/")
-            || (token.starts_with('/') && token.len() > 1);
-        if !looks_like_path {
-            return None;
-        }
-        let (dir, prefix) = token.rsplit_once('/')?;
-        let dir = match dir.strip_prefix('~') {
-            Some(rest) => format!("{}{rest}", std::env::var("HOME").ok()?),
-            None => dir.to_string(),
-        };
-        let lower = prefix.to_lowercase();
-        let mut items: Vec<(String, String)> = std::fs::read_dir(format!("{dir}/"))
-            .ok()?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                let mut name = entry.file_name().into_string().ok()?;
-                // Hidden entries only once the prefix opts in with a dot.
-                if name.starts_with('.') && !prefix.starts_with('.') {
-                    return None;
-                }
-                if !name.to_lowercase().starts_with(&lower) || name == prefix {
-                    return None;
-                }
-                if entry.file_type().ok()?.is_dir() {
-                    name.push('/');
-                }
-                Some((name.clone(), name))
-            })
-            .collect();
-        items.sort();
-        items.truncate(50);
-        (!items.is_empty()).then(|| Completion {
-            items,
-            selected: 0,
-            prefix: prefix.to_string(),
-            navigated: false,
-            docs: std::collections::HashMap::new(),
-        })
-    }
-
-    fn lsp_sync(&mut self) {
-        // One client per distinct server command among the open files.
-        let needed: Vec<String> = self
-            .documents
-            .iter()
-            .filter_map(|d| d.path.as_deref())
-            .filter_map(|p| server_for(&self.lsp_table, p))
-            .map(str::to_string)
-            .collect();
-        for command in needed {
-            if self.lsps.iter().any(|c| c.command() == command)
-                || self.lsp_failed.contains(&command)
-            {
-                continue;
-            }
-            let root = std::env::current_dir().unwrap_or_default();
-            match lsp::Client::spawn(&root, &command) {
-                Some(client) => self.lsps.push(client),
-                None => {
-                    let program = command.split_whitespace().next().unwrap_or("").to_string();
-                    self.lsp_failed.insert(command.clone());
-                    if !self.offer_install(&program) {
-                        self.set_status(format!("could not start {command:?} — no LSP"));
-                    }
-                }
-            }
-        }
-        // Sync every document to its own language's server — never another's
-        // (taplo getting a .rs file marks it "excluded", and worse).
-        for doc in &self.documents {
-            let Some(path) = doc.path.as_ref() else {
-                continue;
-            };
-            let Some(command) = server_for(&self.lsp_table, path) else {
-                continue;
-            };
-            let Some(lsp) = self.lsps.iter_mut().find(|c| c.command() == command) else {
-                continue;
-            };
-            match lsp.synced.get(path.as_path()) {
-                None => lsp.did_open(path, doc.text.to_string(), doc.revision),
-                Some(&(_, revision)) if revision != doc.revision => {
-                    lsp.did_change(path, doc.text.to_string(), doc.revision)
-                }
-                Some(_) => {}
-            }
-        }
-    }
-
-    /// Jump to a position given as (path, line, UTF-16 column) — reusing an
-    /// open buffer for the file when there is one.
-    pub fn jump_to(&mut self, path: PathBuf, line: usize, utf16_col: usize) {
-        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-        let existing = self.documents.iter().position(|d| {
-            d.path
-                .as_ref()
-                .and_then(|p| p.canonicalize().ok())
-                .is_some_and(|p| p == canon)
-        });
-        let idx = match existing {
-            Some(i) => i,
-            None => match Document::open(&path) {
-                Ok(doc) => {
-                    self.documents.push(doc);
-                    self.documents.len() - 1
-                }
-                Err(e) => {
-                    self.set_status(format!("Error: {e}"));
-                    return;
-                }
-            },
-        };
-        crate::config::record_recent(&canon);
-        self.leave_terminal_for_edit();
-        self.current = idx;
-        let doc = self.doc_mut();
-        let line = line.min(doc.line_count().saturating_sub(1));
-        let col = crate::position::utf16_to_char(doc.line(line), utf16_col);
-        doc.cursor = doc.line_start(line) + col;
-        doc.anchor = doc.cursor;
-        doc.clamp_cursor(false);
-        doc.goal_col = None;
-    }
-
-    /// Whether any buffer is owed a reparse.
-    pub fn needs_reparse(&self) -> bool {
-        self.documents.iter().any(Document::syntax_stale)
-    }
-
-    /// Whether nothing has been typed for `gap`.
-    pub fn idle_for(&self, gap: std::time::Duration) -> bool {
-        self.last_key_at.elapsed() >= gap
-    }
-
-    /// Recolor the stale buffers. A reparse is a whole-file tree-sitter pass —
-    /// tens of milliseconds on a big file — so the main loop holds this until
-    /// typing pauses, and draws the edits with the old spans slid through them
-    /// in the meantime.
-    pub fn settle(&mut self) {
-        for doc in &mut self.documents {
-            doc.settle_syntax();
-        }
-    }
-
     // ---- scrolling ---------------------------------------------------------
 
     /// Adjust the viewport so the cursor is on screen, keeping a few lines of
@@ -3486,6 +2063,10 @@ impl Editor {
         // is a (line, row) pair and scrolling counts rows.
         doc.view_col = 0; // nothing scrolls sideways while it wraps
         doc.view_line = doc.view_line.min(doc.line_count().saturating_sub(1));
+        // A resize changes the wrap width under the viewport: the row it is
+        // parked on may no longer exist.
+        let rows = doc.visual_rows(doc.view_line, wrap);
+        doc.view_row = doc.view_row.min(rows.saturating_sub(1));
         // A jump (`G`, a goto) can leave the viewport a whole file away. Land
         // near the cursor first, so the row walk below stays bounded by the
         // screen instead of the file.

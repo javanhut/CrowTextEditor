@@ -21,6 +21,20 @@ line, and then every motion, selection, edit, and keystroke of insert-mode
 typing applies at every cursor. A multi-cursor edit is a single undo step, and
 a multi-cursor delete or copy captures every selection into the register.
 
+Repeat and macros. `.` runs the last change again where the cursor is now —
+and because a selection made from the cursor (a word, a line, a text object)
+is kept with the change that acted on it, `mi( d .` deletes the inside of the
+parentheses you are in now, while `n .` walks the search matches deleting
+each. `q` plus a register records a macro, `q` stops, `@a` plays it (`3@a`
+three times, `@@` the last one). Both replay the keys through the same
+dispatch that ran them, so anything you can type, you can repeat.
+
+Text objects: `mi` and `ma` select inside or around `(` `[` `{` `<` `"` `'`
+`` ` ``, `w` a word, `W` a WORD, `p` a paragraph — and, from the syntax tree,
+`f` a function, `t` a type, `a` an argument, `c` a comment. Pressing the same
+object again grows to the one enclosing it. `md(` deletes the surrounding
+pair and `mr([` swaps it for another; both work at every cursor at once.
+
 Search and multi-cursor are the same feature. `/` searches incrementally by
 regex and the match _is_ a selection, so `d`, `c`, and `y` compose with it;
 `n`/`N` walk the matches. `s` puts a selection on **every** match — inside the
@@ -41,6 +55,11 @@ into `syntax.rs` instead — keywords, `<type>` annotations, strings, comments,
 `#[indent]` directives, calls. Same colors, minus `A-o`, which needs a tree.
 `oxigen-lsp` and `oxigen fmt` are wired up by default like every other
 language; `:install oxigen-lsp` builds them from the language's own repo.
+
+Selections are a set you can work on as a set: `A-s` splits them into one per
+line, `A-S` splits them on a regex, `A-k` keeps only the ones matching a
+pattern and `A-K` drops those, `&` lines them up in a column, `_` trims their
+whitespace, and `)` / `(` walk which one is primary.
 
 Markdown renders, it doesn't just get highlighted. `:md` (or `space m`) opens
 a preview beside the buffer that reads the way GitHub does: `**bold**` is
@@ -72,6 +91,35 @@ file tree shows Nerd Font icons per file type. Both are options in crow.toml
 (`autoclose`, `icons`); the installer offers JetBrains Mono Nerd Font on
 macOS.
 
+Jumps are remembered. Anything that moves further than a motion — `gd`, a
+picker, `gg`/`G`, a search, `:42`, a diagnostic or a change — leaves where it
+came from in the jumplist, and `C-o` / `C-i` walk back and forward through it,
+across files.
+
+The mouse works, if you want it. Click to put the cursor there (and focus that
+window), drag to select, wheel to scroll, click the file tree to open a file,
+click the shell to focus it. `mouse = false` in crow.toml gives the terminal
+its own selection back.
+
+Change markers come from ivaldi, not git. `ivaldi whodidit` gives the file as
+the last seal has it; crow diffs the buffer against that and marks the gutter —
+green for added lines, blue for changed, red where sealed lines were removed —
+with `]g` / `[g` jumping between the changes and the status line counting them
+(`+12 ~3 -1`). The lookup runs in a background thread and the diff runs when
+typing pauses, so neither is ever in the way of a keystroke.
+
+Your work survives the machine. Unsaved buffers are written aside every couple
+of seconds, and the next time you open that file crow says so: `:recover`
+brings the text back as an undoable edit, `:recover!` throws the swap file
+away. Undo history is saved on write and loaded when you reopen the file, so
+`u` still reaches yesterday's edits — but only when the file on disk is still
+the text the history was recorded against. Both are `crow.toml` options.
+
+Files that change underneath you are noticed. An unmodified buffer whose file
+changed on disk reloads itself as one undoable edit that leaves your cursor
+where it was; a modified one says so once, and `:e!` takes their version while
+`:w!` keeps yours.
+
 LSP without an async runtime: the server runs as a child process, a thread
 feeds its messages into a channel, and the main loop drains it between
 keystrokes — the editor never blocks on the server. Diagnostics color the
@@ -81,6 +129,17 @@ below the status bar; `gd` jumps to a definition (opening the file if needed);
 identifier, on the trigger characters it advertises (`.` for members, `<` for
 Oxigen's type annotations), and on demand with `C-space`. rust-analyzer is
 wired up by default; any server is one config line.
+
+The rest of the protocol is wired up too: `gr` lists every reference in a
+picker, `space a` offers the code actions and quick fixes for the selection
+(applying whatever edits and commands they come back with), `space R` renames
+the symbol across every file that uses it, `space s s` picks a symbol in this
+buffer and `space S` searches them across the project as you type, `]d` / `[d`
+walk the diagnostics and `space x` lists them all, signature help pops up as
+you type a call's arguments with the parameter you are on picked out, and
+`:fmt` falls back to the server when crow knows no formatter for the file.
+Edits arrive incrementally: the transaction log becomes LSP change events, so
+a keystroke in a 16,000-line file sends a few bytes rather than the buffer.
 
 Configuration is a data file, not a program. `~/.config/crow/crow.toml` —
 created with comments on first run, opened with `:config` — declares
@@ -133,6 +192,13 @@ an emoji ZWJ sequence or a combining stack.
 | `V`                                | select (highlight) the line; repeat to extend                                                                                                                                                                                               |
 | `v`                                | select the character under the cursor, then grow or shrink the selection with motions (status shows `SELECT`)                                                                                                                               |
 | `;`                                | collapse the selection to the cursor                                                                                                                                                                                                        |
+| `mi` `ma` _(then an object)_       | select inside / around: `(` `[` `{` `<` `"` `'` `` ` ``, `w` word, `W` WORD, `p` paragraph, `f` function, `t` type, `a` argument, `c` comment; again grows outwards |
+| `md` `mr` _(then a pair)_          | delete / replace the surrounding pair — `md(`, `mr"'` |
+| `.`                                | repeat the last change where the cursor is now (`3.` three times) |
+| `q{reg}` … `q`  `@{reg}`           | record a macro into a register, stop; play it (`@@` replays the last, `3@a` three times) |
+| `A-s` `A-S`                        | split the selections into lines / on a regex |
+| `A-k` `A-K`                        | keep / drop the selections matching a regex |
+| `&` `_`  `(` `)`                   | align the selections, trim their whitespace, walk which is primary |
 | `A-o`                              | expand the selection to the enclosing syntax node                                                                                                                                                                                           |
 | `C` `A-C`                          | add a cursor on the next / previous line                                                                                                                                                                                                    |
 | `,`                                | drop the extra cursors (`Esc` in normal mode too)                                                                                                                                                                                           |
@@ -151,7 +217,12 @@ an emoji ZWJ sequence or a combining stack.
 | `D` `J`                            | delete to line end, join                                                                                                                                                                                                                    |
 | `u` `C-r`                          | undo / redo                                                                                                                                                                                                                                 |
 | `gn` `gp`                          | next / previous buffer                                                                                                                                                                                                                      |
-| `gd` `K`                           | goto definition / hover (LSP)                                                                                                                                                                                                               |
+| `gd` `gr` `K`                      | goto definition / list references / hover (LSP) |
+| `C-o` `C-i`                        | jump back / forward through the jumplist (Tab works as `C-i`) |
+| `]d` `[d`  `]g` `[g`               | next / previous diagnostic, next / previous change since the last seal |
+| `space a` `space R`                | code actions for the selection, rename the symbol everywhere (LSP) |
+| `space s s` `space S` `space x`    | symbols in this buffer, symbols across the project, every diagnostic |
+| _(the mouse)_                      | click to place the cursor, drag to select, wheel to scroll, click the tree or the shell to focus it |                                                                                                                                                                                                               |
 | `gc`                               | comment or uncomment the selected lines                                                                                                                                                                                                     |
 | `ms` _(then a character)_          | surround the selection with it — `ms(`, `ms"`, `ms*`                                                                                                                                                                                       |
 | `space m` `:md`                    | live markdown preview beside the buffer                                                                                                                                                                                                     |
@@ -164,7 +235,7 @@ an emoji ZWJ sequence or a combining stack.
 | `space d`                          | directory browser picker (Enter descends, Backspace goes up)                                                                                                                                                                                |
 | `space t` `:term`                  | shell in a split below; `C-\ C-n` or `C-w N` for normal mode there, `i` back in, `space t` again hides it                                                                                                                                  |
 | `space T`                          | theme picker with live preview                                                                                                                                                                                                              |
-| `:w` `:q` `:wq` `:q!` `:e f` `:42` | ex commands; also `:md`, `:term`, `:theme`, `:help` for the full list                                                                                                                                                                                                                                 |
+| `:w` `:wa` `:q` `:q!` `:e f` `:42` | ex commands; also `:e!` (reload), `:rename`, `:recover`, `:md`, `:term`, `:theme`, `:help` for the full list                                                                                                                                                                                                                                 |
 | `:%s/pat/repl/g`                   | substitute: `%` = whole buffer (omit for the cursor line), `g` = every match (omit for first per line), `i` = ignore case; pattern is a regex with `\1` groups                                                                              |
 
 Any command in the registry is also callable by name, so `:join_lines` works.
@@ -174,10 +245,26 @@ Any command in the registry is also callable by name, so `:join_lines` works.
 ```
 transaction.rs   changesets: the edit and undo primitive
 position.rs      char offsets <-> display columns, soft-wrap points
-document.rs      rope buffer, cursor, undo history, file I/O
+document.rs      rope buffer, cursor, undo history, swap and file I/O
 keymap.rs        keys, and the trie mapping sequences to commands
 commands.rs      every action, as a named static value
+textobj.rs       the ranges mi/ma select
+vcs.rs           ivaldi's sealed text, and the diff behind the gutter marks
 editor.rs        state, key dispatch, ex commands, scrolling
+editor/          one file per area of that state:
+  repeat.rs        recording and replaying inputs (. and macros)
+  objects.rs       what the character after mi/ma/md/mr/q/@ does
+  selections.rs    operations on the whole set of selections
+  jumps.rs         the jumplist, and finding the buffer for a file
+  lsp_glue.rs      syncing buffers and draining server events
+  lsp_features.rs  references, rename, code actions, symbols, formatting
+  completion.rs    the completion menu
+  watch.rs         files changed on disk, swap files, change markers
+  mouse.rs         screen cells back to buffer positions
+  tree.rs          the file tree sidebar
+  picker_keys.rs   the popup picker's keys
+  terminal_split.rs  the shell window
+  tools.rs         background installs and dependency versions
 markdown.rs      markdown -> styled rows, for the preview pane
 vt.rs            terminal emulator: pty bytes -> a grid of styled cells
 terminal.rs      the shell process on its pty, and the keys sent to it
@@ -223,17 +310,17 @@ command needed rewriting to become multi-cursor aware.
 
 Roughly in the order worth doing them:
 
-1. **Completion** — the LSP plumbing is there; this needs a popup-menu widget,
-   which is why it isn't. `textDocument/completion` plus a filtering list.
-2. **More grammars and servers** — each grammar is one dependency and one arm
-   in `syntax::config_for`; each server is one row in a table `lsp.rs` doesn't
-   have yet (rust-analyzer is hardcoded).
-3. **Rendering-side graphemes** — the cursor steps by grapheme now, but width
-   is still summed per char, so a ZWJ emoji renders wider than it should.
-4. **More themes and config options** — a theme is one entry in
-   `theme::THEMES`; an option is one key in `config.rs`. The parser is a
-   deliberate TOML subset; swap in the `toml` crate if the config ever needs
-   arrays or nesting.
+1. **Whole-project search and replace** — `space g` finds the matches; taking
+   an edit across every file they are in needs the picker to hand its results
+   to the multi-cursor machinery rather than to a jump.
+2. **A diff view** — the gutter says a line changed; it can't yet show what it
+   changed from. The sealed text is already in memory for the markers.
+3. **Inlay hints and semantic tokens** — the two LSP features left. Both are
+   virtual text, which the diagnostics already prove out.
+4. **More grammars and themes** — a grammar is one dependency and one arm in
+   `syntax::config_for`; a theme is one entry in `theme::THEMES`. The config
+   parser is a deliberate TOML subset; swap in the `toml` crate if it ever
+   needs arrays or nesting.
 
 ## Tests
 
@@ -243,9 +330,12 @@ cargo test
 
 The tests cover the parts that are easy to get subtly wrong and hard to notice:
 transaction inversion round-trips, undo grouping, tab and wide-character column
-math, count parsing, the sticky goal column, soft-wrap break points and the
-row arithmetic that scrolling depends on, and that markdown's markup is
-consumed rather than shown.
+math (including that a ZWJ emoji is measured as the one glyph it is drawn as),
+count parsing, the sticky goal column, soft-wrap break points and the row
+arithmetic that scrolling depends on, that markdown's markup is consumed rather
+than shown, what `.` decides to repeat, the text-object finders, the line diff
+behind the gutter marks, applying a workspace edit to a file that isn't open,
+and that a file changed on disk reloads without losing the cursor.
 
 ```
 cargo test --release -- --ignored    # the benchmarks
@@ -257,6 +347,6 @@ screenful costs less than a tenth of re-parsing the file.
 
 ## Note
 
-This was written without a compiler available, so expect to fix a few type
-errors on first build. The design is the part worth keeping; the syntax errors
-are cheap.
+Change markers assume ivaldi, not git: the base comes from `ivaldi whodidit`,
+and a file outside an ivaldi repository simply has no markers. `vcs_gutter =
+false` turns the whole thing off.

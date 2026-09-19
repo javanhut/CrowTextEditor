@@ -6,6 +6,9 @@
 //! accept handler.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::Arc;
 
 pub struct Item {
     pub label: String,
@@ -22,16 +25,40 @@ pub enum Kind {
     /// Browse a directory: Enter descends into `dir/label` or opens a file.
     Explorer { dir: PathBuf },
     /// Live content search: the query greps files, labels are `path:line`.
-    /// `corpus` is the project read into memory on the first query, so typing
-    /// searches memory instead of re-walking and re-reading the whole tree on
-    /// every keystroke.
+    /// The search runs in a background thread — ripgrep when it is
+    /// installed, a walker of our own when not — and streams its hits in, so
+    /// a big repository never freezes the editor. `wake` pokes the main loop
+    /// when a batch lands.
     Grep {
         root: PathBuf,
-        corpus: Option<Vec<GrepFile>>,
+        search: Option<GrepSearch>,
+        wake: Option<Sender<crate::terminal::Wake>>,
     },
     /// Recently opened files; labels are absolute paths (`~`-shortened).
     Recent,
+    /// Places to jump to — references, symbols, diagnostics — one per item.
+    Locations { locs: Vec<crate::lsp::Location> },
+    /// Code actions from the language server, one per item.
+    CodeActions { actions: Vec<serde_json::Value> },
+    /// Workspace symbols: the server refills the list as the query changes.
+    WorkspaceSymbols { locs: Vec<crate::lsp::Location> },
 }
+
+/// A grep in flight: its results arrive in batches, and setting `cancel`
+/// tells it to stop because the query moved on.
+pub struct GrepSearch {
+    rx: Receiver<Vec<Item>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for GrepSearch {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Hits a grep stops at; a common word would otherwise list the whole repo.
+const GREP_LIMIT: usize = 1000;
 
 pub struct Picker {
     pub title: String,
@@ -45,7 +72,7 @@ pub struct Picker {
 }
 
 impl Picker {
-    fn new(title: impl Into<String>, kind: Kind, items: Vec<Item>) -> Picker {
+    pub fn new(title: impl Into<String>, kind: Kind, items: Vec<Item>) -> Picker {
         let mut picker = Picker {
             title: title.into(),
             kind,
@@ -129,34 +156,73 @@ impl Picker {
         Picker::new("recent", Kind::Recent, items)
     }
 
-    pub fn grep(root: &Path) -> Picker {
+    pub fn grep(root: &Path, wake: Option<Sender<crate::terminal::Wake>>) -> Picker {
         Picker::new(
             "grep",
             Kind::Grep {
                 root: root.to_path_buf(),
-                corpus: None,
+                search: None,
+                wake,
             },
             Vec::new(),
         )
     }
 
-    /// React to a query change: Grep pickers re-search file contents, every
-    /// other kind fuzzy-refilters its fixed item list.
+    /// React to a query change: Grep pickers start a new search, every
+    /// other kind fuzzy-refilters its item list.
     pub fn requery(&mut self) {
-        if let Kind::Grep { root, corpus } = &mut self.kind {
-            self.items = if self.query.chars().count() < 2 {
-                Vec::new() // one char would light up the whole repo
-            } else {
-                grep_corpus(
-                    corpus.get_or_insert_with(|| read_project(root)),
-                    &self.query,
-                )
-            };
-            self.filtered = (0..self.items.len()).collect();
+        if let Kind::Grep { root, search, wake } = &mut self.kind {
+            // Dropping the old search cancels it.
+            *search = None;
+            self.items.clear();
+            self.filtered.clear();
             self.selected = 0;
+            if self.query.chars().count() >= 2 {
+                // One char would light up the whole repo.
+                *search = Some(start_grep(root.clone(), self.query.clone(), wake.clone()));
+            }
         } else {
             self.refilter();
         }
+    }
+
+    /// Take in whatever a running grep has found since last time. True when
+    /// the list grew.
+    pub fn poll(&mut self) -> bool {
+        let Kind::Grep { search, .. } = &mut self.kind else {
+            return false;
+        };
+        let Some(running) = search.as_ref() else {
+            return false;
+        };
+        let mut grew = false;
+        loop {
+            match running.rx.try_recv() {
+                Ok(batch) => {
+                    let start = self.items.len();
+                    self.items.extend(batch);
+                    self.filtered.extend(start..self.items.len());
+                    grew = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    *search = None; // finished
+                    break;
+                }
+            }
+        }
+        grew
+    }
+
+    /// Whether a grep is still running (the title says so).
+    pub fn searching(&self) -> bool {
+        matches!(
+            &self.kind,
+            Kind::Grep {
+                search: Some(_),
+                ..
+            }
+        )
     }
 
     pub fn refilter(&mut self) {
@@ -182,6 +248,11 @@ impl Picker {
 
     pub fn selected_item(&self) -> Option<&Item> {
         self.filtered.get(self.selected).map(|&i| &self.items[i])
+    }
+
+    /// Index into `items` of the highlighted row.
+    pub fn selected_index(&self) -> Option<usize> {
+        self.filtered.get(self.selected).copied()
     }
 }
 
@@ -235,8 +306,10 @@ fn score_lowered(query: &str, target: &str) -> Option<i64> {
 /// Every file under `root`, relative paths, skipping hidden entries and
 /// build/vendor directories. ponytail: capped and synchronous — a background
 /// walker with .gitignore support when big repos itch.
+/// Directories no search wants to see: build output and vendored code.
+const SKIP: &[&str] = &["target", "node_modules", "dist", "build"];
+
 fn list_files(root: &Path) -> Vec<String> {
-    const SKIP: &[&str] = &["target", "node_modules", "dist", "build"];
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -272,65 +345,141 @@ fn list_files(root: &Path) -> Vec<String> {
     out
 }
 
-/// One file in the grep corpus: its path relative to the root, its text, and
-/// a lowercased copy of that text to match against. Lowercasing once here is
-/// what turns the search from "re-read and re-fold the whole repo per
-/// keystroke" into a `contains` over memory.
-pub struct GrepFile {
-    rel: String,
-    text: String,
-    lower: String,
+/// Start searching `root` for `query` (case-insensitive, literal) in a
+/// background thread; hits come back over the returned search's channel in
+/// batches, as `path:line` items with the line as detail.
+fn start_grep(
+    root: PathBuf,
+    query: String,
+    wake: Option<Sender<crate::terminal::Wake>>,
+) -> GrepSearch {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let stop = Arc::clone(&cancel);
+    std::thread::spawn(move || {
+        let send = |batch: Vec<Item>| {
+            let ok = tx.send(batch).is_ok();
+            if let Some(w) = &wake {
+                let _ = w.send(crate::terminal::Wake::Refresh);
+            }
+            ok
+        };
+        if crate::config::on_path("rg") {
+            ripgrep(&root, &query, &stop, send);
+        } else {
+            walk_grep(&root, &query, &stop, send);
+        }
+    });
+    GrepSearch { rx, cancel }
 }
 
-/// Read the project in once, for as long as the grep picker is open.
-///
-/// ponytail: capped at 16 MB of source and read on the main thread, so the
-/// first query in a huge repo pauses once; a background ripgrep-style walker
-/// is the upgrade when that itches.
-fn read_project(root: &Path) -> Vec<GrepFile> {
-    const BUDGET: usize = 16 << 20;
-    let mut used = 0usize;
-    let mut out = Vec::new();
-    for rel in list_files(root) {
-        let Ok(text) = std::fs::read_to_string(root.join(&rel)) else {
-            continue; // binary or unreadable
+/// Batches of this many hits go over the channel at a time.
+const GREP_BATCH: usize = 64;
+
+/// The search, by ripgrep: fast, and it knows `.gitignore`. The same
+/// directories the file finder skips are skipped here, `.ivaldiignore` counts
+/// too, and dotfiles follow the hidden toggle.
+fn ripgrep(root: &Path, query: &str, stop: &AtomicBool, mut send: impl FnMut(Vec<Item>) -> bool) {
+    use std::io::BufRead;
+    let mut cmd = std::process::Command::new("rg");
+    cmd.args([
+        "--line-number",
+        "--no-heading",
+        "--color=never",
+        "--null",
+        "--fixed-strings",
+        "--ignore-case",
+        "--max-columns=300",
+    ]);
+    for dir in SKIP {
+        cmd.arg("--glob").arg(format!("!{dir}"));
+    }
+    if crate::config::show_hidden() {
+        cmd.arg("--hidden");
+    }
+    if root.join(".ivaldiignore").is_file() {
+        cmd.arg("--ignore-file").arg(root.join(".ivaldiignore"));
+    }
+    cmd.arg("--").arg(query).arg(".");
+    let Ok(mut child) = cmd
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let Some(out) = child.stdout.take() else {
+        return;
+    };
+    let mut batch = Vec::new();
+    let mut total = 0;
+    for line in std::io::BufReader::new(out).lines() {
+        if stop.load(Ordering::Relaxed) || total >= GREP_LIMIT {
+            break;
+        }
+        let Ok(line) = line else {
+            continue; // not UTF-8
         };
-        used += text.len();
-        out.push(GrepFile {
-            rel,
-            lower: text.to_lowercase(),
-            text,
+        // `path\0line:text`
+        let Some((path, rest)) = line.split_once('\0') else {
+            continue;
+        };
+        let Some((num, text)) = rest.split_once(':') else {
+            continue;
+        };
+        batch.push(Item {
+            label: format!("{}:{num}", path.strip_prefix("./").unwrap_or(path)),
+            detail: text.trim().to_string(),
         });
-        if used >= BUDGET {
+        total += 1;
+        if batch.len() >= GREP_BATCH && !send(std::mem::take(&mut batch)) {
             break;
         }
     }
-    out
+    if !batch.is_empty() {
+        send(batch);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
-/// Case-insensitive substring search over the in-memory corpus, capped at 100
-/// hits so a common word does not build a list nobody will scroll.
-fn grep_corpus(corpus: &[GrepFile], query: &str) -> Vec<Item> {
+/// The search without ripgrep: the file finder's walk, each file read and
+/// matched in turn.
+fn walk_grep(root: &Path, query: &str, stop: &AtomicBool, mut send: impl FnMut(Vec<Item>) -> bool) {
     let query = query.to_lowercase();
-    let mut out = Vec::new();
-    for file in corpus {
-        // One pass to rule the file out, instead of walking its lines.
-        if !file.lower.contains(&query) {
+    let mut batch = Vec::new();
+    let mut total = 0;
+    for rel in list_files(root) {
+        if stop.load(Ordering::Relaxed) || total >= GREP_LIMIT {
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(root.join(&rel)) else {
+            continue; // binary or unreadable
+        };
+        if !text.to_lowercase().contains(&query) {
             continue;
         }
-        for (i, (line, lower)) in file.text.lines().zip(file.lower.lines()).enumerate() {
-            if lower.contains(&query) {
-                out.push(Item {
-                    label: format!("{}:{}", file.rel, i + 1),
+        for (i, line) in text.lines().enumerate() {
+            if total >= GREP_LIMIT {
+                break; // one file of matches must not outrun the whole cap
+            }
+            if line.to_lowercase().contains(&query) {
+                batch.push(Item {
+                    label: format!("{rel}:{}", i + 1),
                     detail: line.trim().to_string(),
                 });
-                if out.len() >= 100 {
-                    return out;
-                }
+                total += 1;
             }
         }
+        if batch.len() >= GREP_BATCH && !send(std::mem::take(&mut batch)) {
+            return;
+        }
     }
-    out
+    if !batch.is_empty() {
+        send(batch);
+    }
 }
 
 /// One directory level: `../`, then subdirectories (marked with `/`), then
@@ -400,15 +549,31 @@ mod tests {
         let dir = std::env::temp_dir().join("crow-grep-test");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "hello\nthe needle is here\n").unwrap();
-        let mut picker = Picker::grep(&dir);
+        let mut picker = Picker::grep(&dir, None);
         picker.query = "NEEDLE".into(); // case-insensitive
         picker.requery();
+        // The search streams in from a thread; give it a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while picker.searching() && std::time::Instant::now() < deadline {
+            picker.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let item = picker.selected_item().expect("one hit");
         assert_eq!(item.label, "a.txt:2");
         assert_eq!(item.detail, "the needle is here");
         picker.query = "n".into(); // too short: no full-repo scan
         picker.requery();
         assert!(picker.selected_item().is_none());
+        assert!(!picker.searching());
+
+        // Both engines agree: the walker finds the same line.
+        let stop = AtomicBool::new(false);
+        let mut found = Vec::new();
+        walk_grep(&dir, "NEEDLE", &stop, |batch| {
+            found.extend(batch);
+            true
+        });
+        assert_eq!(found[0].label, "a.txt:2");
     }
 
     #[test]

@@ -168,6 +168,89 @@ impl Transaction {
         start.map(|s| (s, old_end, new_end))
     }
 
+    /// Every change as `(from, to, inserted)` in the coordinates of the
+    /// document *before* the transaction — the shape the LSP's incremental
+    /// `didChange` wants, once positions are converted to lines and columns.
+    pub fn changes(&self) -> Vec<(usize, usize, String)> {
+        let mut out: Vec<(usize, usize, String)> = Vec::new();
+        let mut old = 0usize;
+        // Whether the last op touched text, so an Insert and the Delete that
+        // `change` puts right after it land in one change, not two.
+        let mut open = false;
+        for op in &self.ops {
+            match op {
+                Operation::Retain(n) => {
+                    old += n;
+                    open = false;
+                }
+                Operation::Delete(n) => {
+                    match out.last_mut() {
+                        Some(last) if open => last.1 += n,
+                        _ => out.push((old, old + n, String::new())),
+                    }
+                    old += n;
+                    open = true;
+                }
+                Operation::Insert(s) => {
+                    match out.last_mut() {
+                        Some(last) if open => last.2.push_str(s),
+                        _ => out.push((old, old, s.clone())),
+                    }
+                    open = true;
+                }
+            }
+        }
+        out
+    }
+
+    /// The transaction as JSON, for the persistent undo file: retains and
+    /// deletes are `[0, n]` / `[1, n]`, inserts are plain strings.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.ops
+                .iter()
+                .map(|op| match op {
+                    Operation::Retain(n) => serde_json::json!([0, n]),
+                    Operation::Delete(n) => serde_json::json!([1, n]),
+                    Operation::Insert(s) => serde_json::Value::String(s.clone()),
+                })
+                .collect(),
+        )
+    }
+
+    /// The inverse of `to_json`; `None` for anything it didn't write.
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let ops = value
+            .as_array()?
+            .iter()
+            .map(|op| match op {
+                serde_json::Value::String(s) => Some(Operation::Insert(s.clone())),
+                serde_json::Value::Array(pair) => {
+                    let n = pair.get(1)?.as_u64()? as usize;
+                    match pair.first()?.as_u64()? {
+                        0 => Some(Operation::Retain(n)),
+                        1 => Some(Operation::Delete(n)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Transaction { ops })
+    }
+
+    /// How many chars of document this transaction expects to read — what the
+    /// text must measure for it to apply. Used to reject a stale undo file.
+    pub fn input_len(&self) -> usize {
+        self.ops
+            .iter()
+            .map(|op| match op {
+                Operation::Retain(n) | Operation::Delete(n) => *n,
+                Operation::Insert(_) => 0,
+            })
+            .sum()
+    }
+
     /// Map a position through this transaction, so a cursor or mark survives an
     /// edit made elsewhere in the document.
     ///
@@ -283,6 +366,37 @@ mod tests {
         let tx = Transaction::insert(&text, 0, "-> ");
         // A cursor at "world" moves right by the length of the insertion.
         assert_eq!(tx.map_pos(6, false), 9);
+    }
+
+    #[test]
+    fn changes_are_reported_in_original_coordinates() {
+        let text = Rope::from_str("aaa bbb ccc");
+        let tx = Transaction::change(
+            &text,
+            [
+                (0, 3, Some("x".to_string())),
+                (4, 4, Some("new ".to_string())),
+                (8, 11, None),
+            ],
+        );
+        assert_eq!(
+            tx.changes(),
+            vec![
+                (0, 3, "x".to_string()),
+                (4, 4, "new ".to_string()),
+                (8, 11, String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_roundtrips() {
+        let text = Rope::from_str("hello world");
+        let tx = Transaction::change(&text, [(0, 5, Some("bye".to_string()))]);
+        let back = Transaction::from_json(&tx.to_json()).unwrap();
+        assert_eq!(back, tx);
+        assert_eq!(back.input_len(), 11);
+        assert!(Transaction::from_json(&serde_json::json!([[7, 1]])).is_none());
     }
 
     #[test]

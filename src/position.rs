@@ -14,8 +14,8 @@
 //! the name.
 
 use ropey::RopeSlice;
-use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete, UnicodeSegmentation};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Display width of a single character at a given display column.
 ///
@@ -28,31 +28,54 @@ pub fn char_width(c: char, at_col: usize, tab_width: usize) -> usize {
     }
 }
 
+/// Display width of one grapheme cluster starting at display column `col`.
+///
+/// This, not a sum over the cluster's chars, is what the renderer draws: a
+/// ZWJ emoji sequence is one glyph, not three. Measuring the cursor the same
+/// way is what keeps it on the character it is drawn over.
+pub fn grapheme_width(g: &str, col: usize, tab_width: usize) -> usize {
+    match g {
+        "\t" => char_width('\t', col, tab_width),
+        _ if g.starts_with(['\n', '\r']) => 0,
+        _ => UnicodeWidthStr::width(g),
+    }
+}
+
+/// The line's grapheme clusters as (char offset, cluster), newline excluded.
+fn graphemes(line: RopeSlice) -> Vec<(usize, String)> {
+    let text: String = line.chars().take(line_len_without_newline(line)).collect();
+    let mut at = 0;
+    text.graphemes(true)
+        .map(|g| {
+            let start = at;
+            at += g.chars().count();
+            (start, g.to_string())
+        })
+        .collect()
+}
+
 /// Convert a char offset within a line to the display column it renders at.
 pub fn char_to_display_col(line: RopeSlice, char_offset: usize, tab_width: usize) -> usize {
     let mut col = 0usize;
-    for (i, c) in line.chars().enumerate() {
-        if i >= char_offset {
+    for (at, g) in graphemes(line) {
+        if at >= char_offset {
             break;
         }
-        col += char_width(c, col, tab_width);
+        col += grapheme_width(&g, col, tab_width);
     }
     col
 }
 
 /// Convert a display column to the nearest char offset within a line.
 ///
-/// If the column falls inside a wide character or a tab, this returns the
-/// offset of that character rather than splitting it.
+/// If the column falls inside a wide character, a tab, or a cluster, this
+/// returns the offset where that starts rather than splitting it.
 pub fn display_col_to_char(line: RopeSlice, target_col: usize, tab_width: usize) -> usize {
     let mut col = 0usize;
-    for (i, c) in line.chars().enumerate() {
-        if c == '\n' || c == '\r' {
-            return i;
-        }
-        let w = char_width(c, col, tab_width);
+    for (at, g) in graphemes(line) {
+        let w = grapheme_width(&g, col, tab_width);
         if col + w > target_col {
-            return i;
+            return at;
         }
         col += w;
     }
@@ -62,46 +85,72 @@ pub fn display_col_to_char(line: RopeSlice, target_col: usize, tab_width: usize)
 /// Display width of the chars `from..to` of a line, measured as if the row
 /// started at column 0 — which is what a soft-wrapped row does.
 pub fn display_col_between(line: RopeSlice, from: usize, to: usize, tab_width: usize) -> usize {
+    let text: String = line.chars_at(from).take(to.saturating_sub(from)).collect();
     let mut col = 0usize;
-    for c in line.chars_at(from).take(to.saturating_sub(from)) {
-        col += char_width(c, col, tab_width);
+    for g in text.graphemes(true) {
+        col += grapheme_width(g, col, tab_width);
     }
     col
+}
+
+/// The char offset in `from..to` of a line drawn at display column `target`,
+/// columns counted from `from` — a click on a soft-wrapped row. Past the end
+/// it is `to`.
+pub fn display_col_to_char_between(
+    line: RopeSlice,
+    from: usize,
+    to: usize,
+    target: usize,
+    tab_width: usize,
+) -> usize {
+    let text: String = line.chars_at(from).take(to.saturating_sub(from)).collect();
+    let mut col = 0usize;
+    let mut at = from;
+    for g in text.graphemes(true) {
+        let w = grapheme_width(g, col, tab_width);
+        if col + w > target {
+            return at;
+        }
+        col += w;
+        at += g.chars().count();
+    }
+    to
 }
 
 /// Char offsets within `line` where each soft-wrapped visual row begins.
 ///
 /// Always starts with `0`, so a line that fits returns `[0]` and the count is
 /// the number of screen rows the line takes. Breaks after the last space that
-/// fits, and mid-word only when one word is wider than the window.
+/// fits, and mid-word only when one word is wider than the window — and even
+/// then between clusters, never inside one.
 pub fn wrap_offsets(line: RopeSlice, width: usize, tab_width: usize) -> Vec<usize> {
     let mut offsets = vec![0usize];
     if width == 0 {
         return offsets;
     }
-    let chars: Vec<char> = line.chars().take(line_len_without_newline(line)).collect();
+    let clusters = graphemes(line);
     let mut col = 0usize;
-    let mut row_start = 0usize;
-    // Offset just past the last space seen on this row — where a break would
-    // land without splitting a word.
+    let mut row_start = 0usize; // index into `clusters`
+                                // Cluster index just past the last space seen on this row — where a
+                                // break would land without splitting a word.
     let mut last_space: Option<usize> = None;
 
-    for (i, &c) in chars.iter().enumerate() {
-        let w = char_width(c, col, tab_width);
+    for (i, (_, g)) in clusters.iter().enumerate() {
+        let w = grapheme_width(g, col, tab_width);
         if col + w > width && i > row_start {
             let brk = last_space.filter(|&b| b > row_start && b <= i).unwrap_or(i);
-            offsets.push(brk);
+            offsets.push(clusters[brk].0);
             row_start = brk;
             last_space = None;
             // Re-lay what moved down onto the new row, tabs included.
-            col = chars[brk..i]
+            col = clusters[brk..i]
                 .iter()
-                .fold(0, |acc, &c| acc + char_width(c, acc, tab_width));
-            col += char_width(c, col, tab_width);
+                .fold(0, |acc, (_, g)| acc + grapheme_width(g, acc, tab_width));
+            col += grapheme_width(g, col, tab_width);
         } else {
             col += w;
         }
-        if c == ' ' || c == '\t' {
+        if g == " " || g == "\t" {
             last_space = Some(i + 1);
         }
     }
@@ -375,6 +424,35 @@ mod tests {
         let line = rope.line(0);
         // "brown fox" starts at char 10; "fox" is 6 columns into its own row.
         assert_eq!(display_col_between(line, 10, 16, 4), 6);
+    }
+
+    #[test]
+    fn a_cluster_is_measured_the_way_it_is_drawn() {
+        // A ZWJ sequence: its width is the cluster's, not the sum of its chars.
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let rope = Rope::from_str(&format!("a{family}b"));
+        let line = rope.line(0);
+        let drawn = UnicodeWidthStr::width(family);
+        assert_eq!(char_to_display_col(line, 6, 4), 1 + drawn);
+        // A column inside the cluster lands on its start, never mid-cluster.
+        assert_eq!(display_col_to_char(line, 2, 4), 1);
+        assert_eq!(display_col_to_char(line, 1 + drawn, 4), 6);
+        assert_eq!(display_col_between(line, 1, 7, 4), drawn + 1);
+        // Wrapping never splits it either.
+        for off in wrap_offsets(line, 2, 4) {
+            assert!(
+                [0, 1, 6].contains(&off),
+                "split inside the cluster at {off}"
+            );
+        }
+    }
+
+    #[test]
+    fn clicks_on_a_wrapped_row_find_their_char() {
+        let rope = Rope::from_str("the quick brown fox\n");
+        let line = rope.line(0);
+        assert_eq!(display_col_to_char_between(line, 10, 19, 6, 4), 16);
+        assert_eq!(display_col_to_char_between(line, 10, 19, 50, 4), 19);
     }
 
     #[test]

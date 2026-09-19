@@ -26,6 +26,8 @@ use crate::vt::Screen;
 pub enum Wake {
     Input(crossterm::event::Event),
     Pty(u64, Vec<u8>),
+    /// Background work finished something worth drawing (a grep batch).
+    Refresh,
 }
 
 pub struct Terminal {

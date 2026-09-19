@@ -6,7 +6,7 @@
 
 use crate::config::tab_width;
 use crate::document::Document;
-use crate::editor::{Editor, Mode};
+use crate::editor::{CharWait, Editor, Mode, SelectPrompt};
 use crate::position::{self, CharClass};
 use crate::transaction::Transaction;
 use unicode_segmentation::UnicodeSegmentation;
@@ -47,6 +47,33 @@ commands! {
     add_cursor_above => "add a cursor on the previous line",
     remove_extra_cursors => "keep only the primary cursor",
     goto_definition => "jump to the definition under the cursor (LSP)",
+    goto_references => "list every reference to the symbol under the cursor (LSP)",
+    code_action => "quick fixes and refactors for the selection or line (LSP)",
+    rename => "rename the symbol under the cursor across the project (LSP, :rename)",
+    document_symbols => "pick a symbol in this buffer to jump to (LSP)",
+    workspace_symbols => "search symbols across the project (LSP)",
+    diagnostics => "list every diagnostic in every file",
+    next_diagnostic => "jump to the next diagnostic in this buffer",
+    prev_diagnostic => "jump to the previous diagnostic in this buffer",
+    next_change => "jump to the next change since the last ivaldi seal",
+    prev_change => "jump to the previous change since the last ivaldi seal",
+    jump_back => "go back to where the last jump came from (C-o)",
+    jump_forward => "go forward again through the jumplist (C-i / Tab)",
+    repeat_last_change => "repeat the last change at the cursor (.)",
+    macro_record => "q then a register records a macro; q again stops",
+    macro_play => "@ then a register plays that macro (@@ the last one)",
+    select_inside => "select inside an object — mi then ( [ { < \" ' ` w W p f t a c",
+    select_around => "select around an object — ma then ( [ { < \" ' ` w W p f t a c",
+    surround_delete => "delete the surrounding pair — md then the pair",
+    surround_replace => "replace the surrounding pair — mr, the old pair, then the new",
+    split_selection_lines => "split the selections into one per line",
+    split_selection => "split the selections on a regex",
+    keep_selections => "keep only the selections matching a regex",
+    remove_selections => "drop the selections matching a regex",
+    align_selections => "line the selections up in one column with spaces",
+    rotate_selections_forward => "make the next selection the primary one",
+    rotate_selections_backward => "make the previous selection the primary one",
+    trim_selections => "trim whitespace off both ends of every selection",
     hover => "pop up docs and examples for the symbol under the cursor (LSP)",
     complete => "open the completion menu (LSP)",
     command_palette => "fuzzy-pick any command by name",
@@ -152,9 +179,19 @@ pub fn help_lines(keymap: &crate::keymap::KeyTrie) -> Vec<HelpLine> {
     let mut out = vec![HelpLine::Header("Command line — press :")];
     for (cmd, doc) in [
         (":w [path]", "write the buffer (:write; to a path if given)"),
+        (":wa", "write every modified buffer"),
         (":q  :q!", "close the window / quit without saving"),
         (":wq  :x", "write, then quit"),
         (":e <file>", "open a file (:edit)"),
+        (":e!", "reload this buffer from disk, as one undoable edit"),
+        (
+            ":rename <name>",
+            "rename the symbol under the cursor across the project (LSP; <space> R prefills it)",
+        ),
+        (
+            ":recover  :recover!",
+            "restore the unsaved changes in this buffer's swap file, or discard it",
+        ),
         (":fmt", "run the file's formatter over the buffer"),
         (
             ":install <x>",
@@ -694,7 +731,8 @@ fn recent_files(editor: &mut Editor) {
 
 fn grep_text(editor: &mut Editor) {
     let root = std::env::current_dir().unwrap_or_default();
-    editor.open_picker(crate::picker::Picker::grep(&root));
+    let wake = editor.wake_tx.clone();
+    editor.open_picker(crate::picker::Picker::grep(&root, Some(wake)));
 }
 
 fn file_explorer(editor: &mut Editor) {
@@ -767,6 +805,144 @@ fn lsp_position_request(editor: &mut Editor, tag: &'static str, method: &str) {
     }
 }
 
+fn goto_references(editor: &mut Editor) {
+    editor.find_references();
+}
+
+fn code_action(editor: &mut Editor) {
+    editor.code_actions();
+}
+
+fn rename(editor: &mut Editor) {
+    editor.prompt_rename();
+}
+
+fn document_symbols(editor: &mut Editor) {
+    editor.document_symbols();
+}
+
+fn workspace_symbols(editor: &mut Editor) {
+    editor.workspace_symbols();
+}
+
+fn diagnostics(editor: &mut Editor) {
+    editor.diagnostics_picker();
+}
+
+fn next_diagnostic(editor: &mut Editor) {
+    editor.goto_diagnostic(true);
+}
+
+fn prev_diagnostic(editor: &mut Editor) {
+    editor.goto_diagnostic(false);
+}
+
+fn next_change(editor: &mut Editor) {
+    editor.goto_change(true);
+}
+
+fn prev_change(editor: &mut Editor) {
+    editor.goto_change(false);
+}
+
+// ---- jumps, repeats, macros ------------------------------------------------
+
+fn jump_back(editor: &mut Editor) {
+    editor.jump_back();
+}
+
+fn jump_forward(editor: &mut Editor) {
+    editor.jump_forward();
+}
+
+fn repeat_last_change(editor: &mut Editor) {
+    editor.repeat_last_change();
+}
+
+fn macro_record(editor: &mut Editor) {
+    editor.macro_record();
+}
+
+fn macro_play(editor: &mut Editor) {
+    editor.macro_play();
+}
+
+// ---- text objects and surround ---------------------------------------------
+
+/// Arm a command that takes one more character. The selection is what the
+/// character will act on, so it survives the keypress that only arms.
+fn await_char(editor: &mut Editor, wait: CharWait, prompt: &str) {
+    editor.keep_selection = true;
+    editor.awaiting_char = Some(wait);
+    editor.set_status(prompt);
+}
+
+fn select_inside(editor: &mut Editor) {
+    await_char(
+        editor,
+        CharWait::Inside,
+        "inside: ( [ { < \" ' ` · w word · W WORD · p paragraph · f function · t type · a argument · c comment",
+    );
+}
+
+fn select_around(editor: &mut Editor) {
+    await_char(
+        editor,
+        CharWait::Around,
+        "around: ( [ { < \" ' ` · w word · W WORD · p paragraph · f function · t type · a argument · c comment",
+    );
+}
+
+fn surround_delete(editor: &mut Editor) {
+    await_char(
+        editor,
+        CharWait::SurroundDelete,
+        "delete the surrounding: ( [ { < \" ' `",
+    );
+}
+
+fn surround_replace(editor: &mut Editor) {
+    await_char(
+        editor,
+        CharWait::SurroundReplace(None),
+        "replace the surrounding: ( [ { < \" ' `",
+    );
+}
+
+// ---- selection sets --------------------------------------------------------
+
+fn split_selection_lines(editor: &mut Editor) {
+    editor.split_selection_lines();
+}
+
+fn split_selection(editor: &mut Editor) {
+    editor.open_select_prompt(SelectPrompt::Split);
+}
+
+fn keep_selections(editor: &mut Editor) {
+    editor.open_select_prompt(SelectPrompt::Keep);
+}
+
+fn remove_selections(editor: &mut Editor) {
+    editor.open_select_prompt(SelectPrompt::Remove);
+}
+
+fn align_selections(editor: &mut Editor) {
+    editor.align_selections();
+}
+
+fn rotate_selections_forward(editor: &mut Editor) {
+    editor.rotate_selections(true);
+}
+
+fn rotate_selections_backward(editor: &mut Editor) {
+    editor.rotate_selections(false);
+}
+
+fn trim_selections(editor: &mut Editor) {
+    editor.trim_selections();
+}
+
 // ---- search ----------------------------------------------------------------
 
 fn search(editor: &mut Editor) {
@@ -816,6 +992,7 @@ fn search_step(editor: &mut Editor, forward: bool) {
     };
     match hit {
         Some((p, e)) => {
+            editor.push_jump();
             let doc = editor.doc_mut();
             doc.anchor = p;
             doc.cursor = e;
@@ -1053,7 +1230,7 @@ fn paste(editor: &mut Editor, after: bool) {
 /// Character offset of the start of the final user-perceived character.
 fn last_grapheme_start(text: &str) -> usize {
     text.grapheme_indices(true)
-        .last()
+        .next_back()
         .map(|(byte, _)| text[..byte].chars().count())
         .unwrap_or(0)
 }
@@ -1132,6 +1309,7 @@ fn goto_line(editor: &mut Editor, default: usize) {
         .take()
         .map(|n| n.saturating_sub(1))
         .unwrap_or(default);
+    editor.push_jump();
     let doc = editor.doc_mut();
     doc.cursor = doc.line_start(line.min(doc.line_count().saturating_sub(1)));
     doc.goal_col = None;
@@ -1435,6 +1613,8 @@ fn format_buffer(editor: &mut Editor) {
         Some(Err(e)) => editor.set_status(e),
         // An armed install offer already owns the status line.
         None if editor.pending_install.is_some() => {}
+        // No formatter crow knows of — but the language server may be one.
+        None if editor.lsp_format() => editor.set_status("formatting…"),
         None => editor.set_status("no formatter for this buffer (see [fmt] in crow.toml)"),
     }
 }
@@ -1593,10 +1773,12 @@ fn delete_forward(editor: &mut Editor) {
 // ---- buffers and lifecycle -------------------------------------------------
 
 fn next_buffer(editor: &mut Editor) {
+    editor.push_jump();
     editor.current = (editor.current + 1) % editor.documents.len();
 }
 
 fn prev_buffer(editor: &mut Editor) {
+    editor.push_jump();
     editor.current = (editor.current + editor.documents.len() - 1) % editor.documents.len();
 }
 
@@ -1811,6 +1993,11 @@ pub fn save_with(editor: &mut Editor, force: bool) {
     };
     match editor.doc_mut().save(force) {
         Ok(()) => {
+            editor.lsp_did_save();
+            // A file saved for the first time may now be one ivaldi knows.
+            if editor.doc().vcs.base == crate::vcs::Base::NoRepo {
+                editor.request_vcs(editor.current);
+            }
             let name = editor.doc().name();
             let lines = editor.doc().line_count();
             match fmt_err {

@@ -19,6 +19,18 @@ use crate::config::tab_width;
 use crate::editor::{Editor, Mode};
 use crate::position::{self};
 
+/// Take the mouse, or give it back to the terminal — `mouse` in crow.toml,
+/// applied at startup and again on `:config!`.
+pub fn set_mouse_capture(on: bool) {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    let mut out = std::io::stdout();
+    let _ = if on {
+        crossterm::execute!(out, EnableMouseCapture)
+    } else {
+        crossterm::execute!(out, DisableMouseCapture)
+    };
+}
+
 pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     // Synchronized updates make the terminal present the frame atomically
     // instead of painting it cell by cell as the bytes stream in; ignored by
@@ -40,6 +52,7 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     render_picker(editor, out)?;
     render_completion(editor, out)?;
     render_hover(editor, out)?;
+    render_signature(editor, out)?;
     render_pending_keys(editor, out)?;
     render_help(editor, out)?;
 
@@ -272,9 +285,17 @@ fn render_window(
         // Continuation rows leave the gutter blank, so the line numbers still
         // read as one number per line.
         let number = if sub_row == 0 {
-            format!("{:>width$} ", line_idx + 1, width = gutter - 1)
+            format!("{:>width$}", line_idx + 1, width = gutter - 1)
         } else {
-            " ".repeat(gutter)
+            " ".repeat(gutter - 1)
+        };
+        // The gutter's last column, between number and text, carries the
+        // change marker against the last ivaldi seal.
+        let (sign, sign_color) = match doc.vcs.mark(line_idx) {
+            crate::vcs::Mark::Added => ("▎", Color::Green),
+            crate::vcs::Mark::Modified => ("▎", Color::Blue),
+            crate::vcs::Mark::DeletedAbove if sub_row == 0 => ("▔", Color::Red),
+            _ => (" ", theme.gutter),
         };
         // A diagnostic on the line colors its number: red error, yellow warning.
         let diag_color = diags
@@ -290,7 +311,9 @@ fn render_window(
             } else {
                 theme.gutter
             })),
-            Print(number)
+            Print(number),
+            SetForegroundColor(sign_color),
+            Print(sign)
         )?;
 
         let ls = doc.line_start(line_idx);
@@ -827,6 +850,19 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         diag_w += s.chars().count();
         queue!(out, SetForegroundColor(Color::Yellow), Print(s))?;
     }
+    // Changes since the last ivaldi seal: added, modified, deleted lines.
+    let (added, modified, deleted) = doc.vcs.stats;
+    for (n, sign, color) in [
+        (added, '+', Color::Green),
+        (modified, '~', Color::Blue),
+        (deleted, '-', Color::Red),
+    ] {
+        if n > 0 && term.is_none() {
+            let s = format!(" {sign}{n}");
+            diag_w += s.chars().count();
+            queue!(out, SetForegroundColor(color), Print(s))?;
+        }
+    }
 
     // Right side: transient input state, then the pills.
     let reg = match (editor.awaiting_register, editor.active_register) {
@@ -850,7 +886,11 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         .as_deref()
         .map(crate::lsp::language_id)
         .unwrap_or("");
-    let mut info = format!("{cursors}{reg}{count}{pending}");
+    let recording = match &editor.macro_rec {
+        Some((r, _)) => format!("rec @{r}  "),
+        None => String::new(),
+    };
+    let mut info = format!("{recording}{cursors}{reg}{count}{pending}");
     if !info.is_empty() {
         info.push_str("  ");
     }
@@ -1063,7 +1103,11 @@ fn render_picker(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
         x,
         y,
         w,
-        &format!(" {} ", picker.title),
+        &format!(
+            " {}{} ",
+            picker.title,
+            if picker.searching() { " …" } else { "" }
+        ),
         &format!(" ▸ {}", picker.query),
     )?;
 
@@ -1533,6 +1577,72 @@ fn render_hover(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
     draw_text_popup(out, x, top, text_w, rows)
 }
 
+/// Signature help while typing a call's arguments: the signature in a
+/// one-line box above the cursor, the parameter being typed picked out.
+fn render_signature(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    let Some((label, active)) = &editor.signature else {
+        return Ok(());
+    };
+    if editor.mode != Mode::Insert {
+        return Ok(());
+    }
+    let Some((cx, cy)) = editor.screen_cursor() else {
+        return Ok(());
+    };
+    let max_w = (editor.size.0 as usize).saturating_sub(4).min(100);
+    if max_w < 8 {
+        return Ok(());
+    }
+    // Too long for the screen: keep the active parameter in view.
+    let chars: Vec<char> = label.chars().collect();
+    let (mut from, mut to) = (0, chars.len());
+    if chars.len() > max_w {
+        let focus = active.map_or(0, |(s, _)| s);
+        from = focus.saturating_sub(max_w / 3).min(chars.len() - max_w);
+        to = from + max_w;
+    }
+    let inner = to - from;
+    let w = inner as u16 + 4;
+    // Above the cursor, where the completion menu isn't.
+    let y = if cy >= 3 { cy - 3 } else { cy + 1 };
+    let x = cx.min(editor.size.0.saturating_sub(w));
+    let theme = crate::theme::current();
+    let fg = theme.fg.unwrap_or(Color::Reset);
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        SetBackgroundColor(theme.popup_bg),
+        SetForegroundColor(theme.border),
+        Print(format!("╭{}╮", "─".repeat(inner + 2))),
+        cursor::MoveTo(x, y + 1),
+        Print("│ ")
+    )?;
+    for (i, c) in chars[from..to].iter().enumerate() {
+        let hot = active.is_some_and(|(s, e)| from + i >= s && from + i < e);
+        if hot {
+            queue!(
+                out,
+                SetForegroundColor(theme.gutter_cursor),
+                SetAttribute(Attribute::Bold),
+                SetAttribute(Attribute::Underlined),
+                Print(c),
+                SetAttribute(Attribute::NoUnderline),
+                SetAttribute(Attribute::NormalIntensity)
+            )?;
+        } else {
+            queue!(out, SetForegroundColor(fg), Print(c))?;
+        }
+    }
+    queue!(
+        out,
+        SetForegroundColor(theme.border),
+        Print(" │"),
+        cursor::MoveTo(x, y + 2),
+        Print(format!("╰{}╯", "─".repeat(inner + 2))),
+        ResetColor
+    )
+}
+
 /// The bottom line: status messages and the cursor line's diagnostic. The
 /// `:` and `/` prompts live in the floating popup, not here.
 fn render_command_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
@@ -1634,10 +1744,13 @@ fn draw_popup(
 
 /// The `:` and `/` prompts as a floating popup.
 fn render_prompt_popup(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
-    let title = match editor.mode {
-        Mode::Command => " Command ",
-        Mode::Search if editor.search_select => " Select ",
-        Mode::Search => " Search ",
+    let title = match (editor.mode, editor.select_prompt) {
+        (Mode::Command, _) => " Command ",
+        (Mode::Search, Some(crate::editor::SelectPrompt::Split)) => " Split selections on ",
+        (Mode::Search, Some(crate::editor::SelectPrompt::Keep)) => " Keep selections matching ",
+        (Mode::Search, Some(crate::editor::SelectPrompt::Remove)) => " Remove selections matching ",
+        (Mode::Search, None) if editor.search_select => " Select ",
+        (Mode::Search, None) => " Search ",
         _ => return Ok(()),
     };
     let (x, y, w) = editor.prompt_rect();

@@ -12,9 +12,11 @@ mod position;
 mod search;
 mod syntax;
 mod terminal;
+mod textobj;
 mod theme;
 mod transaction;
 mod ui;
+mod vcs;
 mod vt;
 
 use std::io::{stdout, BufWriter, Write};
@@ -23,7 +25,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, Event,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -46,13 +51,22 @@ KEYS (normal mode):
     x v ;        select line, extend mode,     collapse selection
     C A-C  ,     add cursor below/above, drop  extra cursors
     A-o          expand selection to syntax node
+    mi( ma\"     select inside/around an object (w W p f t a c too)
+    md( mr([     delete / replace the surrounding pair
+    .  q{r} @{r} repeat the last change; record a macro, play it
     / n N        regex search    s  \"x        select all matches, register
+    A-s A-S      split selections into lines / on a regex
+    A-k A-K & _  keep/drop selections matching a regex, align, trim
     C-w v/s/w/q  split side-by-side/stacked,   cycle, close window
     0 ^ $        line ends       u  C-r        undo, redo
     gg G  42gg   file ends, jump to line       :w :q :wq  write, quit
-    C-d C-u      half page       gn gp         next/prev buffer
-    gd K         goto definition, hover        C-space  LSP complete (insert)
+    C-o C-i      jump back / forward           C-d C-u   half page
+    ]d [d  ]g [g next/prev diagnostic, next/prev change since the seal
+    gd gr K      goto definition, references, hover
+    space a R    code actions, rename symbol   C-space  LSP complete (insert)
+    space s s S  symbols here / across the project;  space x  diagnostics
     gc  ms(      comment lines, surround selection
+    (the mouse)  click to place the cursor, drag to select, wheel to scroll
     space m  :md   live GitHub-style markdown preview beside the buffer
     space t  :term shell in a split below; C-\\ C-n for normal mode there
     space e      file tree sidebar             (typing pops word completion)
@@ -95,6 +109,7 @@ fn main() -> std::io::Result<()> {
     restore_terminal()?;
     editor.close_terminal();
     editor.shutdown_lsps();
+    editor.cleanup_on_exit();
     result
 }
 
@@ -166,6 +181,12 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
         if editor.terminal_tick() {
             dirty = true;
         }
+        if editor.watch_tick() {
+            dirty = true;
+        }
+        if editor.picker_tick() {
+            dirty = true;
+        }
 
         if editor.should_quit {
             break;
@@ -219,8 +240,12 @@ fn apply(editor: &mut Editor, wake: Wake) {
         }
         Wake::Input(Event::Paste(text)) => editor.handle_paste(&text),
         Wake::Input(Event::Resize(cols, rows)) => editor.size = (cols, rows),
+        Wake::Input(Event::Mouse(ev)) => editor.handle_mouse(ev),
+        // Coming back to crow from elsewhere: files may have changed.
+        Wake::Input(Event::FocusGained) => editor.external_change_hint(),
         Wake::Input(_) => {}
         Wake::Pty(generation, bytes) => editor.terminal_output(generation, &bytes),
+        Wake::Refresh => {}
     }
 }
 
@@ -230,8 +255,11 @@ fn setup_terminal() -> std::io::Result<()> {
         stdout(),
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableFocusChange,
         cursor::Hide
-    )
+    )?;
+    ui::set_mouse_capture(config::mouse());
+    Ok(())
 }
 
 fn restore_terminal() -> std::io::Result<()> {
@@ -240,6 +268,8 @@ fn restore_terminal() -> std::io::Result<()> {
         out,
         cursor::SetCursorStyle::DefaultUserShape,
         cursor::Show,
+        DisableMouseCapture,
+        DisableFocusChange,
         DisableBracketedPaste,
         LeaveAlternateScreen
     );

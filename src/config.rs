@@ -23,6 +23,16 @@ pub struct Config {
     pub soft_wrap: bool,
     pub trailing_whitespace: bool,
     pub strip_trailing_whitespace: bool,
+    /// Keep undo history across sessions, in the state dir.
+    pub persistent_undo: bool,
+    /// Write unsaved buffers to swap files so a crash loses seconds, not work.
+    pub swap_files: bool,
+    /// Take the mouse: click to place the cursor, drag to select, wheel to scroll.
+    pub mouse: bool,
+    /// Reload buffers whose file changed on disk (unmodified ones only).
+    pub auto_reload: bool,
+    /// Change markers in the gutter against the last ivaldi seal.
+    pub vcs_gutter: bool,
     /// What `space t` runs; empty means `$SHELL`, falling back to `/bin/sh`.
     pub shell: String,
     /// Extra bindings per mode: (key sequence, command name).
@@ -48,6 +58,11 @@ impl Default for Config {
             soft_wrap: true,
             trailing_whitespace: true,
             strip_trailing_whitespace: true,
+            persistent_undo: true,
+            swap_files: true,
+            mouse: true,
+            auto_reload: true,
+            vcs_gutter: true,
             shell: String::new(),
             keys_normal: Vec::new(),
             keys_insert: Vec::new(),
@@ -69,6 +84,11 @@ static FORMAT_ON_SAVE: AtomicBool = AtomicBool::new(true);
 static SOFT_WRAP: AtomicBool = AtomicBool::new(true);
 static TRAILING_WHITESPACE: AtomicBool = AtomicBool::new(true);
 static STRIP_TRAILING_WHITESPACE: AtomicBool = AtomicBool::new(true);
+static PERSISTENT_UNDO: AtomicBool = AtomicBool::new(true);
+static SWAP_FILES: AtomicBool = AtomicBool::new(true);
+static MOUSE: AtomicBool = AtomicBool::new(true);
+static AUTO_RELOAD: AtomicBool = AtomicBool::new(true);
+static VCS_GUTTER: AtomicBool = AtomicBool::new(true);
 
 pub fn tab_width() -> usize {
     TAB_WIDTH.load(Ordering::Relaxed)
@@ -119,6 +139,26 @@ pub fn strip_trailing_whitespace() -> bool {
     STRIP_TRAILING_WHITESPACE.load(Ordering::Relaxed)
 }
 
+pub fn persistent_undo() -> bool {
+    PERSISTENT_UNDO.load(Ordering::Relaxed)
+}
+
+pub fn swap_files() -> bool {
+    SWAP_FILES.load(Ordering::Relaxed)
+}
+
+pub fn mouse() -> bool {
+    MOUSE.load(Ordering::Relaxed)
+}
+
+pub fn auto_reload() -> bool {
+    AUTO_RELOAD.load(Ordering::Relaxed)
+}
+
+pub fn vcs_gutter() -> bool {
+    VCS_GUTTER.load(Ordering::Relaxed)
+}
+
 /// Install the config's options and theme as the live values. False when the
 /// theme name was not recognised — startup ignores that, `:config!` reports it
 /// rather than looking like the reload did nothing.
@@ -132,6 +172,11 @@ pub fn apply(config: &Config) -> bool {
     SOFT_WRAP.store(config.soft_wrap, Ordering::Relaxed);
     TRAILING_WHITESPACE.store(config.trailing_whitespace, Ordering::Relaxed);
     STRIP_TRAILING_WHITESPACE.store(config.strip_trailing_whitespace, Ordering::Relaxed);
+    PERSISTENT_UNDO.store(config.persistent_undo, Ordering::Relaxed);
+    SWAP_FILES.store(config.swap_files, Ordering::Relaxed);
+    MOUSE.store(config.mouse, Ordering::Relaxed);
+    AUTO_RELOAD.store(config.auto_reload, Ordering::Relaxed);
+    VCS_GUTTER.store(config.vcs_gutter, Ordering::Relaxed);
     *FMT.lock().unwrap() = config.fmt.clone();
     *SHELL.lock().unwrap() = config.shell.clone();
     crate::theme::set(&config.theme)
@@ -398,7 +443,14 @@ const INSTALLERS: &[(&str, &str)] = &[
 /// building it from its own ecosystem — rather than being told to install a
 /// package that doesn't exist. `None` there means we have nothing to suggest
 /// beyond Homebrew, which is consulted last and only if this machine has it.
-const PACKAGES: &[(&str, &[(Pm, &str)], Option<&str>)] = &[
+/// One `PACKAGES` row: program, (manager, package) pairs, fallback build.
+type PackageRow = (
+    &'static str,
+    &'static [(Pm, &'static str)],
+    Option<&'static str>,
+);
+
+const PACKAGES: &[PackageRow] = &[
     (
         "gofmt", // ships with the Go toolchain
         &[
@@ -583,13 +635,24 @@ pub fn path() -> PathBuf {
         .join("crow/crow.toml")
 }
 
-/// The recent-files list, most recent first (XDG state, not config).
-fn recent_path() -> PathBuf {
+/// Where crow keeps what it learns between runs: recent files, undo
+/// history, swap files. XDG state, not config — none of it is hand-edited.
+pub fn state_dir() -> PathBuf {
+    // Tests save and open files; their undo and swap files must not land in
+    // the real state dir of whoever runs `cargo test`.
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("crow-test-state-{}", std::process::id()));
+    }
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .unwrap_or_default()
-        .join("crow/recent")
+        .join("crow")
+}
+
+/// The recent-files list, most recent first.
+fn recent_path() -> PathBuf {
+    state_dir().join("recent")
 }
 
 /// Recently opened files that still exist, most recent first.
@@ -637,6 +700,11 @@ show_hidden = false      # dotfiles, .git, and build dirs everywhere (toggle: . 
 soft_wrap = true         # wrap long lines instead of scrolling sideways (toggle: :wrap)
 trailing_whitespace = true          # tint spaces left at the end of a line
 strip_trailing_whitespace = true    # and cut them on :w (never in markdown, where they mean a line break)
+persistent_undo = true   # undo history survives closing the file
+swap_files = true        # unsaved edits are written aside; :recover brings them back after a crash
+mouse = true             # click, drag to select, wheel to scroll (shift+drag for the terminal's own selection)
+auto_reload = true       # a file changed on disk reloads if you haven't edited it
+vcs_gutter = true        # added/changed/deleted markers against the last ivaldi seal
 # shell = "zsh"          # what space t / :term runs (default: $SHELL, then /bin/sh)
 
 # Language servers: file extension = server command. crow starts the first
@@ -724,6 +792,13 @@ fn parse(text: &str) -> Config {
                     config.strip_trailing_whitespace =
                         value.parse().unwrap_or(config.strip_trailing_whitespace)
                 }
+                "persistent_undo" => {
+                    config.persistent_undo = value.parse().unwrap_or(config.persistent_undo)
+                }
+                "swap_files" => config.swap_files = value.parse().unwrap_or(config.swap_files),
+                "mouse" => config.mouse = value.parse().unwrap_or(config.mouse),
+                "auto_reload" => config.auto_reload = value.parse().unwrap_or(config.auto_reload),
+                "vcs_gutter" => config.vcs_gutter = value.parse().unwrap_or(config.vcs_gutter),
                 "shell" => config.shell = value,
                 _ => {}
             },
