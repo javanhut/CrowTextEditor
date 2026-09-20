@@ -28,6 +28,14 @@ if [ "$(uname)" = "Linux" ]; then
   mkdir -p "$APP_DIR"
   cp crow.desktop "$APP_DIR/crow.desktop"
   echo "Installed $APP_DIR/crow.desktop"
+  # Rebuild mimeinfo.cache: GIO reads a directory's MIME associations only from
+  # that cache, but it masks an app id found in any higher-priority directory.
+  # Without this, our copy hides the system entry and crow registers for nothing.
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APP_DIR"
+  else
+    echo "Note: update-desktop-database not found — crow may not be offered as a text editor."
+  fi
 fi
 
 case ":$PATH:" in
