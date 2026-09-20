@@ -345,6 +345,7 @@ impl Default for Keymaps {
         // selection and edits
         normal.bind_str("V", "select_line");
         normal.bind_str("v", "extend_mode");
+        normal.bind_str("C-v", "block_mode");
         normal.bind_str("A-o", "expand_selection");
         normal.bind_str(";", "collapse_selection");
         normal.bind_str("C", "add_cursor_below");
@@ -410,6 +411,7 @@ impl Default for Keymaps {
         normal.bind_str("<space> s s", "document_symbols");
         normal.bind_str("<space> S", "workspace_symbols");
         normal.bind_str("<space> x", "diagnostics");
+        normal.bind_str("gl", "diagnostic_detail");
 
         // space leader: pickers
         normal.bind_str("<space> c", "command_palette");
@@ -560,6 +562,9 @@ pub struct Editor {
     pub keep_selection: bool,
     /// Extend mode (`v`): motions grow the selection instead of replacing it.
     pub extend: bool,
+    /// Block mode (`C-v`): motions stretch a rectangle, one selection per
+    /// line of it. See `selections.rs`.
+    pub block: Option<selections::Block>,
     /// One running language server per distinct command; documents are
     /// synced only to their own language's server.
     lsps: Vec<lsp::Client>,
@@ -567,6 +572,9 @@ pub struct Editor {
     lsp_table: Vec<(String, String)>,
     /// Commands that failed to spawn or died, so we don't retry every tick.
     lsp_failed: std::collections::HashSet<String>,
+    /// The (file, revision) autosave last failed to write, so it isn't retried
+    /// and re-reported every tick.
+    pub(crate) autosave_failed: Option<(PathBuf, u64)>,
     /// Latest diagnostics per file (canonical paths, as the server sends them).
     pub diagnostics: HashMap<PathBuf, Vec<lsp::Diagnostic>>,
     /// The markdown preview split, when open.
@@ -734,8 +742,10 @@ impl Editor {
             search_origin: (0, 0),
             keep_selection: false,
             extend: false,
+            block: None,
             lsps: Vec::new(),
             lsp_failed: std::collections::HashSet::new(),
+            autosave_failed: None,
             diagnostics: HashMap::new(),
             preview: None,
             picker: None,
@@ -1328,6 +1338,15 @@ impl Editor {
                 self.pending.clear();
                 self.keep_selection = false;
                 self.register_fresh = true;
+                // A motion in block mode moves the rectangle's corner, alone;
+                // anything else is what the block was built for, and runs on
+                // its selections like on any others.
+                let stretching = self.block.is_some() && commands::BLOCK_MOTIONS.contains(&command.name);
+                if stretching {
+                    self.block_to_corner();
+                } else if command.name != "block_mode" && self.block.take().is_some() {
+                    self.block_finish(command.name);
+                }
                 if !self.doc().extra.is_empty() && commands::PER_CURSOR.contains(&command.name) {
                     self.dispatch_per_cursor(command);
                 } else {
@@ -1344,6 +1363,9 @@ impl Editor {
                     }
                 }
                 self.doc_mut().dedupe_cursors();
+                if stretching {
+                    self.block_stretch();
+                }
                 if self.mode == Mode::Normal {
                     // Each normal-mode edit is its own undo step; insert-mode
                     // bursts stay grouped because the mode is no longer Normal
@@ -2163,7 +2185,7 @@ impl Editor {
         let (rx, ry, rw, rh) = self.focused_rect();
         let wrap = self.wrap_width();
         let doc = self.doc();
-        let cursor = if self.extend && doc.anchor < doc.cursor {
+        let cursor = if self.inclusive() && doc.anchor < doc.cursor {
             crate::position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor)
         } else {
             doc.cursor
@@ -2190,7 +2212,7 @@ impl Editor {
     /// Human-readable cursor position for the status line, 1-indexed.
     pub fn cursor_indicator(&self) -> String {
         let doc = self.doc();
-        let cursor = if self.extend && doc.anchor < doc.cursor {
+        let cursor = if self.inclusive() && doc.anchor < doc.cursor {
             crate::position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor)
         } else {
             doc.cursor

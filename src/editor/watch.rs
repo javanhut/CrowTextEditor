@@ -14,10 +14,41 @@ const VCS_REFRESH_EVERY: Duration = Duration::from_secs(30);
 const VCS_DIFF_GAP: Duration = Duration::from_millis(150);
 
 impl Editor {
+    /// `autosave = <ms>`: write the current buffer once typing has paused,
+    /// and tell the server, so checks that run on save run without a `:w`.
+    /// The text goes out as it stands — formatting or stripping whitespace
+    /// under a cursor that is only resting would be an edit nobody made.
+    fn autosave_tick(&mut self) -> bool {
+        let Some(gap) = crate::config::autosave() else {
+            return false;
+        };
+        let doc = self.doc();
+        let Some(path) = doc.path.clone().filter(|_| doc.modified) else {
+            return false;
+        };
+        // A write that failed fails again until something changes; say so
+        // once, not every tick.
+        let attempt = (path, doc.revision);
+        if !self.idle_for(gap) || self.autosave_failed.as_ref() == Some(&attempt) {
+            return false;
+        }
+        match self.doc_mut().save(false) {
+            Ok(()) => {
+                self.autosave_failed = None;
+                self.lsp_did_save();
+            }
+            Err(e) => {
+                self.set_status(format!("autosave: {e}"));
+                self.autosave_failed = Some(attempt);
+            }
+        }
+        true
+    }
+
     /// From the main loop, between keystrokes. True when something on screen
     /// may have changed.
     pub fn watch_tick(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.autosave_tick();
         if self.disk_checked.elapsed() >= DISK_CHECK_EVERY {
             self.disk_checked = Instant::now();
             changed |= self.check_disk();
@@ -293,6 +324,52 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use crate::editor::tests::{editor_with, press};
+
+    /// Off unless asked for; on, a pause writes the text exactly as typed —
+    /// and a write that can't happen is reported once, not every tick.
+    #[test]
+    fn autosave_writes_after_a_pause_and_only_when_asked() {
+        let _guard = crate::theme::TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("crow-autosave-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "one\n").unwrap();
+        let mut editor = editor_with("");
+        editor.jump_to(file.clone(), 0, 0);
+        let paused = |editor: &mut crate::editor::Editor| {
+            editor.last_key_at = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        };
+        let on_disk = || std::fs::read_to_string(&file).unwrap();
+
+        press(&mut editor, "A ! <esc>");
+        paused(&mut editor);
+        assert!(!editor.autosave_tick(), "off by default");
+        assert_eq!(on_disk(), "one\n");
+
+        crate::config::apply(&crate::config::Config {
+            autosave: 1000,
+            ..Default::default()
+        });
+        press(&mut editor, "A <space> <esc>"); // a trailing space: :w would strip it
+        assert!(!editor.autosave_tick(), "still typing");
+        paused(&mut editor);
+        assert!(editor.autosave_tick());
+        assert_eq!(on_disk(), "one! \n", "written as typed");
+        assert!(!editor.doc().modified);
+        assert!(!editor.autosave_tick(), "nothing new to write");
+
+        // Someone else's write is never clobbered, and is reported once.
+        press(&mut editor, "A ? <esc>");
+        editor.doc_mut().disk_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        paused(&mut editor);
+        assert!(editor.autosave_tick());
+        assert!(editor.status.starts_with("autosave: "), "{}", editor.status);
+        assert!(!editor.autosave_tick());
+        assert_eq!(on_disk(), "one! \n");
+
+        crate::config::apply(&Default::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_unmodified_buffer_follows_its_file_and_a_modified_one_is_flagged() {

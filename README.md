@@ -16,7 +16,10 @@ Motions select the text they cross, `x` selects lines, and `d`/`c`/`y` act on
 the selection, so what an edit will touch is on screen before you commit to it.
 There is no operator-pending state.
 
-Multiple cursors are native, not a plugin: `C` copies the cursor to the next
+Multiple cursors are native, not a plugin: `C-v` starts a block — `j`/`k`/`h`/`l`
+and the other motions stretch a rectangle with one selection per line, and
+whatever comes next (`i`/`a` at its left/right edge, `I`/`A` at each line's
+start/end, `d`, `c`, `gc`) runs on all of them — `C` copies the cursor to the next
 line, and then every motion, selection, edit, and keystroke of insert-mode
 typing applies at every cursor. A multi-cursor edit is a single undo step, and
 a multi-cursor delete or copy captures every selection into the register.
@@ -135,9 +138,15 @@ picker, `space a` offers the code actions and quick fixes for the selection
 (applying whatever edits and commands they come back with), `space R` renames
 the symbol across every file that uses it, `space s s` picks a symbol in this
 buffer and `space S` searches them across the project as you type, `]d` / `[d`
-walk the diagnostics and `space x` lists them all, signature help pops up as
+walk the diagnostics and `space x` lists them all, a diagnostic shows its first
+suggestion beside it and `gl` opens it in full (for Rust, the compiler's own
+output with its `help:` rewrites), signature help pops up as
 you type a call's arguments with the parameter you are on picked out, and
 `:fmt` falls back to the server when crow knows no formatter for the file.
+Checks a server only runs on save — rust-analyzer's `cargo check`, where the
+borrow checker lives — need a `:w`; set `autosave = 1000` in crow.toml and crow
+writes the buffer a second after you stop typing instead (as typed: no
+formatting, no whitespace strip, and never over a file changed on disk).
 Edits arrive incrementally: the transaction log becomes LSP change events, so
 a keystroke in a 16,000-line file sends a few bytes rather than the buffer.
 
@@ -200,6 +209,7 @@ an emoji ZWJ sequence or a combining stack.
 | `A-k` `A-K`                        | keep / drop the selections matching a regex |
 | `&` `_`  `(` `)`                   | align the selections, trim their whitespace, walk which is primary |
 | `A-o`                              | expand the selection to the enclosing syntax node                                                                                                                                                                                           |
+| `C-v`                              | block mode: motions stretch a rectangle, one selection per line; the next edit runs on every line (`C-v` again keeps the cursors, `Esc` drops them) |
 | `C` `A-C`                          | add a cursor on the next / previous line                                                                                                                                                                                                    |
 | `,`                                | drop the extra cursors (`Esc` in normal mode too)                                                                                                                                                                                           |
 | `/` `n` `N`                        | incremental regex search; next / previous match                                                                                                                                                                                             |

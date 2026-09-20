@@ -27,6 +27,10 @@ pub struct Config {
     pub persistent_undo: bool,
     /// Write unsaved buffers to swap files so a crash loses seconds, not work.
     pub swap_files: bool,
+    /// Write the buffer once typing has paused this many milliseconds, so a
+    /// server that checks on save (rust-analyzer's `cargo check`) needs no
+    /// `:w`. 0, the default, is off.
+    pub autosave: usize,
     /// Take the mouse: click to place the cursor, drag to select, wheel to scroll.
     pub mouse: bool,
     /// Reload buffers whose file changed on disk (unmodified ones only).
@@ -60,6 +64,7 @@ impl Default for Config {
             strip_trailing_whitespace: true,
             persistent_undo: true,
             swap_files: true,
+            autosave: 0,
             mouse: true,
             auto_reload: true,
             vcs_gutter: true,
@@ -86,6 +91,7 @@ static TRAILING_WHITESPACE: AtomicBool = AtomicBool::new(true);
 static STRIP_TRAILING_WHITESPACE: AtomicBool = AtomicBool::new(true);
 static PERSISTENT_UNDO: AtomicBool = AtomicBool::new(true);
 static SWAP_FILES: AtomicBool = AtomicBool::new(true);
+static AUTOSAVE: AtomicUsize = AtomicUsize::new(0);
 static MOUSE: AtomicBool = AtomicBool::new(true);
 static AUTO_RELOAD: AtomicBool = AtomicBool::new(true);
 static VCS_GUTTER: AtomicBool = AtomicBool::new(true);
@@ -143,6 +149,15 @@ pub fn persistent_undo() -> bool {
     PERSISTENT_UNDO.load(Ordering::Relaxed)
 }
 
+/// The pause that triggers an autosave, when autosave is on.
+pub fn autosave() -> Option<std::time::Duration> {
+    match AUTOSAVE.load(Ordering::Relaxed) {
+        0 => None,
+        // Under a quarter second is a write per word, not per pause.
+        ms => Some(std::time::Duration::from_millis(ms.max(250) as u64)),
+    }
+}
+
 pub fn swap_files() -> bool {
     SWAP_FILES.load(Ordering::Relaxed)
 }
@@ -174,6 +189,7 @@ pub fn apply(config: &Config) -> bool {
     STRIP_TRAILING_WHITESPACE.store(config.strip_trailing_whitespace, Ordering::Relaxed);
     PERSISTENT_UNDO.store(config.persistent_undo, Ordering::Relaxed);
     SWAP_FILES.store(config.swap_files, Ordering::Relaxed);
+    AUTOSAVE.store(config.autosave, Ordering::Relaxed);
     MOUSE.store(config.mouse, Ordering::Relaxed);
     AUTO_RELOAD.store(config.auto_reload, Ordering::Relaxed);
     VCS_GUTTER.store(config.vcs_gutter, Ordering::Relaxed);
@@ -765,6 +781,7 @@ trailing_whitespace = true          # tint spaces left at the end of a line
 strip_trailing_whitespace = true    # and cut them on :w (never in markdown, where they mean a line break)
 persistent_undo = true   # undo history survives closing the file
 swap_files = true        # unsaved edits are written aside; :recover brings them back after a crash
+autosave = 0             # write the file this many ms after typing pauses, so on-save checks (cargo check) need no :w; 0 = off, try 1000
 mouse = true             # click, drag to select, wheel to scroll (shift+drag for the terminal's own selection)
 auto_reload = true       # a file changed on disk reloads if you haven't edited it
 vcs_gutter = true        # added/changed/deleted markers against the last ivaldi seal
@@ -859,6 +876,7 @@ fn parse(text: &str) -> Config {
                     config.persistent_undo = value.parse().unwrap_or(config.persistent_undo)
                 }
                 "swap_files" => config.swap_files = value.parse().unwrap_or(config.swap_files),
+                "autosave" => config.autosave = value.parse().unwrap_or(config.autosave),
                 "mouse" => config.mouse = value.parse().unwrap_or(config.mouse),
                 "auto_reload" => config.auto_reload = value.parse().unwrap_or(config.auto_reload),
                 "vcs_gutter" => config.vcs_gutter = value.parse().unwrap_or(config.vcs_gutter),
@@ -1130,6 +1148,7 @@ py = "pyright-langserver --stdio"
         assert_eq!(config.theme, "tokyonight");
         assert_eq!(config.tab_width, 4);
         assert_eq!(config.scrolloff, 3);
+        assert_eq!(config.autosave, 0); // opt-in: crow writes nothing unasked
         assert!(config.keys_normal.is_empty());
         assert_eq!(config.lsp, Config::default().lsp);
     }

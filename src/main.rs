@@ -49,6 +49,7 @@ KEYS (normal mode):
     w b e        select word     d c y p P     delete/change/yank/paste
     dd           delete line (into the register, so p pastes it)
     x v ;        select line, extend mode,     collapse selection
+    C-v          block: motions stretch a rectangle, then i a I A d c gc hit every line
     C A-C  ,     add cursor below/above, drop  extra cursors
     A-o          expand selection to syntax node
     mi( ma\"     select inside/around an object (w W p f t a c too)
@@ -62,7 +63,7 @@ KEYS (normal mode):
     gg G  42gg   file ends, jump to line       :w :q :wq  write, quit
     C-o C-i      jump back / forward           C-d C-u   half page
     ]d [d  ]g [g next/prev diagnostic, next/prev change since the seal
-    gd gr K      goto definition, references, hover
+    gd gr K gl   goto definition, references, hover, diagnostic in full
     space a R    code actions, rename symbol   C-space  LSP complete (insert)
     space s s S  symbols here / across the project;  space x  diagnostics
     gc  ms(      comment lines, surround selection

@@ -3,9 +3,133 @@
 //! hand back forward ones (anchor at the start).
 
 use super::*;
+use crate::config::tab_width;
+use crate::position;
 use crate::transaction::Transaction;
 
+/// `C-v`'s rectangle: two opposite corners as (line, display column). The
+/// origin is where it was started; the corner is the one motions move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+    origin: (usize, usize),
+    corner: (usize, usize),
+}
+
 impl Editor {
+    /// Are selections drawn with the cursor on their last character, not
+    /// past it? True while one is being stretched, by `v` or by `C-v`.
+    pub fn inclusive(&self) -> bool {
+        self.extend || self.block.is_some()
+    }
+
+    /// `C-v`: start a block at the cursor, or stop stretching the one there
+    /// is and keep its selections.
+    pub fn toggle_block(&mut self) {
+        self.keep_selection = true;
+        if self.block.take().is_some() {
+            return;
+        }
+        self.extend = false;
+        let doc = self.doc_mut();
+        doc.extra.clear();
+        let (line, col) = doc.cursor_line_col();
+        let col = position::char_to_display_col(doc.line(line), col, tab_width());
+        self.block = Some(Block {
+            origin: (line, col),
+            corner: (line, col),
+        });
+        self.block_select();
+    }
+
+    /// Before a motion in block mode: one bare cursor, on the corner, holding
+    /// the corner's column through lines too short to reach it.
+    pub(crate) fn block_to_corner(&mut self) {
+        let Some(Block { corner, .. }) = self.block else {
+            return;
+        };
+        let doc = self.doc_mut();
+        let line = corner.0.min(doc.line_count().saturating_sub(1));
+        let at = doc.line_start(line)
+            + position::display_col_to_char(doc.line(line), corner.1, tab_width());
+        doc.extra.clear();
+        (doc.anchor, doc.cursor) = (at, at);
+        doc.clamp_cursor(false);
+        doc.goal_col = Some(corner.1);
+    }
+
+    /// After it: the corner is wherever the cursor went. A vertical motion
+    /// leaves its column in `goal_col`; a horizontal one clears that, and
+    /// the cursor's own column is the new one.
+    pub(crate) fn block_stretch(&mut self) {
+        let doc = self.doc();
+        let (line, col) = doc.cursor_line_col();
+        let col = doc
+            .goal_col
+            .unwrap_or_else(|| position::char_to_display_col(doc.line(line), col, tab_width()));
+        if let Some(block) = self.block.as_mut() {
+            block.corner = (line, col);
+        }
+        self.block_select();
+    }
+
+    /// The block's selections, handed to the command that ends it. `i` and
+    /// `a` type at the cursor, so the cursors go to the rectangle's left
+    /// edge, or onto its right one. Insert and comment want the lines the
+    /// rectangle only touches; a delete there would eat the line break.
+    pub(crate) fn block_finish(&mut self, command: &str) {
+        let doc = self.doc_mut();
+        let text = doc.text.clone();
+        let mut sels: Vec<&mut (usize, usize)> = doc.extra.iter_mut().collect();
+        let mut primary = (doc.anchor, doc.cursor);
+        sels.push(&mut primary);
+        for sel in sels {
+            let (a, c) = *sel;
+            match command {
+                "insert_mode" => *sel = (a, a),
+                "append" if a < c => {
+                    let last = position::prev_grapheme_boundary(text.slice(..), c);
+                    *sel = (last, last);
+                }
+                _ => {}
+            }
+        }
+        (doc.anchor, doc.cursor) = primary;
+        if matches!(command, "delete_selection" | "change_selection") {
+            doc.extra.retain(|(a, c)| a != c);
+        }
+    }
+
+    /// One selection per line of the rectangle. A line that ends before the
+    /// rectangle begins has nothing in it and gets none — except the corner's
+    /// own, which is where the cursor has to be.
+    fn block_select(&mut self) {
+        let Some(Block { origin, corner }) = self.block else {
+            return;
+        };
+        let doc = self.doc();
+        let (left, right) = (origin.1.min(corner.1), origin.1.max(corner.1));
+        let mut sels = Vec::new();
+        let mut primary = 0;
+        for line in origin.0.min(corner.0)..=origin.0.max(corner.0) {
+            let text = doc.line(line);
+            let len = doc.line_len(line);
+            let from = position::display_col_to_char(text, left, tab_width()).min(len);
+            let width = position::char_to_display_col(text, len, tab_width());
+            if width < left && line != corner.0 {
+                continue;
+            }
+            let to = position::display_col_to_char(text, right + 1, tab_width()).min(len);
+            if line == corner.0 {
+                primary = sels.len();
+            }
+            let start = doc.line_start(line);
+            sels.push((start + from, start + to.max(from)));
+        }
+        let goal = self.doc().goal_col;
+        self.set_selections(sels, primary);
+        self.doc_mut().goal_col = goal;
+    }
+
     /// Every selection, the primary first, as (start, end).
     pub(crate) fn selections(&self) -> Vec<(usize, usize)> {
         let doc = self.doc();
@@ -226,6 +350,74 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// `C-v` and motions draw a rectangle; what comes next runs on every
+    /// line of it, as one undo step.
+    #[test]
+    fn a_block_is_one_selection_per_line() {
+        let mut editor = editor_with("abcdef\nabcdef\nabcdef\n");
+        press(&mut editor, "l C-v j j l");
+        assert_eq!(texts(&editor), ["bc", "bc", "bc"]);
+        // Stretching back the other way shrinks it, and crosses the origin.
+        press(&mut editor, "k h h");
+        assert_eq!(texts(&editor), ["ab", "ab"]);
+        press(&mut editor, "d");
+        assert!(editor.block.is_none(), "an edit is what the block was for");
+        assert_eq!(editor.doc().text.to_string(), "cdef\ncdef\nabcdef\n");
+        press(&mut editor, "u");
+        assert_eq!(editor.doc().text.to_string(), "abcdef\nabcdef\nabcdef\n");
+    }
+
+    #[test]
+    fn a_block_inserts_and_appends_on_every_line() {
+        let mut editor = editor_with("one\ntwo\nthree\n");
+        press(&mut editor, "C-v j j i <space> <space> <esc>");
+        assert_eq!(editor.doc().text.to_string(), "  one\n  two\n  three\n");
+        press(&mut editor, "<esc> gg C-v j j a - <esc>");
+        assert_eq!(editor.doc().text.to_string(), " - one\n - two\n - three\n");
+    }
+
+    /// The column is the rectangle's, not whatever a short line clamps the
+    /// cursor to on the way through; and a line the rectangle misses is left
+    /// alone — but an insert at column 0 still reaches an empty one.
+    #[test]
+    fn a_block_keeps_its_column_through_short_lines() {
+        let mut editor = editor_with("abcdef\nab\n\nabcdef\n");
+        press(&mut editor, "l l l C-v j j j");
+        assert_eq!(texts(&editor), ["d", "d"]);
+        press(&mut editor, "d");
+        assert_eq!(editor.doc().text.to_string(), "abcef\nab\n\nabcef\n");
+
+        let mut editor = editor_with("a\n\nb\n");
+        press(&mut editor, "C-v j j d");
+        assert_eq!(editor.doc().text.to_string(), "\n\n\n", "the empty line survives");
+        let mut editor = editor_with("a\n\nb\n");
+        press(&mut editor, "C-v j j i # <esc>");
+        assert_eq!(editor.doc().text.to_string(), "#a\n#\n#b\n");
+    }
+
+    /// `I` and `A` go to each line's own start and end, however ragged.
+    #[test]
+    fn line_start_and_end_inserts_reach_every_cursor() {
+        let mut editor = editor_with("  one\n    three\n");
+        press(&mut editor, "C-v j I / / <space> <esc>");
+        assert_eq!(editor.doc().text.to_string(), "  // one\n    // three\n");
+        press(&mut editor, "<esc> gg C-v j A ; <esc>");
+        assert_eq!(editor.doc().text.to_string(), "  // one;\n    // three;\n");
+    }
+
+    #[test]
+    fn leaving_a_block() {
+        let mut editor = editor_with("abc\nabc\n");
+        // C-v again keeps the cursors for plain multi-cursor work…
+        press(&mut editor, "C-v j C-v");
+        assert!(editor.block.is_none());
+        assert_eq!(editor.doc().extra.len(), 1);
+        // …and Esc drops them.
+        press(&mut editor, "C-v j <esc>");
+        assert!(editor.block.is_none());
+        assert!(editor.doc().extra.is_empty());
     }
 
     #[test]

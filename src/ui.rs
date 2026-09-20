@@ -186,7 +186,7 @@ fn render_window(
     let len = doc.text.len_chars();
     let line_count = doc.line_count();
     let gutter = doc.line_count().to_string().len().max(3) + 1;
-    let display_cursor = if focused && editor.extend && anchor < cursor {
+    let display_cursor = if focused && editor.inclusive() && anchor < cursor {
         position::prev_grapheme_boundary(doc.text.slice(..), cursor)
     } else {
         cursor
@@ -212,7 +212,7 @@ fn render_window(
         curs = extra
             .iter()
             .map(|&(a, c)| {
-                if editor.extend && a < c {
+                if editor.inclusive() && a < c {
                     position::prev_grapheme_boundary(doc.text.slice(..), c)
                 } else {
                     c.min(len)
@@ -420,29 +420,37 @@ fn render_window(
                 diags
                     .iter()
                     .filter(|d| d.line == line_idx)
-                    .min_by_key(|d| d.severity)
+                    .min_by_key(|d| d.rank())
             })
             .flatten();
         if let Some(d) = inline {
             let avail = width.saturating_sub(printed);
             if avail > 8 {
-                let mut text = String::from("  ■ ");
-                let mut w = display_width(&text);
-                for ch in d.message.chars() {
-                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                    if w + cw > avail {
-                        break;
+                let color = match d.severity {
+                    1 => Color::Red,
+                    2 => Color::Yellow,
+                    _ => Color::Cyan,
+                };
+                // The message, then the first suggestion that came with it,
+                // for as far as the window goes.
+                let mut parts = vec![(color, format!("  ■ {}", d.message))];
+                if let Some(note) = d.notes().next() {
+                    parts.push((Color::Cyan, format!("  ➜ {note}")));
+                }
+                let mut w = 0;
+                for (color, part) in parts {
+                    let mut text = String::new();
+                    for ch in part.chars() {
+                        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if w + cw > avail {
+                            break;
+                        }
+                        text.push(ch);
+                        w += cw;
                     }
-                    text.push(ch);
-                    w += cw;
+                    queue!(out, SetForegroundColor(color), Print(text))?;
                 }
                 printed += w;
-                let color = if d.severity == 1 {
-                    Color::Red
-                } else {
-                    Color::Yellow
-                };
-                queue!(out, SetForegroundColor(color), Print(text))?;
             }
         }
         // Pad to the window edge; UntilNewLine would bleed into a neighbour.
@@ -771,7 +779,9 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
     let doc = editor.doc();
     let theme = crate::theme::current();
 
-    let (label, accent) = if editor.extend && editor.mode == Mode::Normal {
+    let (label, accent) = if editor.block.is_some() && editor.mode == Mode::Normal {
+        ("BLOCK", Color::Magenta)
+    } else if editor.extend && editor.mode == Mode::Normal {
         ("SELECT", Color::Magenta)
     } else {
         match editor.mode {
@@ -1658,9 +1668,16 @@ fn render_command_line(editor: &Editor, out: &mut impl Write) -> std::io::Result
             .as_ref()
             .and_then(|p| p.canonicalize().ok())
             .and_then(|p| editor.diagnostics.get(&p))
-            .and_then(|v| v.iter().find(|d| d.line == doc.cursor_line()))
+            .and_then(|v| {
+                v.iter()
+                    .filter(|d| d.line == doc.cursor_line())
+                    .min_by_key(|d| d.rank())
+            })
         {
             content = format!("● {}", d.message);
+            if let Some(note) = d.notes().next() {
+                content.push_str(&format!("  ➜ {note}"));
+            }
         }
     }
     let content: String = content.chars().take(width).collect();

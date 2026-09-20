@@ -28,6 +28,54 @@ pub struct Diagnostic {
     pub raw: Value,
 }
 
+impl Diagnostic {
+    /// What the server attached beyond the headline: the labels on other
+    /// spans and, from a compiler, its `help:` suggestions.
+    pub fn notes(&self) -> impl Iterator<Item = &str> {
+        self.raw["relatedInformation"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r["message"].as_str())
+            // rust-analyzer's back-pointer from a help to the error it is for.
+            .filter(|m| *m != "original diagnostic")
+    }
+
+    /// rust-analyzer publishes each compiler `help:` a second time, as a hint
+    /// of its own pointing back at the error it belongs to.
+    pub fn is_echo(&self) -> bool {
+        self.raw["relatedInformation"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|r| r["message"] == "original diagnostic"))
+    }
+
+    /// How much a line wants this one shown, least first: the worst
+    /// severity, and among equals the one that comes with a suggestion.
+    pub fn rank(&self) -> (u8, bool) {
+        (self.severity, self.notes().next().is_none())
+    }
+
+    /// Everything there is to read. rust-analyzer passes the compiler's own
+    /// rendering along — the snippet, the carets, the suggested rewrite —
+    /// and nothing we could assemble says it better; elsewhere, the whole
+    /// message and its notes.
+    pub fn detail(&self) -> String {
+        if let Some(rendered) = self.raw["data"]["rendered"].as_str() {
+            return rendered.trim_end().to_string();
+        }
+        let mut out = self.raw["message"]
+            .as_str()
+            .unwrap_or(&self.message)
+            .trim_end()
+            .to_string();
+        for note in self.notes() {
+            out.push_str("\n➜ ");
+            out.push_str(note);
+        }
+        out
+    }
+}
+
 /// A place in a file: path, line, UTF-16 column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
@@ -940,6 +988,42 @@ pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What rust-analyzer really sends for rustc's E0106: the suggestions
+    /// ride in `relatedInformation`, the compiler's rendering in `data`.
+    #[test]
+    fn a_compiler_diagnostic_keeps_its_suggestions() {
+        let d = parse_diagnostic(&json!({
+            "range": {"start": {"line": 0, "character": 24}},
+            "severity": 1,
+            "message": "missing lifetime specifier\nexpected named lifetime parameter",
+            "relatedInformation": [
+                {"message": "consider using the `'static` lifetime: `'static `"},
+                {"message": "instead, return an owned value: `String`"}
+            ],
+            "data": {"rendered": "error[E0106]: missing lifetime specifier\nhelp: consider\n\n"}
+        }))
+        .unwrap();
+        assert_eq!(d.message, "missing lifetime specifier");
+        assert_eq!(d.notes().count(), 2);
+        assert!(d.detail().ends_with("help: consider"));
+        assert!(!d.is_echo());
+
+        // The help republished as a hint: no note of its own, and no
+        // rendering, so the detail is assembled from the message.
+        let echo = parse_diagnostic(&json!({
+            "range": {"start": {"line": 0, "character": 25}},
+            "severity": 4,
+            "message": "consider using the `'static` lifetime",
+            "relatedInformation": [{"message": "original diagnostic"}]
+        }))
+        .unwrap();
+        assert!(echo.is_echo());
+        assert_eq!(echo.notes().count(), 0);
+        assert_eq!(echo.detail(), "consider using the `'static` lifetime");
+        // The error with a suggestion outranks a bare one and any hint.
+        assert!(d.rank() < echo.rank());
+    }
     use std::io::Cursor;
 
     #[test]

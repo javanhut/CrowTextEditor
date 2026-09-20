@@ -53,6 +53,7 @@ commands! {
     document_symbols => "pick a symbol in this buffer to jump to (LSP)",
     workspace_symbols => "search symbols across the project (LSP)",
     diagnostics => "list every diagnostic in every file",
+    diagnostic_detail => "show the cursor line's diagnostics in full, compiler suggestions included",
     next_diagnostic => "jump to the next diagnostic in this buffer",
     prev_diagnostic => "jump to the previous diagnostic in this buffer",
     next_change => "jump to the next change since the last ivaldi seal",
@@ -96,6 +97,7 @@ commands! {
     goto_file_end => "move to the last line, or with a count to that line",
     goto_matching_bracket => "jump to the bracket matching the one under the cursor (%)",
     extend_mode => "toggle extending selections with every motion",
+    block_mode => "toggle block mode: motions stretch a rectangle, one selection per line (C-v)",
     half_page_down => "scroll down half a screen",
     half_page_up => "scroll up half a screen",
     page_down => "scroll down a screen",
@@ -279,6 +281,10 @@ pub static PER_CURSOR: &[&str] = &[
     "paste_before",
     "delete_backward",
     "delete_forward",
+    // Where insert mode starts is each cursor's own business too.
+    "append",
+    "insert_at_line_start",
+    "append_at_line_end",
 ];
 
 // ---- motions ---------------------------------------------------------------
@@ -479,6 +485,10 @@ fn goto_matching_bracket(editor: &mut Editor) {
 // Selecting commands set `editor.keep_selection`; any command that doesn't is
 // collapsed by `handle_key` afterwards, so plain motions clear the selection.
 
+fn block_mode(editor: &mut Editor) {
+    editor.toggle_block();
+}
+
 fn extend_mode(editor: &mut Editor) {
     editor.keep_selection = true;
     if editor.extend {
@@ -655,6 +665,28 @@ fn collapse_selection(_editor: &mut Editor) {
 
 // ---- multiple cursors ------------------------------------------------------
 
+/// What stretches `C-v`'s rectangle rather than ending it: the commands that
+/// only move the cursor.
+pub const BLOCK_MOTIONS: &[&str] = &[
+    "move_left",
+    "move_right",
+    "move_up",
+    "move_down",
+    "move_line_start",
+    "move_line_first_nonblank",
+    "move_line_end",
+    "select_word_next",
+    "select_word_prev",
+    "select_word_end",
+    "goto_file_start",
+    "goto_file_end",
+    "goto_matching_bracket",
+    "half_page_down",
+    "half_page_up",
+    "page_down",
+    "page_up",
+];
+
 fn add_cursor_below(editor: &mut Editor) {
     add_cursor(editor, 1);
 }
@@ -827,6 +859,12 @@ fn workspace_symbols(editor: &mut Editor) {
 
 fn diagnostics(editor: &mut Editor) {
     editor.diagnostics_picker();
+}
+
+fn diagnostic_detail(editor: &mut Editor) {
+    if !editor.diagnostic_detail() {
+        editor.set_status("no diagnostics on this line");
+    }
 }
 
 fn next_diagnostic(editor: &mut Editor) {
@@ -1830,15 +1868,25 @@ fn toggle_comment(editor: &mut Editor) {
         return;
     };
     let doc = editor.doc();
-    let (from, to) = selection_range(doc);
-    let first = doc.text.char_to_line(from);
-    let last = doc
-        .text
-        .char_to_line(to.saturating_sub(1).max(from))
-        .min(doc.line_count().saturating_sub(1));
+    // Every line any selection touches: one selection's lines, or one line
+    // under each of many cursors.
+    let last_line = doc.line_count().saturating_sub(1);
+    let touched: std::collections::BTreeSet<usize> = editor
+        .selections()
+        .into_iter()
+        .flat_map(|(from, to)| {
+            let first = doc.text.char_to_line(from.min(doc.text.len_chars()));
+            let last = doc
+                .text
+                .char_to_line(to.saturating_sub(1).max(from).min(doc.text.len_chars()))
+                .min(last_line);
+            first..=last
+        })
+        .collect();
 
     // (line, indent in chars, already commented)
-    let lines: Vec<(usize, usize, bool)> = (first..=last)
+    let lines: Vec<(usize, usize, bool)> = touched
+        .into_iter()
         .filter_map(|l| {
             let text: String = doc.line(l).chars().take(doc.line_len(l)).collect();
             let indent = text.len() - text.trim_start().len();
@@ -2034,6 +2082,17 @@ mod tests {
         let mut editor = editor_with(text);
         editor.doc_mut().path = Some(std::path::PathBuf::from(name));
         editor
+    }
+
+    #[test]
+    fn gc_comments_every_line_of_a_cv_block() {
+        let mut editor = editor_named("let a = 1;\nlet b = 2;\nlet c = 3;\n", "x.rs");
+        press(&mut editor, "C-v j j");
+        press(&mut editor, "gc");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "// let a = 1;\n// let b = 2;\n// let c = 3;\n"
+        );
     }
 
     #[test]

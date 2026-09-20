@@ -573,6 +573,38 @@ impl Editor {
         doc.clamp_cursor(false);
         doc.goal_col = None;
         self.set_status(format!("● {message}"));
+        // Landing on one is asking what it says.
+        if self.mode == Mode::Normal {
+            self.diagnostic_detail();
+        }
+    }
+
+    /// `gl`: everything the cursor line's diagnostics have to say, in the
+    /// hover popup — for rustc, the compiler's own output, suggestions and
+    /// all. False when the line has none.
+    pub fn diagnostic_detail(&mut self) -> bool {
+        let line = self.doc().cursor_line();
+        let mut here: Vec<&lsp::Diagnostic> = self
+            .doc()
+            .path
+            .as_ref()
+            .and_then(|p| p.canonicalize().ok())
+            .and_then(|p| self.diagnostics.get(&p))
+            .map(|ds| ds.iter().filter(|d| d.line == line).collect())
+            .unwrap_or_default();
+        here.sort_by_key(|d| d.rank());
+        // A help split out of an error is already in that error's rendering:
+        // say each thing once. One whose error sits on another line stays.
+        if here.iter().any(|d| !d.is_echo()) {
+            here.retain(|d| !d.is_echo());
+        }
+        let mut details: Vec<String> = here.iter().map(|d| d.detail()).collect();
+        details.dedup();
+        if details.is_empty() {
+            return false;
+        }
+        self.open_hover(&details.join("\n\n"));
+        true
     }
 
     /// `space x`: every diagnostic in every file, this buffer's first.
