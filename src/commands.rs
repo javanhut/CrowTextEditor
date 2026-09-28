@@ -1076,9 +1076,9 @@ fn push_register(editor: &mut Editor, s: &str) {
 /// Best effort by design: a machine with none of these tools still has a
 /// working editor, and a failed copy is not worth interrupting an edit over.
 ///
-/// ponytail: the platform tool only. Over ssh the clipboard lives on the far
-/// side of the terminal and this reaches the wrong machine — add an OSC 52
-/// fallback (needs base64) if crow starts getting used that way.
+/// The platform tool comes first; with none installed, or over ssh — where
+/// the tool would reach the far machine's clipboard, not the user's — the
+/// text goes to the terminal as OSC 52 instead.
 fn to_system_clipboard(text: &str) {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -1089,6 +1089,13 @@ fn to_system_clipboard(text: &str) {
         ("xclip", &["-selection", "clipboard"]),
         ("xsel", &["--clipboard", "--input"]),
     ];
+
+    let over_ssh = std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CONNECTION").is_some();
+    if over_ssh {
+        osc52_copy(text);
+        return;
+    }
 
     for (program, args) in TOOLS {
         let Ok(mut child) = Command::new(program)
@@ -1107,6 +1114,59 @@ fn to_system_clipboard(text: &str) {
         let _ = child.wait();
         return;
     }
+    osc52_copy(text);
+}
+
+/// Ask the terminal to set the clipboard: `ESC ] 52 ; c ; <base64> BEL`.
+///
+/// Safe to write straight to stdout: commands run between frames, and each
+/// frame is flushed whole, so this never lands inside one. Terminals that
+/// don't understand it ignore it.
+///
+/// Inside tmux it goes out twice: plain, which tmux itself acts on when it has
+/// `set-clipboard on`, and wrapped for passthrough, which reaches the outer
+/// terminal when tmux has `allow-passthrough on`. Either setting is enough;
+/// with both, the clipboard is just set twice to the same text.
+fn osc52_copy(text: &str) {
+    use std::io::Write;
+
+    // Tests press `c` constantly; don't spray escapes at the test runner.
+    if cfg!(test) {
+        return;
+    }
+    let seq = format!("\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(seq.as_bytes());
+    if std::env::var_os("TMUX").is_some() {
+        let _ = out.write_all(tmux_passthrough(&seq).as_bytes());
+    }
+    let _ = out.flush();
+}
+
+/// Wrap an escape sequence so tmux hands it to the outer terminal untouched:
+/// `ESC P tmux; <seq, every ESC doubled> ESC \`.
+fn tmux_passthrough(seq: &str) -> String {
+    format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
+}
+
+/// Standard base64 with padding. Small enough not to be worth a crate.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.len();
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let v = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            if i <= n {
+                s.push(ALPHABET[(v >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                s.push('=');
+            }
+        }
+    }
+    s
 }
 
 /// The char range the next action applies to: the selection, or the character
@@ -2274,6 +2334,30 @@ mod tests {
         press(&mut editor, "j \"ax");
         let out = std::process::Command::new("pbpaste").output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n");
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        let cases = [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ];
+        for (plain, encoded) in cases {
+            assert_eq!(base64(plain.as_bytes()), encoded, "{plain:?}");
+        }
+    }
+
+    #[test]
+    fn tmux_passthrough_doubles_escapes_and_wraps_in_dcs() {
+        assert_eq!(
+            tmux_passthrough("\x1b]52;c;Zm9v\x07"),
+            "\x1bPtmux;\x1b\x1b]52;c;Zm9v\x07\x1b\\"
+        );
     }
 
     #[test]
