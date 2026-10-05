@@ -15,11 +15,103 @@ pub struct Block {
     corner: (usize, usize),
 }
 
+/// The character a selection's caret is on: its last one when it runs
+/// forward (the cursor is half-open, one past it), else the cursor itself.
+pub fn head(text: ropey::RopeSlice, (anchor, cursor): (usize, usize)) -> usize {
+    if anchor < cursor {
+        position::prev_grapheme_boundary(text, cursor)
+    } else {
+        cursor
+    }
+}
+
 impl Editor {
     /// Are selections drawn with the cursor on their last character, not
-    /// past it? True while one is being stretched, by `v` or by `C-v`.
+    /// past it? Everywhere but insert mode, where the cursor is a gap.
     pub fn inclusive(&self) -> bool {
-        self.extend || self.block.is_some()
+        self.mode != Mode::Insert
+    }
+
+    /// Where the caret is drawn and where the next motion starts from.
+    pub fn caret(&self) -> usize {
+        let doc = self.doc();
+        let len = doc.text.len_chars();
+        match self.linewise {
+            Some((_, caret)) => caret.min(len),
+            None if self.inclusive() => head(doc.text.slice(..), (doc.anchor, doc.cursor)),
+            None => doc.cursor,
+        }
+    }
+
+    /// Line mode's caret is now `caret`: select whole lines from where it
+    /// started through the caret's, half-open at the end away from the origin.
+    pub(crate) fn line_reselect(&mut self, caret: usize) {
+        let Some((origin, _)) = self.linewise else {
+            return;
+        };
+        self.linewise = Some((origin, caret));
+        let doc = self.doc_mut();
+        let line = doc.text.char_to_line(caret.min(doc.text.len_chars()));
+        let after = |l: usize| {
+            if l + 1 < doc.line_count() {
+                doc.line_start(l + 1)
+            } else {
+                doc.text.len_chars()
+            }
+        };
+        let (anchor, cursor) = if line >= origin {
+            (doc.line_start(origin), after(line))
+        } else {
+            (after(origin), doc.line_start(line))
+        };
+        (doc.anchor, doc.cursor) = (anchor, cursor);
+    }
+
+    pub(crate) fn map_selections(
+        &mut self,
+        f: impl Fn(ropey::RopeSlice, (usize, usize)) -> (usize, usize),
+    ) {
+        let doc = self.doc_mut();
+        let text = doc.text.clone();
+        (doc.anchor, doc.cursor) = f(text.slice(..), (doc.anchor, doc.cursor));
+        for sel in &mut doc.extra {
+            *sel = f(text.slice(..), *sel);
+        }
+    }
+
+    /// Every selection down to the character its caret is drawn on.
+    pub(crate) fn collapse_to_heads(&mut self) {
+        self.map_selections(|t, sel| {
+            let h = head(t, sel);
+            (h, h)
+        });
+    }
+
+    /// Before a motion: it starts from the caret's character, as drawn. In
+    /// `v` the anchor becomes the origin character, so motions see two
+    /// inclusive ends and `motion_end` makes them half-open again.
+    pub(crate) fn motion_start(&mut self) {
+        if !self.extend {
+            return self.collapse_to_heads();
+        }
+        self.map_selections(|t, (a, c)| {
+            let origin = if a > c {
+                position::prev_grapheme_boundary(t, a)
+            } else {
+                a
+            };
+            (origin, head(t, (a, c)))
+        });
+    }
+
+    pub(crate) fn motion_end(&mut self) {
+        self.map_selections(|t, (origin, head)| {
+            if head >= origin {
+                (origin, position::next_grapheme_boundary(t, head))
+            } else {
+                (position::next_grapheme_boundary(t, origin), head)
+            }
+        });
     }
 
     /// `C-v`: start a block at the cursor, or stop stretching the one there

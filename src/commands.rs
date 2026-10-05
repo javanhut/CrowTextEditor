@@ -6,7 +6,7 @@
 
 use crate::config::tab_width;
 use crate::document::Document;
-use crate::editor::{CharWait, Editor, Mode, SelectPrompt};
+use crate::editor::{selections, CharWait, Editor, Mode, SelectPrompt};
 use crate::position::{self, CharClass};
 use crate::transaction::Transaction;
 use unicode_segmentation::UnicodeSegmentation;
@@ -41,6 +41,7 @@ commands! {
     select_word_prev => "select back to the start of the previous word",
     select_word_end => "select through the end of the current word",
     select_line => "select the current line; repeat to extend",
+    visual_line => "line mode: select the line, then j/k and other motions extend by whole lines",
     expand_selection => "expand the selection to the enclosing syntax node",
     collapse_selection => "collapse the selection to the cursor",
     add_cursor_below => "add a cursor on the next line",
@@ -273,6 +274,7 @@ pub static PER_CURSOR: &[&str] = &[
     "select_word_prev",
     "select_word_end",
     "select_line",
+    "visual_line",
     "expand_selection",
     "delete_selection",
     "change_selection",
@@ -292,24 +294,10 @@ pub static PER_CURSOR: &[&str] = &[
 fn move_left(editor: &mut Editor) {
     let count = editor.take_count();
     let past_end = editor.mode == Mode::Insert;
-    let extend = editor.extend && editor.mode == Mode::Normal;
     let doc = editor.doc_mut();
     for _ in 0..count {
         if doc.cursor == 0 {
             break;
-        }
-        // Characterwise select stores a forward selection as
-        // [origin, just-past-head).  Crossing left from its one-character
-        // form has to turn it around; a plain decrement would make it empty.
-        if extend
-            && doc.anchor < doc.cursor
-            && position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor) == doc.anchor
-        {
-            let origin_end = doc.cursor;
-            doc.cursor = position::prev_grapheme_boundary(doc.text.slice(..), doc.anchor);
-            doc.clamp_cursor(false);
-            doc.anchor = origin_end;
-            continue;
         }
         // Stepping left off the start of a line lands on the previous line's
         // newline; clamp_cursor pulls that back onto the line's last char
@@ -323,46 +311,8 @@ fn move_left(editor: &mut Editor) {
 fn move_right(editor: &mut Editor) {
     let count = editor.take_count();
     let past_end = editor.mode == Mode::Insert;
-    let extend = editor.extend && editor.mode == Mode::Normal;
     let doc = editor.doc_mut();
     for _ in 0..count {
-        if extend && doc.anchor < doc.cursor {
-            // In a forward selection cursor is the exclusive end, not the
-            // character under the caret. Extend it by one complete grapheme.
-            // A newline is crossed together with the first character of the
-            // next line, matching normal-mode `l` wrapping.
-            if doc.cursor >= doc.text.len_chars() {
-                break;
-            }
-            let mut end = doc.cursor;
-            if matches!(doc.text.char(end), '\n' | '\r') {
-                end = position::next_grapheme_boundary(doc.text.slice(..), end);
-            }
-            if end < doc.text.len_chars() {
-                end = position::next_grapheme_boundary(doc.text.slice(..), end);
-            }
-            doc.cursor = end;
-            doc.goal_col = None;
-            continue;
-        }
-        // Mirror the leftward crossing above.  In a backward selection the
-        // cursor is the head itself and anchor is just past the origin.
-        if extend
-            && doc.anchor > doc.cursor
-            && position::next_grapheme_boundary(doc.text.slice(..), doc.cursor) == doc.anchor
-        {
-            let origin = doc.cursor;
-            let mut end = doc.anchor;
-            if end < doc.text.len_chars() && matches!(doc.text.char(end), '\n' | '\r') {
-                end = position::next_grapheme_boundary(doc.text.slice(..), end);
-            }
-            if end < doc.text.len_chars() {
-                end = position::next_grapheme_boundary(doc.text.slice(..), end);
-            }
-            doc.cursor = end;
-            doc.anchor = origin;
-            continue;
-        }
         let line = doc.cursor_line();
         let next = position::next_grapheme_boundary(doc.text.slice(..), doc.cursor);
         if !past_end && next == doc.line_end(line) && line + 1 < doc.line_count() {
@@ -393,47 +343,13 @@ fn move_vertical(doc: &mut Document, delta: isize, past_end: bool) {
 fn move_up(editor: &mut Editor) {
     let count = editor.take_count() as isize;
     let past_end = editor.mode == Mode::Insert;
-    if editor.extend && editor.mode == Mode::Normal {
-        move_vertical_selection(editor.doc_mut(), -count);
-    } else {
-        move_vertical(editor.doc_mut(), -count, past_end);
-    }
+    move_vertical(editor.doc_mut(), -count, past_end);
 }
 
 fn move_down(editor: &mut Editor) {
     let count = editor.take_count() as isize;
     let past_end = editor.mode == Mode::Insert;
-    if editor.extend && editor.mode == Mode::Normal {
-        move_vertical_selection(editor.doc_mut(), count);
-    } else {
-        move_vertical(editor.doc_mut(), count, past_end);
-    }
-}
-
-/// Move the active character of an inclusive characterwise selection while
-/// keeping Document's public selection representation half-open.
-fn move_vertical_selection(doc: &mut Document, delta: isize) {
-    let (origin, head) = if doc.anchor <= doc.cursor {
-        (
-            doc.anchor,
-            position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor),
-        )
-    } else {
-        (
-            position::prev_grapheme_boundary(doc.text.slice(..), doc.anchor),
-            doc.cursor,
-        )
-    };
-    doc.cursor = head;
-    move_vertical(doc, delta, false);
-    let head = doc.cursor;
-    if head >= origin {
-        doc.anchor = origin;
-        doc.cursor = position::next_grapheme_boundary(doc.text.slice(..), head);
-    } else {
-        doc.anchor = position::next_grapheme_boundary(doc.text.slice(..), origin);
-        doc.cursor = head;
-    }
+    move_vertical(editor.doc_mut(), count, past_end);
 }
 
 fn move_line_start(editor: &mut Editor) {
@@ -492,57 +408,37 @@ fn block_mode(editor: &mut Editor) {
 fn extend_mode(editor: &mut Editor) {
     editor.keep_selection = true;
     if editor.extend {
-        let (primary, extras) = {
-            let doc = editor.doc();
-            let primary = if doc.anchor < doc.cursor {
-                position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor)
-            } else {
-                doc.cursor
-            };
-            let extras = doc
-                .extra
-                .iter()
-                .map(|&(anchor, cursor)| {
-                    if anchor < cursor {
-                        position::prev_grapheme_boundary(doc.text.slice(..), cursor)
-                    } else {
-                        cursor
-                    }
-                })
-                .collect::<Vec<_>>();
-            (primary, extras)
-        };
-        let doc = editor.doc_mut();
-        doc.cursor = primary;
-        doc.anchor = primary;
-        for ((anchor, cursor), at) in doc.extra.iter_mut().zip(extras) {
-            *anchor = at;
-            *cursor = at;
-        }
+        editor.collapse_to_heads();
         editor.extend = false;
         return;
     }
     editor.extend = true;
 
-    // Entering SELECT selects the complete grapheme under every cursor.  Apart
+    // Entering SELECT selects the complete grapheme under every caret, as
+    // drawn, so `wv` starts where the caret is and not one past it. Apart
     // from being visible immediately, this prevents d/x/c from mistaking `v`
     // for an empty selection and arming their doubled line operation.
-    let (primary_end, extra_ends) = {
-        let doc = editor.doc();
-        let end = position::next_grapheme_boundary(doc.text.slice(..), doc.cursor);
-        let extras = doc
-            .extra
-            .iter()
-            .map(|&(_, cursor)| position::next_grapheme_boundary(doc.text.slice(..), cursor))
-            .collect::<Vec<_>>();
-        (end, extras)
-    };
-    let doc = editor.doc_mut();
-    doc.anchor = doc.cursor;
-    doc.cursor = primary_end;
-    for ((anchor, cursor), end) in doc.extra.iter_mut().zip(extra_ends) {
-        *anchor = *cursor;
-        *cursor = end;
+    editor.map_selections(|t, sel| {
+        let h = selections::head(t, sel);
+        (h, position::next_grapheme_boundary(t, h))
+    });
+}
+
+// Outside `v`, w/b/e select one word from the caret, Helix-style: a caret on
+// the word's edge steps over it first, so repeating walks word by word. In
+// `v` they are vim's motions, and `motion_end` keeps the head inclusive.
+
+/// Where a word selection starts: the caret, or the character after it when
+/// the caret sits on the last character of a word.
+fn step_off_edge(doc: &Document, head: usize, forward: bool) -> usize {
+    let len = doc.text.len_chars();
+    let class = |p: usize| position::classify(doc.text.char(p));
+    if forward && head + 1 < len && class(head) != class(head + 1) {
+        head + 1
+    } else if !forward && head > 0 && head < len && class(head - 1) != class(head) {
+        head - 1
+    } else {
+        head
     }
 }
 
@@ -551,11 +447,14 @@ fn select_word_next(editor: &mut Editor) {
     editor.keep_selection = true;
     let extend = editor.extend;
     let doc = editor.doc_mut();
-    if !extend {
-        doc.anchor = doc.cursor;
-    }
     for _ in 0..count {
-        doc.cursor = next_word_start(doc, doc.cursor);
+        if extend {
+            doc.cursor = next_word_start(doc, doc.cursor);
+        } else {
+            let head = selections::head(doc.text.slice(..), (doc.anchor, doc.cursor));
+            doc.anchor = step_off_edge(doc, head, true);
+            doc.cursor = next_word_start(doc, doc.anchor);
+        }
     }
     doc.goal_col = None;
 }
@@ -565,11 +464,15 @@ fn select_word_prev(editor: &mut Editor) {
     editor.keep_selection = true;
     let extend = editor.extend;
     let doc = editor.doc_mut();
-    if !extend {
-        doc.anchor = doc.cursor;
-    }
     for _ in 0..count {
-        doc.cursor = prev_word_start(doc, doc.cursor);
+        if extend {
+            doc.cursor = prev_word_start(doc, doc.cursor);
+        } else {
+            // Backward: the caret is the cursor, the anchor is half-open.
+            let start = step_off_edge(doc, doc.cursor, false);
+            doc.anchor = position::next_grapheme_boundary(doc.text.slice(..), start);
+            doc.cursor = prev_word_start(doc, doc.anchor);
+        }
     }
     doc.goal_col = None;
 }
@@ -579,15 +482,22 @@ fn select_word_end(editor: &mut Editor) {
     editor.keep_selection = true;
     let extend = editor.extend;
     let doc = editor.doc_mut();
-    if !extend {
-        doc.anchor = doc.cursor;
-    }
     for _ in 0..count {
-        doc.cursor = word_end(doc, doc.cursor);
+        if extend {
+            doc.cursor = word_end(doc, doc.cursor);
+        } else {
+            let head = selections::head(doc.text.slice(..), (doc.anchor, doc.cursor));
+            doc.anchor = step_off_edge(doc, head, true);
+            // word_end looks from the next char; from anchor - 1 it can end
+            // on the anchor itself, a one-letter word.
+            let end = if doc.anchor == 0 {
+                word_end(doc, 0)
+            } else {
+                word_end(doc, doc.anchor - 1)
+            };
+            doc.cursor = (end + 1).min(doc.text.len_chars());
+        }
     }
-    // Selections are exclusive at the cursor end; step past the last word char
-    // so `ed` deletes the whole word.
-    doc.cursor = (doc.cursor + 1).min(doc.text.len_chars());
     doc.goal_col = None;
 }
 
@@ -615,6 +525,33 @@ fn select_line(editor: &mut Editor) {
         };
     }
     doc.goal_col = None;
+}
+
+/// `V`: start line mode at the caret, `3V` taking three lines; in it, each
+/// further `V` takes one more line down. With several cursors, every cursor
+/// selects its own line as `select_line` does.
+fn visual_line(editor: &mut Editor) {
+    if !editor.doc().extra.is_empty() {
+        return select_line(editor);
+    }
+    let count = editor.take_count();
+    editor.keep_selection = true;
+    editor.extend = false;
+    let (caret, down) = match editor.linewise {
+        Some((_, caret)) => (caret, count),
+        None => {
+            let caret = editor.caret();
+            editor.linewise = Some((editor.doc().text.char_to_line(caret), caret));
+            (caret, count - 1)
+        }
+    };
+    let doc = editor.doc_mut();
+    doc.cursor = caret;
+    if down > 0 {
+        move_vertical(doc, down as isize, false);
+    }
+    let caret = doc.cursor;
+    editor.line_reselect(caret);
 }
 
 /// Grow the selection to the smallest syntax node strictly containing it:
@@ -658,9 +595,8 @@ fn expand_selection(editor: &mut Editor) {
     }
 }
 
-fn collapse_selection(_editor: &mut Editor) {
-    // Not setting `keep_selection` is the whole implementation: the
-    // post-command collapse in `handle_key` does the work.
+fn collapse_selection(editor: &mut Editor) {
+    editor.collapse_to_heads();
 }
 
 // ---- multiple cursors ------------------------------------------------------
@@ -1440,7 +1376,10 @@ fn page_up(editor: &mut Editor) {
 
 // ---- mode changes ----------------------------------------------------------
 
+/// `i` types before the selection, `a` after it; with nothing selected,
+/// before or after the character under the caret.
 fn insert_mode(editor: &mut Editor) {
+    editor.map_selections(|_, (a, c)| (a.min(c), a.min(c)));
     editor.set_mode(Mode::Insert);
 }
 
@@ -1453,7 +1392,9 @@ fn append(editor: &mut Editor) {
     editor.set_mode(Mode::Insert);
     let doc = editor.doc_mut();
     let line = doc.cursor_line();
-    if doc.line_len(line) > 0 {
+    if doc.anchor != doc.cursor {
+        doc.cursor = doc.anchor.max(doc.cursor);
+    } else if doc.line_len(line) > 0 {
         doc.cursor += 1;
     }
     doc.clamp_cursor(true);
@@ -1510,11 +1451,8 @@ fn normal_mode(editor: &mut Editor) {
     if editor.mode == Mode::Normal {
         editor.doc_mut().extra.clear();
     }
-    if editor.extend {
-        let doc = editor.doc_mut();
-        if doc.anchor < doc.cursor {
-            doc.cursor = position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor);
-        }
+    if editor.mode == Mode::Normal {
+        editor.collapse_to_heads();
     }
     editor.extend = false;
     editor.set_mode(Mode::Normal);
@@ -2237,7 +2175,8 @@ mod tests {
         // A tab is one character but four columns wide: `j` off a tab-indented
         // line has to land under where the cursor looked, not under char 2.
         let mut editor = editor_with("\tabc\nabcdefgh");
-        editor.doc_mut().cursor = 2; // 'b', display column 5
+        editor.doc_mut().cursor = 2;
+        editor.doc_mut().anchor = 2; // 'b', display column 5
         press(&mut editor, "j");
         assert_eq!(editor.doc().cursor_line_col(), (1, 5));
         press(&mut editor, "k");
@@ -2315,7 +2254,7 @@ mod tests {
         };
         assert_eq!(keys("delete_line"), "dd  xx");
         assert_eq!(keys("copy_line"), "cc");
-        assert_eq!(keys("select_line"), "V");
+        assert_eq!(keys("visual_line"), "V");
         assert_eq!(keys("copy"), "c");
     }
 

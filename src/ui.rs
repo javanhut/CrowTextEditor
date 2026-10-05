@@ -186,11 +186,7 @@ fn render_window(
     let len = doc.text.len_chars();
     let line_count = doc.line_count();
     let gutter = doc.line_count().to_string().len().max(3) + 1;
-    let display_cursor = if focused && editor.inclusive() && anchor < cursor {
-        position::prev_grapheme_boundary(doc.text.slice(..), cursor)
-    } else {
-        cursor
-    };
+    let display_cursor = if focused { editor.caret() } else { cursor };
     let width = (rw as usize).saturating_sub(gutter);
     let cursor_line = {
         let l = doc.text.char_to_line(display_cursor.min(len));
@@ -783,6 +779,8 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
         ("BLOCK", Color::Magenta)
     } else if editor.extend && editor.mode == Mode::Normal {
         ("SELECT", Color::Magenta)
+    } else if editor.linewise.is_some() && editor.mode == Mode::Normal {
+        ("LINE", Color::Magenta)
     } else {
         match editor.mode {
             Mode::Normal => ("NORMAL", Color::Blue),

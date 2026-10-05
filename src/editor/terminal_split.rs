@@ -186,6 +186,7 @@ impl Editor {
             if matches!(self.mode, Mode::Normal | Mode::Insert) {
                 self.set_mode(Mode::Terminal);
                 self.extend = false;
+                self.linewise = None;
             }
         } else if self.mode == Mode::Terminal {
             self.mode = Mode::Normal;

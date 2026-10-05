@@ -685,7 +685,8 @@ mod tests {
     #[test]
     fn text_edits_apply_as_one_undo_step_and_keep_the_cursor() {
         let mut editor = editor_with("let foo = 1;\nfoo + foo\n");
-        editor.doc_mut().cursor = 17; // the `+` on the second line
+        editor.doc_mut().cursor = 17;
+        editor.doc_mut().anchor = 17; // the `+` on the second line
         let edits = vec![
             json!({"range": {"start": {"line": 1, "character": 6}, "end": {"line": 1, "character": 9}}, "newText": "bar"}),
             json!({"range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 7}}, "newText": "bar"}),
@@ -733,8 +734,10 @@ mod tests {
     fn word_at_cursor_finds_the_identifier() {
         let mut editor = editor_with("let some_name = 1;");
         editor.doc_mut().cursor = 7;
+        editor.doc_mut().anchor = 7;
         assert_eq!(editor.word_at_cursor(), "some_name");
-        editor.doc_mut().cursor = 3; // the space after `let`
+        editor.doc_mut().cursor = 3;
+        editor.doc_mut().anchor = 3; // the space after `let`
         assert_eq!(editor.word_at_cursor(), "let");
     }
 }

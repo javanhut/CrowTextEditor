@@ -19,7 +19,7 @@ mod mouse;
 mod objects;
 mod picker_keys;
 mod repeat;
-mod selections;
+pub(crate) mod selections;
 mod terminal_split;
 mod tools;
 mod tree;
@@ -343,7 +343,7 @@ impl Default for Keymaps {
         normal.bind_str("O", "open_above");
 
         // selection and edits
-        normal.bind_str("V", "select_line");
+        normal.bind_str("V", "visual_line");
         normal.bind_str("v", "extend_mode");
         normal.bind_str("C-v", "block_mode");
         normal.bind_str("A-o", "expand_selection");
@@ -562,6 +562,9 @@ pub struct Editor {
     pub keep_selection: bool,
     /// Extend mode (`v`): motions grow the selection instead of replacing it.
     pub extend: bool,
+    /// Line mode (`V`): the line it started on and the caret, which motions
+    /// move; the selection is every line between them.
+    pub linewise: Option<(usize, usize)>,
     /// Block mode (`C-v`): motions stretch a rectangle, one selection per
     /// line of it. See `selections.rs`.
     pub block: Option<selections::Block>,
@@ -742,6 +745,7 @@ impl Editor {
             search_origin: (0, 0),
             keep_selection: false,
             extend: false,
+            linewise: None,
             block: None,
             lsps: Vec::new(),
             lsp_failed: std::collections::HashSet::new(),
@@ -1347,10 +1351,37 @@ impl Editor {
                 } else if command.name != "block_mode" && self.block.take().is_some() {
                     self.block_finish(command.name);
                 }
+                let motion = !stretching
+                    && self.mode == Mode::Normal
+                    && commands::BLOCK_MOTIONS.contains(&command.name);
+                if let Some((_, caret)) = self.linewise {
+                    // A motion moves line mode's caret; anything else ends it
+                    // and acts on the lines, unless it is only leaving them.
+                    if motion
+                        || matches!(
+                            command.name,
+                            "normal_mode" | "extend_mode" | "collapse_selection"
+                        )
+                    {
+                        let doc = self.doc_mut();
+                        (doc.anchor, doc.cursor) = (caret, caret);
+                    }
+                    if !motion && command.name != "visual_line" {
+                        self.linewise = None;
+                    }
+                } else if motion {
+                    self.motion_start();
+                }
                 if !self.doc().extra.is_empty() && commands::PER_CURSOR.contains(&command.name) {
                     self.dispatch_per_cursor(command);
                 } else {
                     (command.func)(self);
+                }
+                if motion && self.linewise.is_some() {
+                    self.line_reselect(self.doc().cursor);
+                    self.keep_selection = true;
+                } else if motion && self.extend {
+                    self.motion_end();
                 }
                 // After the call: a replay (`.`, `@`) dispatches commands of
                 // its own, and the one to remember is the replay itself.
@@ -2185,11 +2216,7 @@ impl Editor {
         let (rx, ry, rw, rh) = self.focused_rect();
         let wrap = self.wrap_width();
         let doc = self.doc();
-        let cursor = if self.inclusive() && doc.anchor < doc.cursor {
-            crate::position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor)
-        } else {
-            doc.cursor
-        };
+        let cursor = self.caret();
         let (line, row, col) = doc.position_visual(cursor, wrap);
         if line < doc.view_line || line > doc.view_line + rh as usize {
             return None;
@@ -2212,11 +2239,7 @@ impl Editor {
     /// Human-readable cursor position for the status line, 1-indexed.
     pub fn cursor_indicator(&self) -> String {
         let doc = self.doc();
-        let cursor = if self.inclusive() && doc.anchor < doc.cursor {
-            crate::position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor)
-        } else {
-            doc.cursor
-        };
+        let cursor = self.caret();
         let line = doc.text.char_to_line(cursor.min(doc.text.len_chars()));
         let col = cursor - doc.line_start(line);
         let display =
@@ -2273,7 +2296,8 @@ pub(crate) mod tests {
         // and pasted brackets must not auto-close.
         let mut editor = editor_with("    indented\n");
         press(&mut editor, "i");
-        editor.doc_mut().cursor = 13; // after the indented line
+        editor.doc_mut().cursor = 13;
+        editor.doc_mut().anchor = 13; // after the indented line
         editor.handle_paste("on:\r\n  push:\r\n    branches: [main]\n");
         assert_eq!(
             editor.doc().text.to_string(),
@@ -2329,6 +2353,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn v_line_mode_extends_by_whole_lines_either_way() {
+        for (keys, left) in [
+            ("Vjd", "three\nfour"),    // down a line
+            ("jjVkd", "one\nfour"),    // up from the third
+            ("jVjkkd", "three\nfour"), // back past where it started
+            ("2Vd", "three\nfour"),    // a count takes that many lines
+            ("VGd", ""),               // any motion moves the caret
+        ] {
+            let mut editor = editor_with("one\ntwo\nthree\nfour");
+            press(&mut editor, keys);
+            assert_eq!(editor.doc().text.to_string(), left, "{keys}");
+            assert!(editor.linewise.is_none(), "{keys}: d ends line mode");
+        }
+
+        // The caret keeps its column through the lines, and Esc leaves it there.
+        let mut editor = editor_with("abc\ndef\nghi");
+        press(&mut editor, "lVj");
+        assert_eq!(editor.cursor_indicator(), "2:2");
+        let doc = editor.doc();
+        assert_eq!(
+            doc.text.slice(doc.anchor..doc.cursor).to_string(),
+            "abc\ndef\n"
+        );
+        press(&mut editor, "<esc>");
+        assert_eq!(editor.cursor_indicator(), "2:2");
+        assert_eq!(editor.doc().anchor, editor.doc().cursor);
+    }
+
+    #[test]
     fn w_selects_what_it_crosses() {
         let mut editor = editor_with("foo bar baz");
         press(&mut editor, "wd");
@@ -2338,10 +2391,11 @@ pub(crate) mod tests {
     #[test]
     fn motions_collapse_the_selection() {
         let mut editor = editor_with("foo bar");
-        // w selects "foo ", h collapses onto the space; v selects it.
+        // w selects "foo " with the caret on the space; h moves off it
+        // onto the last "o", and v selects that.
         press(&mut editor, "wh");
         press(&mut editor, "vd");
-        assert_eq!(editor.doc().text.to_string(), "foobar");
+        assert_eq!(editor.doc().text.to_string(), "fo bar");
     }
 
     #[test]
@@ -2499,12 +2553,48 @@ pub(crate) mod tests {
     #[test]
     fn v_makes_motions_extend_the_selection() {
         let mut editor = editor_with("foo bar baz");
+        // As in vim, the head lands on the next word's first char and is
+        // selected with the rest.
         press(&mut editor, "vwwd");
-        assert_eq!(editor.doc().text.to_string(), "baz");
+        assert_eq!(editor.doc().text.to_string(), "az");
         // The delete dropped extend mode: l is a plain motion again, so vl
         // selects exactly one char.
         press(&mut editor, "lvd");
-        assert_eq!(editor.doc().text.to_string(), "bz");
+        assert_eq!(editor.doc().text.to_string(), "a");
+    }
+
+    #[test]
+    fn every_motion_in_v_keeps_both_ends_inclusive() {
+        for (keys, left) in [
+            ("v$d", ""),         // $ takes the last char
+            ("$vbd", "foo "),    // b keeps the char v started on
+            ("$v0d", ""),        // so does 0
+            ("lllvwd", "fooar"), // w lands on, and takes, the next word's first char
+            ("ved", " bar"),     // e takes the word's last char
+            ("wwvhhhd", "foo"),  // backwards through the space
+        ] {
+            let mut editor = editor_with("foo bar");
+            press(&mut editor, keys);
+            assert_eq!(editor.doc().text.to_string(), left, "{keys}");
+        }
+    }
+
+    #[test]
+    fn the_caret_is_drawn_where_the_next_motion_starts() {
+        let mut editor = editor_with("foo bar baz");
+        press(&mut editor, "e"); // selects "foo", caret on its last o
+        assert_eq!(editor.cursor_indicator(), "1:3");
+        press(&mut editor, "e"); // walks on: " bar"
+        assert_eq!(editor.cursor_indicator(), "1:7");
+        press(&mut editor, "a!");
+        press(&mut editor, "<esc>"); // a appends after the selection, like vim's ea
+        assert_eq!(editor.doc().text.to_string(), "foo bar! baz");
+
+        let mut editor = editor_with("foo bar baz");
+        press(&mut editor, "ww"); // "foo ", then "bar "
+        assert_eq!(editor.cursor_indicator(), "1:8");
+        press(&mut editor, "l"); // from the drawn caret, not past it
+        assert_eq!(editor.cursor_indicator(), "1:9");
     }
 
     #[test]
@@ -2662,9 +2752,11 @@ pub(crate) mod tests {
         let mut editor = editor_with(&format!("{}\nnext\n", "x".repeat(200)));
         // 80 columns less a 4-column gutter: rows start at chars 0, 76, 152.
         editor.doc_mut().cursor = 100;
+        editor.doc_mut().anchor = 100;
         editor.ensure_cursor_visible();
         assert_eq!(editor.screen_cursor(), Some((4 + 24, 1)));
         editor.doc_mut().cursor = 160;
+        editor.doc_mut().anchor = 160;
         editor.ensure_cursor_visible();
         assert_eq!(editor.screen_cursor(), Some((4 + 8, 2)));
     }
@@ -2681,6 +2773,7 @@ pub(crate) mod tests {
         let mut editor = editor_with(&text);
         let at = editor.doc().line_start(20);
         editor.doc_mut().cursor = at;
+        editor.doc_mut().anchor = at;
         editor.ensure_cursor_visible();
         assert!(
             editor.doc().view_line > 8,
@@ -2699,10 +2792,12 @@ pub(crate) mod tests {
     fn the_viewport_can_park_inside_one_very_long_line() {
         let mut editor = editor_with(&"z".repeat(4000));
         editor.doc_mut().cursor = 3900;
+        editor.doc_mut().anchor = 3900;
         editor.ensure_cursor_visible();
         assert!(editor.doc().view_row > 0);
         assert!(editor.screen_cursor().is_some());
         editor.doc_mut().cursor = 0;
+        editor.doc_mut().anchor = 0;
         editor.ensure_cursor_visible();
         assert_eq!((editor.doc().view_line, editor.doc().view_row), (0, 0));
     }
@@ -2980,6 +3075,7 @@ pub(crate) mod tests {
         // Repeated h keeps wrapping through an empty line to the top.
         let mut editor = editor_with("ab\n\ncd");
         editor.doc_mut().cursor = 4;
+        editor.doc_mut().anchor = 4;
         press(&mut editor, "h");
         assert_eq!(editor.doc().cursor, 3); // the empty line
         press(&mut editor, "h");
@@ -2996,11 +3092,13 @@ pub(crate) mod tests {
         let mut editor = editor_with("ab\ncd\nef");
         // From the last char of "ab", l lands on the first char of "cd".
         editor.doc_mut().cursor = 1;
+        editor.doc_mut().anchor = 1;
         press(&mut editor, "l");
         assert_eq!(editor.doc().cursor, 3);
         // Repeated l keeps wrapping through an empty line.
         let mut editor = editor_with("ab\n\ncd");
         editor.doc_mut().cursor = 1;
+        editor.doc_mut().anchor = 1;
         press(&mut editor, "l");
         assert_eq!(editor.doc().cursor, 3); // the empty line
         press(&mut editor, "l");
@@ -3025,7 +3123,8 @@ pub(crate) mod tests {
     #[test]
     fn s_without_percent_or_g_replaces_the_first_match_on_the_cursor_line() {
         let mut editor = editor_with("foo foo\nfoo foo");
-        editor.doc_mut().cursor = 8; // line 1
+        editor.doc_mut().cursor = 8;
+        editor.doc_mut().anchor = 8; // line 1
         press(&mut editor, ":s/foo/bar <enter>");
         assert_eq!(editor.doc().text.to_string(), "foo foo\nbar foo");
         // With g, every match on the line goes.
@@ -3067,7 +3166,8 @@ pub(crate) mod tests {
         let mut editor = editor_with("fn main() {\n    if x {\n    }\n}");
         press(&mut editor, "%"); // on the 'f': not a bracket, stays put
         assert_eq!(editor.doc().cursor, 0);
-        editor.doc_mut().cursor = 10; // the '{'
+        editor.doc_mut().cursor = 10;
+        editor.doc_mut().anchor = 10; // the '{'
         press(&mut editor, "%");
         assert_eq!(editor.doc().cursor, 29); // the final '}'
         press(&mut editor, "%");

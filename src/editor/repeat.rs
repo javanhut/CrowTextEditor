@@ -102,6 +102,7 @@ impl Editor {
         let doc = self.doc();
         let selected = doc.anchor != doc.cursor || doc.extra.iter().any(|(a, c)| a != c);
         let relative = self.extend
+            || self.linewise.is_some()
             || matches!(
                 self.last_command,
                 Some(

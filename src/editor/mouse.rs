@@ -96,6 +96,7 @@ impl Editor {
         }
         doc.goal_col = None;
         self.extend = false;
+        self.linewise = None;
         self.mouse_drag = true;
     }
 
