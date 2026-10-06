@@ -72,6 +72,18 @@ impl Editor {
             self.tree_click(y);
             return;
         }
+        if y == 0 && self.show_bufferline() {
+            let hit = self
+                .bufferline_tabs()
+                .into_iter()
+                .rev()
+                .find(|&(_, x0, _)| x >= x0);
+            if let Some((i, ..)) = hit.filter(|&(i, ..)| i != self.current) {
+                self.push_jump();
+                self.current = i;
+            }
+            return;
+        }
         let Some((id, _)) = self.window_at(x, y) else {
             return;
         };
@@ -212,7 +224,7 @@ impl Editor {
         let tab = crate::config::tab_width();
         let doc = self.doc();
         let mut rows_left = y.checked_sub(ry)? as usize;
-        let (mut line, mut sub) = (doc.view_line, doc.view_row);
+        let (mut line, mut sub) = (doc.visible_line(doc.view_line), doc.view_row);
         let last_line = doc.line_count().saturating_sub(1);
         // Walk down the visual rows to the one clicked.
         let offsets = loop {
@@ -226,7 +238,7 @@ impl Editor {
                 break offsets;
             }
             rows_left -= here;
-            line += 1;
+            line = doc.next_line(line).min(last_line);
             sub = 0;
         };
         let col = (x.checked_sub(rx)? as usize).saturating_sub(self.gutter_width());
@@ -300,6 +312,31 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         }
+    }
+
+    #[test]
+    fn the_buffer_line_lists_buffers_and_clicks_switch_them() {
+        let mut editor = editor_with("one\n");
+        assert!(
+            !editor.show_bufferline(),
+            "one buffer: no line, no lost row"
+        );
+        assert_eq!(editor.focused_rect().1, 0);
+        for dir in ["a", "b"] {
+            let mut doc = crate::document::Document::empty();
+            doc.path = Some(format!("{dir}/mod.rs").into());
+            editor.documents.push(doc);
+        }
+        editor.documents[1].modified = true;
+        assert!(editor.show_bufferline());
+        assert_eq!(editor.focused_rect().1, 1, "text starts below the line");
+        let tabs = editor.bufferline_tabs();
+        let labels: Vec<&str> = tabs.iter().map(|t| t.2.as_str()).collect();
+        assert_eq!(labels, [" [no name] ", " a/mod.rs ● ", " b/mod.rs "]);
+
+        let x = tabs[2].1 + 2;
+        editor.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, 0));
+        assert_eq!(editor.current, 2);
     }
 
     #[test]

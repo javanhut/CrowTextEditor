@@ -33,6 +33,9 @@ impl Editor {
                 (crate::commands::find("focus_right").unwrap().func)(self);
             }
             KeyCode::Enter => self.picker_accept(),
+            KeyCode::Char('e') if key.ctrl && matches!(picker.kind, Kind::Grep { .. }) => {
+                self.grep_to_refactor();
+            }
             KeyCode::Down => self.picker_move(1),
             KeyCode::Up => self.picker_move(-1),
             KeyCode::Char('n') if key.ctrl => self.picker_move(1),

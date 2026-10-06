@@ -12,14 +12,76 @@ use regex::Regex;
 use ropey::Rope;
 
 /// (start, end) char ranges of every non-overlapping match, in order.
+/// With `smartcase` on, a pattern without a capital ignores case.
 pub fn matches(text: &Rope, pat: &str) -> Vec<(usize, usize)> {
     if pat.is_empty() {
         return Vec::new();
     }
-    match Regex::new(pat) {
+    let fold = crate::config::smartcase() && !has_capital(pat);
+    let re = if fold {
+        format!("(?i){pat}")
+    } else {
+        pat.to_string()
+    };
+    match Regex::new(&re) {
         Ok(re) => regex_matches(text, &re),
-        Err(_) => literal_matches(text, &pat.chars().collect::<Vec<_>>()),
+        Err(_) => literal(text, pat, fold),
     }
+}
+
+/// `literal_matches`, ignoring case when `fold`.
+fn literal(text: &Rope, pat: &str, fold: bool) -> Vec<(usize, usize)> {
+    if !fold {
+        return literal_matches(text, &pat.chars().collect::<Vec<_>>());
+    }
+    // Lowercasing can change a char count (`İ`), which would throw every
+    // offset after it; those chars keep their case instead.
+    let lower = |c: char| {
+        let mut l = c.to_lowercase();
+        match (l.next(), l.next()) {
+            (Some(one), None) => one,
+            _ => c,
+        }
+    };
+    let pat: Vec<char> = pat.chars().map(lower).collect();
+    let folded: Rope = text.chars().map(lower).collect::<String>().as_str().into();
+    literal_matches(&folded, &pat)
+}
+
+/// A capital typed in the pattern — not one in an escape like `\S` or `\W`,
+/// which name a character class rather than asking for case.
+pub fn has_capital(pat: &str) -> bool {
+    let mut chars = pat.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c.is_uppercase() {
+            return true;
+        }
+    }
+    false
+}
+
+/// The replacement for `matched` when it was found ignoring case: a plain
+/// lowercase replacement takes the match's shape — `FOO` → `BAR`, `Foo` →
+/// `Bar`. Anything else, or a replacement with capitals of its own, is left
+/// as typed.
+fn preserve_case(matched: &str, with: String) -> String {
+    if has_capital(&with) || !matched.chars().any(char::is_alphabetic) {
+        return with;
+    }
+    let letters = || matched.chars().filter(|c| c.is_alphabetic());
+    if letters().count() > 1 && letters().all(char::is_uppercase) {
+        return with.to_uppercase();
+    }
+    if letters().next().is_some_and(char::is_uppercase) {
+        let mut chars = with.chars();
+        return match chars.next() {
+            Some(first) => first.to_uppercase().chain(chars).collect(),
+            None => with,
+        };
+    }
+    with
 }
 
 fn regex_matches(text: &Rope, re: &Regex) -> Vec<(usize, usize)> {
@@ -79,14 +141,17 @@ pub fn substitutions(
         return Vec::new();
     }
     let scoped: String = text.slice(scope.clone()).chars().collect();
-    let pat = if insensitive {
+    // An explicit `i`, or smartcase on a pattern without capitals; either
+    // way a replacement follows the case of what it replaces.
+    let insensitive = insensitive || (crate::config::smartcase() && !has_capital(pat));
+    let re = if insensitive {
         format!("(?i){pat}")
     } else {
         pat.to_string()
     };
     // Match ranges as (start, end, expanded replacement) in scope-relative
     // char offsets, in order and non-overlapping.
-    let found: Vec<(usize, usize, String)> = match Regex::new(&pat) {
+    let found: Vec<(usize, usize, String)> = match Regex::new(&re) {
         Ok(re) => {
             let expanded = vim_replacement(repl);
             re.captures_iter(&scoped)
@@ -97,6 +162,9 @@ pub fn substitutions(
                     }
                     let mut with = String::new();
                     caps.expand(&expanded, &mut with);
+                    if insensitive {
+                        with = preserve_case(m.as_str(), with);
+                    }
                     Some((
                         scoped[..m.start()].chars().count(),
                         scoped[..m.end()].chars().count(),
@@ -106,11 +174,19 @@ pub fn substitutions(
                 .collect()
         }
         Err(_) => {
-            let pat_chars: Vec<char> = pat.chars().collect();
             let scope_rope: Rope = scoped.as_str().into();
-            literal_matches(&scope_rope, &pat_chars)
+            literal(&scope_rope, pat, insensitive)
                 .into_iter()
-                .map(|(f, t)| (f, t, repl.to_string()))
+                .map(|(f, t)| {
+                    let matched = scope_rope.slice(f..t).to_string();
+                    let with = repl.to_string();
+                    let with = if insensitive {
+                        preserve_case(&matched, with)
+                    } else {
+                        with
+                    };
+                    (f, t, with)
+                })
                 .collect()
         }
     };
@@ -203,6 +279,39 @@ mod tests {
         let rope = Rope::from_str(text);
         let end = rope.len_chars();
         substitutions(&rope, 0..end, pat, repl, global, false)
+    }
+
+    #[test]
+    fn smartcase_ignores_case_until_a_capital_is_typed() {
+        assert_eq!(find("Foo foo", "foo"), vec![(0, 3), (4, 7)]);
+        assert_eq!(find("Foo foo", "Foo"), vec![(0, 3)]);
+        assert_eq!(
+            find("A b", r"\S"),
+            vec![(0, 1), (2, 3)],
+            "an escape is not a capital"
+        );
+        assert_eq!(
+            find("X[ x[", "x["),
+            vec![(0, 2), (3, 5)],
+            "the literal fallback folds too"
+        );
+    }
+
+    #[test]
+    fn replacing_ignoring_case_keeps_the_case_of_each_match() {
+        assert_eq!(
+            subs("foo Foo FOO", "foo", "bar", true),
+            vec![
+                (0, 3, "bar".to_string()),
+                (4, 7, "Bar".to_string()),
+                (8, 11, "BAR".to_string()),
+            ]
+        );
+        // A replacement with capitals of its own is taken as typed.
+        assert_eq!(
+            subs("FOO", "foo", "bAr", true),
+            vec![(0, 3, "bAr".to_string())]
+        );
     }
 
     #[test]

@@ -138,6 +138,11 @@ commands! {
     toggle_comment => "comment or uncomment the selected lines (gc)",
     surround => "wrap the selection in a bracket or quote — ms then the character",
     toggle_wrap => "turn soft wrapping of long lines on or off (:wrap)",
+    show_change => "show what the change at the cursor replaced since the last ivaldi seal",
+    increment => "add the count to the number or date at or after the cursor (C-a)",
+    decrement => "subtract the count from the number or date at or after the cursor (C-x)",
+    toggle_fold => "fold the block at the cursor, or open the fold it heads (za)",
+    unfold_all => "open every fold in the buffer (zR)",
     markdown_preview => "render this buffer as markdown in a live split (:md)",
     terminal => "open a shell in a split below; again to jump to it, or hide it (:term)",
     split_vertical => "split the window side by side",
@@ -283,6 +288,8 @@ pub static PER_CURSOR: &[&str] = &[
     "paste_before",
     "delete_backward",
     "delete_forward",
+    "increment",
+    "decrement",
     // Where insert mode starts is each cursor's own business too.
     "append",
     "insert_at_line_start",
@@ -331,8 +338,20 @@ fn move_vertical(doc: &mut Document, delta: isize, past_end: bool) {
     let (line, display_col) = doc.cursor_display();
     let goal = doc.goal_col.unwrap_or(display_col);
 
-    let last = doc.line_count().saturating_sub(1) as isize;
-    let target = (line as isize + delta).clamp(0, last) as usize;
+    let last = doc.line_count().saturating_sub(1);
+    // A closed fold is one line to step over, not many to step through.
+    let mut target = line;
+    for _ in 0..delta.unsigned_abs() {
+        let next = if delta > 0 {
+            doc.next_line(target)
+        } else {
+            doc.prev_line(target)
+        };
+        if next > last || next == target {
+            break;
+        }
+        target = next;
+    }
 
     let offset = position::display_col_to_char(doc.line(target), goal, tab_width());
     doc.cursor = doc.line_start(target) + offset;
@@ -1026,8 +1045,8 @@ fn to_system_clipboard(text: &str) {
         ("xsel", &["--clipboard", "--input"]),
     ];
 
-    let over_ssh = std::env::var_os("SSH_TTY").is_some()
-        || std::env::var_os("SSH_CONNECTION").is_some();
+    let over_ssh =
+        std::env::var_os("SSH_TTY").is_some() || std::env::var_os("SSH_CONNECTION").is_some();
     if over_ssh {
         osc52_copy(text);
         return;
@@ -1087,12 +1106,15 @@ fn tmux_passthrough(seq: &str) -> String {
 
 /// Standard base64 with padding. Small enough not to be worth a crate.
 fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = chunk.len();
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let v = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
         for i in 0..4 {
             if i <= n {
@@ -1628,7 +1650,11 @@ fn run_formatter(editor: &mut Editor) -> Option<Result<&'static str, String>> {
     if in_place {
         editor.doc_mut().restamp();
     }
-    let new = rewritten.unwrap_or_else(|| String::from_utf8_lossy(&out.stdout).into_owned());
+    // The buffer holds `\n` only (`Document::crlf` restores `\r\n` on save),
+    // and a formatter that kept the file's own endings must not undo that.
+    let new = rewritten
+        .unwrap_or_else(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        .replace("\r\n", "\n");
     if new.is_empty() || new == src {
         return Some(Ok("already formatted"));
     }
@@ -1720,10 +1746,15 @@ fn redo(editor: &mut Editor) {
 
 // ---- insert mode -----------------------------------------------------------
 
-/// One level of indentation, matching the style already on the line:
-/// tabs if the line's indent has tabs, else `tab_width` spaces.
-pub fn indent_unit(indent: &str) -> String {
-    if indent.contains('\t') {
+/// One level of indentation: what `.editorconfig` says, else the style
+/// already on the line — tabs if its indent has tabs, else `tab_width`
+/// spaces.
+pub fn indent_unit(doc: &Document, indent: &str) -> String {
+    let tabs = doc
+        .editorconfig
+        .indent_tabs
+        .unwrap_or_else(|| indent.contains('\t'));
+    if tabs {
         "\t".to_string()
     } else {
         " ".repeat(tab_width())
@@ -1749,7 +1780,7 @@ fn insert_newline(editor: &mut Editor) {
     // ponytail: brace-aware indent only for the primary cursor; with extra
     // cursors every cursor gets the plain newline+indent.
     if opener && doc.extra.is_empty() {
-        let unit = indent_unit(&indent);
+        let unit = indent_unit(doc, &indent);
         if closes {
             // `{|}` + Enter -> the closer moves to its own line and the
             // cursor lands on the indented one between.
@@ -1765,15 +1796,211 @@ fn insert_newline(editor: &mut Editor) {
     }
 }
 
+fn show_change(editor: &mut Editor) {
+    let doc = editor.doc();
+    let line = doc.cursor_line();
+    let text = |l: usize| doc.line(l).chars().take(doc.line_len(l)).collect();
+    match doc.vcs.diff_at(line, text) {
+        Some(lines) => editor.open_hover(&lines.join("\n")),
+        None => editor.set_status("no change here since the last seal"),
+    }
+}
+
+fn increment(editor: &mut Editor) {
+    add_to_number(editor, 1);
+}
+
+fn decrement(editor: &mut Editor) {
+    add_to_number(editor, -1);
+}
+
+/// vim's `C-a`: the number (or `YYYY-MM-DD` date) under the cursor, or the
+/// first after it on the line, goes up by `sign` × the count. The cursor
+/// ends on its last character.
+fn add_to_number(editor: &mut Editor, sign: i64) {
+    let by = editor.take_count() as i64 * sign;
+    let doc = editor.doc_mut();
+    let line = doc.cursor_line();
+    let start = doc.line_start(line);
+    let text: String = doc.line(line).chars().take(doc.line_len(line)).collect();
+    let Some((from, to, new)) = bump_number(&text, doc.cursor - start, by) else {
+        return;
+    };
+    let end = start + from + new.chars().count() - 1;
+    let tx = Transaction::change(&doc.text, [(start + from, start + to, Some(new))]);
+    doc.apply(tx, end);
+}
+
+/// The edit `C-a` makes to `line` with the cursor at char `col`: (from, to,
+/// replacement) in chars. Decimal (leading zeros kept), `0x` hex (width and
+/// case kept), or an ISO date, whose part under the cursor moves — the day
+/// when the cursor is before it.
+fn bump_number(line: &str, col: usize, by: i64) -> Option<(usize, usize, String)> {
+    let re = regex::Regex::new(r"(\d{4})-(\d{2})-(\d{2})|0[xX][0-9a-fA-F]+|-?\d+").ok()?;
+    let col_byte = line.char_indices().nth(col).map_or(line.len(), |(b, _)| b);
+    let caps = re
+        .captures_iter(line)
+        .find(|c| c.get(0).unwrap().end() > col_byte)?;
+    let m = caps.get(0)?;
+    let chars = |b: usize| line[..b].chars().count();
+    let s = m.as_str();
+    let new = if let (Some(y), Some(mo), Some(d)) = (caps.get(1), caps.get(2), caps.get(3)) {
+        let (mut year, mut month, mut day): (i64, i64, i64) = (
+            y.as_str().parse().ok()?,
+            mo.as_str().parse().ok()?,
+            d.as_str().parse().ok()?,
+        );
+        if col_byte >= y.start() && col_byte < y.end() {
+            year += by;
+        } else if col_byte >= mo.start() && col_byte < mo.end() {
+            let months = year * 12 + month - 1 + by;
+            (year, month) = (months.div_euclid(12), months.rem_euclid(12) + 1);
+        } else {
+            let days = days_from_civil(year, month, 1) + day - 1 + by;
+            (year, month, day) = civil_from_days(days);
+        }
+        let last = civil_from_days(days_from_civil(year + month / 12, month % 12 + 1, 1) - 1).2;
+        format!("{year:04}-{month:02}-{:02}", day.min(last))
+    } else if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        let n = i128::from_str_radix(hex, 16).ok()? + i128::from(by);
+        let width = hex.len();
+        let digits = if hex.chars().any(|c| c.is_ascii_uppercase()) {
+            format!("{:0width$X}", n.max(0))
+        } else {
+            format!("{:0width$x}", n.max(0))
+        };
+        format!("{}{digits}", &s[..2])
+    } else {
+        let n = s.parse::<i128>().ok()? + i128::from(by);
+        let digits = s.trim_start_matches('-');
+        if digits.len() > 1 && digits.starts_with('0') {
+            let width = digits.len();
+            format!("{}{:0width$}", if n < 0 { "-" } else { "" }, n.abs())
+        } else {
+            n.to_string()
+        }
+    };
+    Some((chars(m.start()), chars(m.end()), new))
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
+/// algorithm), and back.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+fn toggle_fold(editor: &mut Editor) {
+    let doc = editor.doc_mut();
+    let line = doc.cursor_line();
+    if doc.open_folds_headed(line) {
+        return;
+    }
+    doc.settle_syntax(); // the fold comes off the tree when there is one
+    let Some((head, last)) = fold_range(doc, line) else {
+        editor.set_status("nothing to fold here");
+        return;
+    };
+    let (h, e) = (doc.line_start(head), doc.line_start(last));
+    doc.folds.push((h, e));
+    if line != head {
+        doc.cursor = h;
+        doc.goal_col = None;
+    }
+}
+
+fn unfold_all(editor: &mut Editor) {
+    editor.doc_mut().folds.clear();
+}
+
+/// The lines (header, last) of the block a fold at `line` should close: the
+/// innermost multi-line syntax node around the line when there is a tree,
+/// else the run of deeper-indented lines under it (or under the line above
+/// it with less indent).
+fn fold_range(doc: &Document, line: usize) -> Option<(usize, usize)> {
+    if let Some(tree) = doc.syntax.as_ref().and_then(|s| s.tree.as_ref()) {
+        let col = (0..doc.line_len(line))
+            .find(|&i| !doc.line(line).char(i).is_whitespace())
+            .unwrap_or(0);
+        let byte = doc.text.char_to_byte(doc.line_start(line) + col);
+        let mut node = tree.root_node().descendant_for_byte_range(byte, byte)?;
+        loop {
+            let start = node.start_position().row;
+            let end = node.end_position();
+            // A node that runs to the start of the next line ends on this one.
+            let last = if end.column == 0 {
+                end.row.saturating_sub(1)
+            } else {
+                end.row
+            };
+            if last > start && node.parent().is_some() {
+                return Some((start, last.min(doc.line_count().saturating_sub(1))));
+            }
+            node = node.parent()?;
+        }
+    }
+    let indent = |l: usize| {
+        let s = doc.line(l);
+        let len = doc.line_len(l);
+        (0..len).position(|i| !s.char(i).is_whitespace())
+    };
+    let count = doc.line_count();
+    let next_text = (line + 1..count).find(|&l| indent(l).is_some());
+    let mut head = line;
+    let deeper_below =
+        matches!((indent(line), next_text.and_then(indent)), (Some(a), Some(b)) if b > a);
+    if !deeper_below {
+        let here = indent(line)?;
+        head = (0..line)
+            .rev()
+            .find(|&l| indent(l).is_some_and(|i| i < here))?;
+    }
+    let base = indent(head)?;
+    let mut last = head;
+    for l in head + 1..count {
+        match indent(l) {
+            Some(i) if i <= base => break,
+            Some(_) => last = l,
+            None => {} // blank lines belong to the block only if text follows
+        }
+    }
+    (last > head).then_some((head, last))
+}
+
 fn insert_tab(editor: &mut Editor) {
+    // Inside an expanded snippet, Tab walks its stops instead.
+    if editor.doc_mut().next_snippet_stop() {
+        editor.keep_selection = true;
+        return;
+    }
     let doc = editor.doc_mut();
     let indent = indent_of(doc, doc.cursor_line());
-    let unit = indent_unit(&indent);
+    let unit = indent_unit(doc, &indent);
     doc.insert_at_cursor(&unit);
 }
 
 fn delete_backward(editor: &mut Editor) {
     let doc = editor.doc_mut();
+    if doc.placeholder && doc.anchor != doc.cursor {
+        doc.take_placeholder();
+        return;
+    }
     if doc.cursor == 0 {
         return;
     }
@@ -1970,7 +2197,8 @@ pub fn surround_with(editor: &mut Editor, open: char) {
 /// Never in markdown: two trailing spaces there are a hard line break, and
 /// silently deleting them rewrites the document.
 fn strip_trailing_whitespace(editor: &mut Editor) {
-    if !crate::config::strip_trailing_whitespace() {
+    let own = editor.doc().editorconfig.trim_trailing_whitespace;
+    if own == Some(false) || (own.is_none() && !crate::config::strip_trailing_whitespace()) {
         return;
     }
     let ext = editor
@@ -1981,7 +2209,7 @@ fn strip_trailing_whitespace(editor: &mut Editor) {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_string();
-    if matches!(ext.as_str(), "md" | "markdown") {
+    if own.is_none() && matches!(ext.as_str(), "md" | "markdown") {
         return;
     }
     let doc = editor.doc();
@@ -2009,6 +2237,23 @@ fn strip_trailing_whitespace(editor: &mut Editor) {
     doc.commit_undo_group();
 }
 
+/// `insert_final_newline = true` in `.editorconfig`: a file that doesn't
+/// end in a newline gets one on write, as its own undo step.
+fn add_final_newline(editor: &mut Editor) {
+    let doc = editor.doc_mut();
+    let len = doc.text.len_chars();
+    if doc.editorconfig.insert_final_newline != Some(true)
+        || len == 0
+        || doc.text.char(len - 1) == '\n'
+    {
+        return;
+    }
+    let tx = Transaction::insert(&doc.text, len, "\n");
+    let cursor = doc.cursor;
+    doc.apply(tx, cursor);
+    doc.commit_undo_group();
+}
+
 fn split_vertical(editor: &mut Editor) {
     editor.split_window(true);
 }
@@ -2028,7 +2273,12 @@ fn save(editor: &mut Editor) {
 /// `force` waives the external-modification guard — that is `:w!`, which cannot
 /// be a registry entry because command names have to be Rust idents.
 pub fn save_with(editor: &mut Editor, force: bool) {
+    if editor.doc().refactor.is_some() {
+        editor.write_refactor();
+        return;
+    }
     strip_trailing_whitespace(editor);
+    add_final_newline(editor);
     // Format first; a broken formatter never blocks the write.
     let fmt_err = match crate::config::format_on_save().then(|| run_formatter(editor)) {
         Some(Some(Err(e))) => Some(e),
@@ -2072,6 +2322,65 @@ fn quit(editor: &mut Editor) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bump_number_handles_decimal_hex_and_dates() {
+        let b = bump_number;
+        assert_eq!(
+            b("x = 9;", 0, 1),
+            Some((4, 5, "10".into())),
+            "first number after the cursor"
+        );
+        assert_eq!(b("a -3", 3, 5), Some((2, 4, "2".into())));
+        assert_eq!(
+            b("007", 0, 1),
+            Some((0, 3, "008".into())),
+            "leading zeros keep the width"
+        );
+        assert_eq!(b("0xFF", 1, 1), Some((0, 4, "0x100".into())));
+        assert_eq!(b("0x0f", 0, -1), Some((0, 4, "0x0e".into())));
+        assert_eq!(
+            b("2024-02-28", 9, 2),
+            Some((0, 10, "2024-03-01".into())),
+            "day rolls over"
+        );
+        assert_eq!(
+            b("2024-01-31", 5, 1),
+            Some((0, 10, "2024-02-29".into())),
+            "month clamps the day"
+        );
+        assert_eq!(b("2024-12-05", 0, 1), Some((0, 10, "2025-12-05".into())));
+        assert_eq!(b("2024-12-05", 6, 1), Some((0, 10, "2025-01-05".into())));
+        assert_eq!(b("no digits", 0, 1), None);
+        assert_eq!(
+            b("1 2", 2, 1),
+            Some((2, 3, "3".into())),
+            "past the first: the one under the cursor"
+        );
+    }
+
+    #[test]
+    fn ctrl_a_adds_the_count_at_every_cursor() {
+        let mut editor = crate::editor::tests::editor_with(
+            "v1
+v9
+",
+        );
+        crate::editor::tests::press(&mut editor, "C C-a");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "v2
+v10
+"
+        );
+        crate::editor::tests::press(&mut editor, ", 5 C-x");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "v-3
+v10
+"
+        );
+    }
     use crate::editor::tests::{editor_with, press};
 
     /// A buffer that knows what language it is, so `gc` and the save-time

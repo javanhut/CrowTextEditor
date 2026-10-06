@@ -44,6 +44,10 @@ pub fn render(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
 
     render_tree(editor, out)?;
     render_text(editor, out)?;
+    render_bufferline(editor, out)?;
+    // Each window drew with its own buffer's tab width; the rest of the
+    // frame is about the focused one.
+    editor.use_buffer_settings();
     render_splash(editor, out)?;
     render_status_line(editor, out)?;
     render_command_line(editor, out)?;
@@ -149,6 +153,12 @@ fn render_window(
 
     let focused = id == editor.focused;
     let win = editor.layout.find(id).expect("window exists");
+    let own_doc = if focused {
+        editor.doc()
+    } else {
+        &editor.documents[win.doc.min(editor.documents.len() - 1)]
+    };
+    crate::config::set_buffer_tab_width(own_doc.editorconfig.width());
     // The focused window's live state is in its document; other windows render
     // from their stashed state.
     let (doc, cursor, anchor, extra, view_line, view_row, view_col) = if focused {
@@ -242,7 +252,7 @@ fn render_window(
         .filter(|w| *w > 0);
     // Walk logical lines, each contributing one row or — soft-wrapped — several.
     let mut row = 0usize;
-    let mut line_idx = view_line;
+    let mut line_idx = doc.visible_line(view_line);
     // Visual row of `line_idx` to draw next; only the first line starts partway
     // in, and only when the viewport is parked inside a tall wrapped line.
     let mut next_sub = view_row;
@@ -335,7 +345,12 @@ fn render_window(
             } else {
                 ST_NONE
             };
-            let group = crate::syntax::group_at(spans, p);
+            // The language server's semantic tokens, where it sent one,
+            // know more than the grammar does.
+            let group = match crate::syntax::group_at(&doc.semantic, p) {
+                0 => crate::syntax::group_at(spans, p),
+                g => g,
+            };
             let fg = crate::syntax::color(group);
             (overlay, fg, crate::syntax::attrs(group))
         };
@@ -410,6 +425,65 @@ fn render_window(
             }
         }
 
+        // Inlay hints, after the text rather than inside it: an inline one
+        // would move every column after it away from where the cursor math
+        // puts it. Each names the identifier it is about.
+        // ponytail: end-of-line only; inline needs position.rs to learn
+        // about virtual text.
+        if last_row && crate::config::inlay_hints() && !doc.inlay_hints.is_empty() {
+            let from = doc.inlay_hints.partition_point(|h| h.0 < ls);
+            let hints: Vec<String> = doc.inlay_hints[from..]
+                .iter()
+                .take_while(|h| h.0 <= ls + line_len)
+                .map(|(p, label)| {
+                    let mut start = p - ls;
+                    while start > 0 && {
+                        let c = line.char(start - 1);
+                        c.is_alphanumeric() || c == '_'
+                    } {
+                        start -= 1;
+                    }
+                    let name: String = line.slice(start..p - ls).chars().collect();
+                    let sep = if name.is_empty() || label.starts_with(':') {
+                        ""
+                    } else {
+                        " "
+                    };
+                    format!("{name}{sep}{label}")
+                })
+                .collect();
+            if !hints.is_empty() {
+                let mut text = format!("  {}", hints.join("  "));
+                let avail = width.saturating_sub(printed);
+                while display_width(&text) > avail {
+                    if text.pop().is_none() {
+                        break;
+                    }
+                }
+                if !text.trim().is_empty() {
+                    printed += display_width(&text);
+                    queue!(
+                        out,
+                        SetForegroundColor(theme.gutter),
+                        SetAttribute(Attribute::Italic),
+                        Print(text),
+                        SetAttribute(Attribute::NoItalic)
+                    )?;
+                }
+            }
+        }
+
+        // A closed fold says how much it is hiding.
+        let folded = doc.next_line(line_idx) - line_idx - 1;
+        if last_row && folded > 0 {
+            let text = format!("  ⋯ {folded} lines");
+            let w = display_width(&text);
+            if printed + w <= width {
+                queue!(out, SetForegroundColor(theme.gutter), Print(text))?;
+                printed += w;
+            }
+        }
+
         // The line's worst diagnostic, inline after the text (virtual text).
         let inline = last_row
             .then(|| {
@@ -455,16 +529,173 @@ fn render_window(
         }
         queue!(out, ResetColor)?;
 
+        // Indent guides, drawn over the blanks they stand in: on a line's
+        // first row, at each indent level its leading whitespace covers.
+        if sub_row == 0 && crate::config::indent_guides() {
+            let unit = tab_width().max(1);
+            let x0 = rx as usize + gutter;
+            let mut level = 0;
+            while level < indent_cols(doc, line_idx) {
+                let p = ls + position::display_col_to_char(line, level, tab_width());
+                let blank = p >= ls + line_len || matches!(doc.text.char(p), ' ' | '\t');
+                let covered = sels.iter().any(|&(f, t)| f <= p && p < t)
+                    || curs.contains(&p)
+                    || trail.is_some_and(|t| p - ls >= t);
+                if level >= view_col && level < view_col + width && blank && !covered {
+                    queue!(
+                        out,
+                        cursor::MoveTo((x0 + level - view_col) as u16, ry + row as u16),
+                        SetBackgroundColor(base_bg),
+                        SetForegroundColor(theme.gutter),
+                        Print("│"),
+                        ResetColor
+                    )?;
+                }
+                level += unit;
+            }
+        }
+
         row += 1;
         if last_row {
-            line_idx += 1;
+            line_idx = doc.next_line(line_idx);
             next_sub = 0;
         } else {
             next_sub = sub_row + 1;
         }
     }
 
+    // The sticky header: the first line of the scope the top of the window
+    // is inside, pinned over row 0 once it has scrolled off — unless the
+    // cursor is on that row and would vanish under it.
+    let top = doc.visible_line(view_line);
+    let header = crate::config::sticky_header()
+        .then(|| context_line(doc, top))
+        .flatten()
+        .filter(|_| !(focused && cursor_line == top && view_row == 0) && rh > 1);
+    if let Some(h) = header {
+        let text: String = doc
+            .line(h)
+            .chars()
+            .take(doc.line_len(h))
+            .map(|c| if c == '\t' { ' ' } else { c })
+            .collect();
+        let mut shown = String::new();
+        let mut w = 0;
+        for ch in text.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w + cw > width {
+                break;
+            }
+            shown.push(ch);
+            w += cw;
+        }
+        queue!(
+            out,
+            cursor::MoveTo(rx, ry),
+            SetBackgroundColor(theme.selection),
+            SetForegroundColor(theme.gutter),
+            Print(format!("{:>width$} ", h + 1, width = gutter - 1)),
+            SetForegroundColor(base_fg),
+            SetAttribute(Attribute::Underlined),
+            Print(&shown),
+            Print(" ".repeat(width - w)),
+            SetAttribute(Attribute::NoUnderline),
+            ResetColor
+        )?;
+    }
+
     Ok(())
+}
+
+/// The open buffers along the top of the text area, the current one lit.
+fn render_bufferline(editor: &Editor, out: &mut impl Write) -> std::io::Result<()> {
+    if !editor.show_bufferline() {
+        return Ok(());
+    }
+    let theme = crate::theme::current();
+    let base_bg = theme.bg.unwrap_or(Color::Reset);
+    let x0 = editor.tree_width();
+    let right = editor.size.0;
+    queue!(
+        out,
+        cursor::MoveTo(x0, 0),
+        SetBackgroundColor(base_bg),
+        Print(" ".repeat(right.saturating_sub(x0) as usize))
+    )?;
+    for (i, x, label) in editor.bufferline_tabs() {
+        let room = right.saturating_sub(x) as usize;
+        let label: String = label
+            .chars()
+            .scan(0, |w, c| {
+                *w += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                (*w <= room).then_some(c)
+            })
+            .collect();
+        let (bg, fg) = if i == editor.current {
+            (theme.selection, theme.fg.unwrap_or(Color::Reset))
+        } else {
+            (base_bg, theme.gutter)
+        };
+        queue!(
+            out,
+            cursor::MoveTo(x, 0),
+            SetBackgroundColor(bg),
+            SetForegroundColor(fg),
+            Print(label)
+        )?;
+    }
+    queue!(out, ResetColor)
+}
+
+/// How many display columns of indentation `line` sits at, for its guides.
+/// A blank line borrows the lesser indent of its neighbours, so the guides
+/// of a block run unbroken through a blank line inside it.
+fn indent_cols(doc: &crate::document::Document, line: usize) -> usize {
+    let own = |l: usize| -> Option<usize> {
+        let slice = doc.line(l);
+        let len = doc.line_len(l);
+        let lead = (0..len).find(|&i| !matches!(slice.char(i), ' ' | '\t'))?;
+        Some(position::char_to_display_col(slice, lead, tab_width()))
+    };
+    if let Some(cols) = own(line) {
+        return cols;
+    }
+    // ponytail: neighbours looked for within 64 lines; a longer blank run
+    // simply goes unguided.
+    let count = doc.line_count();
+    let below = (line + 1..count.min(line + 64)).find_map(own);
+    let above = (line.saturating_sub(64)..line).rev().find_map(own);
+    match (above, below) {
+        (Some(a), Some(b)) => a.min(b),
+        _ => 0,
+    }
+}
+
+/// The line that opens the innermost scope — function, type, `if`, loop… —
+/// that `line` sits inside of and that starts above it, from the syntax
+/// tree. Bare blocks and bodies are passed over, so the header is the line
+/// that says what the block is (Python's `if x:`, not its first statement).
+fn context_line(doc: &crate::document::Document, line: usize) -> Option<usize> {
+    let tree = doc.syntax.as_ref()?.tree.as_ref()?;
+    if line == 0 || line >= doc.text.len_lines() {
+        return None;
+    }
+    let byte = doc.text.line_to_byte(line);
+    let mut node = tree.root_node().descendant_for_byte_range(byte, byte)?;
+    loop {
+        let kind = node.kind();
+        let structural = kind.ends_with("block")
+            || kind.ends_with("body")
+            || kind.ends_with("_list")
+            || matches!(kind, "compound_statement" | "suite" | "statement_block");
+        let start = node.start_position().row;
+        let end = node.end_position();
+        let spans_line = end.row > line || (end.row == line && end.column > 0);
+        if node.parent().is_some() && start < line && spans_line && !structural {
+            return Some(start);
+        }
+        node = node.parent()?;
+    }
 }
 
 /// The markdown preview pane: rows of styled spans built by `markdown.rs`,
@@ -1900,6 +2131,71 @@ fn render_tree_prompt(editor: &Editor, out: &mut impl Write) -> std::io::Result<
 mod tests {
     use super::*;
     use ropey::Rope;
+
+    fn doc(path: &str, text: &str) -> crate::document::Document {
+        let mut d = crate::document::Document::empty();
+        d.text = Rope::from_str(text);
+        d.path = Some(path.into());
+        d.refresh_syntax();
+        d.settle_syntax();
+        d
+    }
+
+    #[test]
+    fn the_sticky_header_is_the_line_that_says_what_the_block_is() {
+        let rs = doc(
+            "a.rs",
+            "fn main() {\n    if x {\n        a();\n        b();\n    }\n}\n",
+        );
+        assert_eq!(context_line(&rs, 3), Some(1), "inside the if");
+        assert_eq!(
+            context_line(&rs, 1),
+            Some(0),
+            "the if itself is inside main"
+        );
+        assert_eq!(context_line(&rs, 0), None);
+        let py = doc("a.py", "def f():\n    if x:\n        a()\n        b()\n");
+        assert_eq!(
+            context_line(&py, 3),
+            Some(1),
+            "not the block's first statement"
+        );
+    }
+
+    #[test]
+    fn a_blank_line_takes_the_lesser_indent_of_its_neighbours() {
+        let d = doc("a.txt", "a\n        b\n\n    c\n");
+        assert_eq!(indent_cols(&d, 1), 8);
+        assert_eq!(indent_cols(&d, 2), 4);
+        assert_eq!(indent_cols(&d, 0), 0);
+    }
+
+    #[test]
+    fn guides_and_the_sticky_header_reach_the_screen() {
+        let body: String = (0..60).map(|i| format!("        x{i}();\n")).collect();
+        let mut editor = crate::editor::tests::editor_with(&format!("fn main() {{\n{body}}}\n"));
+        editor.doc_mut().path = Some("a.rs".into());
+        editor.doc_mut().refresh_syntax();
+        editor.doc_mut().settle_syntax();
+        let screen = |editor: &Editor| {
+            let mut out = Vec::new();
+            render(editor, &mut out).unwrap();
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        assert!(screen(&editor).contains('│'), "indent guides");
+        assert!(
+            !screen(&editor).contains("fn main() {\u{1b}"),
+            "no header at the top"
+        );
+        crate::editor::tests::press(&mut editor, "4 0 j");
+        editor.ensure_cursor_visible();
+        assert!(editor.doc().view_line > 1);
+        let shown = screen(&editor);
+        assert!(
+            shown.contains("fn main() {"),
+            "main is pinned once scrolled off"
+        );
+    }
 
     fn plain(line: RopeSlice, view_col: usize, width: usize) -> String {
         let len = position::line_len_without_newline(line);

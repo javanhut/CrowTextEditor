@@ -17,6 +17,12 @@ pub struct Config {
     pub tab_width: usize,
     pub scrolloff: usize,
     pub autoclose: bool,
+    pub smartcase: bool,
+    pub inlay_hints: bool,
+    pub indent_guides: bool,
+    pub sticky_header: bool,
+    pub bufferline: bool,
+    pub large_file_mb: usize,
     pub icons: bool,
     pub format_on_save: bool,
     pub show_hidden: bool,
@@ -56,6 +62,12 @@ impl Default for Config {
             tab_width: 4,
             scrolloff: 3,
             autoclose: true,
+            smartcase: true,
+            inlay_hints: true,
+            indent_guides: true,
+            sticky_header: true,
+            bufferline: true,
+            large_file_mb: 10,
             icons: true,
             format_on_save: true,
             show_hidden: false,
@@ -81,8 +93,20 @@ impl Default for Config {
 // caches them, so `apply` running a second time (`:config!`) is all a
 // reload needs for this half of the config.
 static TAB_WIDTH: AtomicUsize = AtomicUsize::new(4);
+thread_local! {
+    /// The buffer at hand's own tab width (from `.editorconfig`); 0 for
+    /// none. Per thread: the main loop's one thread edits and draws, and
+    /// tests running side by side must not see each other's buffers.
+    static BUFFER_TAB_WIDTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 static SCROLLOFF: AtomicUsize = AtomicUsize::new(3);
 static AUTOCLOSE: AtomicBool = AtomicBool::new(true);
+static SMARTCASE: AtomicBool = AtomicBool::new(true);
+static INLAY_HINTS: AtomicBool = AtomicBool::new(true);
+static INDENT_GUIDES: AtomicBool = AtomicBool::new(true);
+static STICKY_HEADER: AtomicBool = AtomicBool::new(true);
+static BUFFERLINE: AtomicBool = AtomicBool::new(true);
+static LARGE_FILE_MB: AtomicUsize = AtomicUsize::new(10);
 static ICONS: AtomicBool = AtomicBool::new(true);
 static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false);
 static FORMAT_ON_SAVE: AtomicBool = AtomicBool::new(true);
@@ -97,7 +121,19 @@ static AUTO_RELOAD: AtomicBool = AtomicBool::new(true);
 static VCS_GUTTER: AtomicBool = AtomicBool::new(true);
 
 pub fn tab_width() -> usize {
-    TAB_WIDTH.load(Ordering::Relaxed)
+    match BUFFER_TAB_WIDTH.get() {
+        0 => TAB_WIDTH.load(Ordering::Relaxed),
+        own => own,
+    }
+}
+
+/// Make `tab_width()` answer for one buffer: its `.editorconfig` width, or
+/// crow.toml's when it has none. Set before handling input for a buffer and
+/// before drawing each window, since every column computation reads it.
+// ponytail: a setting switched per buffer, not a width threaded through
+// position.rs; fine while one thread does all the editing and drawing.
+pub fn set_buffer_tab_width(width: Option<usize>) {
+    BUFFER_TAB_WIDTH.set(width.unwrap_or(0));
 }
 
 pub fn scrolloff() -> usize {
@@ -106,6 +142,32 @@ pub fn scrolloff() -> usize {
 
 pub fn autoclose() -> bool {
     AUTOCLOSE.load(Ordering::Relaxed)
+}
+
+pub fn smartcase() -> bool {
+    SMARTCASE.load(Ordering::Relaxed)
+}
+
+pub fn inlay_hints() -> bool {
+    INLAY_HINTS.load(Ordering::Relaxed)
+}
+
+pub fn indent_guides() -> bool {
+    INDENT_GUIDES.load(Ordering::Relaxed)
+}
+
+pub fn sticky_header() -> bool {
+    STICKY_HEADER.load(Ordering::Relaxed)
+}
+
+pub fn bufferline() -> bool {
+    BUFFERLINE.load(Ordering::Relaxed)
+}
+
+/// Files of this many bytes or more open without syntax, LSP, change
+/// markers, swap or undo files.
+pub fn large_file_bytes() -> u64 {
+    LARGE_FILE_MB.load(Ordering::Relaxed) as u64 * 1_000_000
 }
 
 pub fn icons() -> bool {
@@ -181,6 +243,12 @@ pub fn apply(config: &Config) -> bool {
     TAB_WIDTH.store(config.tab_width.clamp(1, 16), Ordering::Relaxed);
     SCROLLOFF.store(config.scrolloff.min(50), Ordering::Relaxed);
     AUTOCLOSE.store(config.autoclose, Ordering::Relaxed);
+    SMARTCASE.store(config.smartcase, Ordering::Relaxed);
+    INLAY_HINTS.store(config.inlay_hints, Ordering::Relaxed);
+    INDENT_GUIDES.store(config.indent_guides, Ordering::Relaxed);
+    STICKY_HEADER.store(config.sticky_header, Ordering::Relaxed);
+    BUFFERLINE.store(config.bufferline, Ordering::Relaxed);
+    LARGE_FILE_MB.store(config.large_file_mb.max(1), Ordering::Relaxed);
     ICONS.store(config.icons, Ordering::Relaxed);
     SHOW_HIDDEN.store(config.show_hidden, Ordering::Relaxed);
     FORMAT_ON_SAVE.store(config.format_on_save, Ordering::Relaxed);
@@ -764,6 +832,39 @@ pub fn record_recent(path: &Path) {
     let _ = std::fs::write(file, lines.join("\n"));
 }
 
+/// Lines entered at a prompt — `kind` is `command` for `:`, `search` for the
+/// pattern prompts — oldest first.
+pub fn history(kind: &str) -> Vec<String> {
+    std::fs::read_to_string(history_file(kind))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// Tests run in parallel threads of one process; each gets its own file,
+/// or one test's prompts would land in another's history mid-assertion.
+fn history_file(kind: &str) -> PathBuf {
+    if cfg!(test) {
+        return state_dir().join(format!("history-{kind}-{:?}", std::thread::current().id()));
+    }
+    state_dir().join(format!("history-{kind}"))
+}
+
+/// Append `line` to a prompt's history, dropping an earlier copy of it.
+pub fn record_history(kind: &str, line: &str) {
+    if line.is_empty() || line.contains('\n') {
+        return;
+    }
+    let mut lines = history(kind);
+    lines.retain(|l| l != line);
+    lines.push(line.to_string());
+    let excess = lines.len().saturating_sub(200);
+    let file = history_file(kind);
+    let _ = std::fs::create_dir_all(state_dir());
+    let _ = std::fs::write(file, lines[excess..].join("\n"));
+}
+
 const TEMPLATE: &str = r#"# crow.toml — crow's config. Everything here is optional;
 # delete a line and the default comes back.
 
@@ -773,6 +874,12 @@ theme = "tokyonight"     # tokyonight | gruvbox | mono | default (terminal color
 tab_width = 4
 scrolloff = 3
 autoclose = true         # type ( [ { " ' and the closer appears
+smartcase = true         # a search in lowercase ignores case; one capital makes it exact
+inlay_hints = true       # the language server's type hints, after the line they are about
+indent_guides = true     # a faint │ at each indent level
+sticky_header = true     # pin the function / if / loop you are scrolled inside to the top row
+bufferline = true        # list the open buffers along the top once there is more than one
+large_file_mb = 10       # bigger files open plain: no syntax, LSP, change markers or swap
 icons = true             # Nerd Font file icons in the tree (needs a Nerd Font)
 format_on_save = true    # pipe the buffer through its [fmt] formatter on :w
 show_hidden = false      # dotfiles, .git, and build dirs everywhere (toggle: . in the tree, :toggle_hidden)
@@ -859,6 +966,18 @@ fn parse(text: &str) -> Config {
                 "tab_width" => config.tab_width = value.parse().unwrap_or(config.tab_width),
                 "scrolloff" => config.scrolloff = value.parse().unwrap_or(config.scrolloff),
                 "autoclose" => config.autoclose = value.parse().unwrap_or(config.autoclose),
+                "smartcase" => config.smartcase = value.parse().unwrap_or(config.smartcase),
+                "inlay_hints" => config.inlay_hints = value.parse().unwrap_or(config.inlay_hints),
+                "indent_guides" => {
+                    config.indent_guides = value.parse().unwrap_or(config.indent_guides)
+                }
+                "sticky_header" => {
+                    config.sticky_header = value.parse().unwrap_or(config.sticky_header)
+                }
+                "bufferline" => config.bufferline = value.parse().unwrap_or(config.bufferline),
+                "large_file_mb" => {
+                    config.large_file_mb = value.parse().unwrap_or(config.large_file_mb)
+                }
                 "icons" => config.icons = value.parse().unwrap_or(config.icons),
                 "show_hidden" => config.show_hidden = value.parse().unwrap_or(config.show_hidden),
                 "format_on_save" => {

@@ -45,6 +45,30 @@ current selection if there is one, else the whole buffer — so interactive
 replace-all is just `s foo ⏎ c bar ⎋`, with every edit site visible before you
 type, and `s \d+ ⏎` puts a cursor on every number. A pattern that doesn't
 compile (yet) is searched literally, so the preview never breaks mid-keystroke.
+Case is smart: a pattern in lowercase ignores case, one capital makes it
+exact, and a replacement made ignoring case takes the case of what it
+replaces — `:%s/foo/bar/g` turns `Foo` into `Bar` and `FOO` into `BAR`. Up and
+Down at the `:` and `/` prompts recall earlier lines that start with what you
+have typed, across sessions.
+
+Replacing across the project is the same machinery again. `space g` greps
+the project, and `C-e` in its results opens every hit as a line of a
+`[refactor]` buffer — `src/main.rs:42: the line` — to edit with anything at
+all: `s`, multi-cursor, `:%s`. `:w` there writes each changed line back into
+its file, one undo step per file, and saves the files that had no unsaved
+work of their own. A line whose file has changed since is skipped, not
+clobbered.
+
+Folding comes off the syntax tree. `za` folds the function, block or other
+node the cursor is in (by indentation in files without a grammar), and again
+on the folded line opens it; `zR` opens them all. A fold is one line to `j`
+and `k`, says how many it hides, and opens itself when a search, a jump or an
+edit lands inside it.
+
+`C-a` / `C-x` add to and subtract from the number under or after the cursor
+— decimal with its leading zeros kept, `0x` hex, or the part of a
+`YYYY-MM-DD` date the cursor is on, with months and leap years done right.
+With a count, by that much; with cursors, at each.
 
 Syntax is a selection too. Tree-sitter parses Rust, TOML, JSON, Python,
 shell, and JavaScript (each further language is one grammar dependency and
@@ -81,6 +105,11 @@ drained in a burst before drawing, so holding a key or pasting costs one
 frame instead of one per keystroke, and the frame leaves as a single
 buffered write.
 
+Indent guides mark each level of indentation, and when the line that opens
+the function, `if` or loop you are scrolled inside has gone off the top, it
+stays pinned there. With more than one buffer open, they are listed along
+the top — the current one lit, unsaved ones marked `●`, a click switches.
+
 Long lines soft-wrap by default, at word boundaries, with the gutter left
 blank on continuation rows — a paragraph-per-line markdown file reads as
 prose instead of scrolling sideways. `:wrap` turns it off. Trailing
@@ -108,8 +137,10 @@ Change markers come from ivaldi, not git. `ivaldi whodidit` gives the file as
 the last seal has it; crow diffs the buffer against that and marks the gutter —
 green for added lines, blue for changed, red where sealed lines were removed —
 with `]g` / `[g` jumping between the changes and the status line counting them
-(`+12 ~3 -1`). The lookup runs in a background thread and the diff runs when
-typing pauses, so neither is ever in the way of a keystroke.
+(`+12 ~3 -1`). `space h` shows what the change under the cursor replaced:
+the sealed lines and the lines now there, as a diff. The lookup runs in a
+background thread and the diff runs when typing pauses, so neither is ever
+in the way of a keystroke.
 
 Your work survives the machine. Unsaved buffers are written aside every couple
 of seconds, and the next time you open that file crow says so: `:recover`
@@ -117,6 +148,18 @@ brings the text back as an undoable edit, `:recover!` throws the swap file
 away. Undo history is saved on write and loaded when you reopen the file, so
 `u` still reaches yesterday's edits — but only when the file on disk is still
 the text the history was recorded against. Both are `crow.toml` options.
+Writes go to a temporary file beside the original, synced and then renamed
+over it, so a full disk or a crash mid-write leaves the old file whole; a
+symlink stays a symlink and the file keeps its permissions. Windows line
+endings are read as `\n` — columns and motions never see a `\r` — and written
+back as `\r\n`.
+
+A project's `.editorconfig` wins over crow.toml for its files: indent style
+and size, tab width, trailing-whitespace trimming, a final newline, and the
+line endings of new files. Files bigger than `large_file_mb` (10 by default)
+open as plain text — no syntax, language server, change markers or swap
+file — so a log file of a few hundred megabytes opens and scrolls like any
+other.
 
 Files that change underneath you are noticed. An unmodified buffer whose file
 changed on disk reloads itself as one undoable edit that leaves your cursor
@@ -143,6 +186,12 @@ suggestion beside it and `gl` opens it in full (for Rust, the compiler's own
 output with its `help:` rewrites), signature help pops up as
 you type a call's arguments with the parameter you are on picked out, and
 `:fmt` falls back to the server when crow knows no formatter for the file.
+Completions that come as snippets expand: the first placeholder is selected
+(with a cursor on every copy of it), typing replaces it, and Tab moves to the
+next. Inlay hints show after the line they are about — `x: i32` — and
+semantic tokens paint over tree-sitter's colors where the server knows more
+than the grammar: that a capitalised word is a type, a call is a macro, a
+name is a constant.
 Checks a server only runs on save — rust-analyzer's `cargo check`, where the
 borrow checker lives — need a `:w`; set `autosave = 1000` in crow.toml and crow
 writes the buffer a second after you stop typing instead (as typed: no
@@ -162,6 +211,12 @@ tab_width = 4
 scrolloff = 3
 soft_wrap = true             # wrap long lines instead of scrolling sideways
 strip_trailing_whitespace = true
+smartcase = true             # lowercase searches ignore case
+inlay_hints = true           # type hints after the line
+indent_guides = true
+sticky_header = true         # pin the scope you are scrolled inside to the top
+bufferline = true            # list the buffers along the top when there are several
+large_file_mb = 10           # bigger files open as plain text
 shell = "zsh"                # what space t runs; default $SHELL
 
 [lsp]                        # file extension = server command
@@ -233,6 +288,11 @@ an emoji ZWJ sequence or a combining stack.
 | `space a` `space R`                | code actions for the selection, rename the symbol everywhere (LSP) |
 | `space s s` `space S` `space x`    | symbols in this buffer, symbols across the project, every diagnostic |
 | _(the mouse)_                      | click to place the cursor, drag to select, wheel to scroll, click the tree or the shell to focus it |                                                                                                                                                                                                               |
+| `za` `zR`                          | fold the block at the cursor or open the fold on this line; open every fold |
+| `C-a` `C-x`                        | add to / subtract from the number or date at or after the cursor (`5 C-a`) |
+| `space h`                          | show what the change on this line replaced since the last ivaldi seal |
+| `C-e` _(in `space g`)_             | open every grep hit in an editable `[refactor]` buffer; `:w` writes the edits back |
+| `Up` `Down` _(at `:` or `/`)_      | earlier lines from the prompt's history that start with what you typed |
 | `gc`                               | comment or uncomment the selected lines                                                                                                                                                                                                     |
 | `ms` _(then a character)_          | surround the selection with it — `ms(`, `ms"`, `ms*`                                                                                                                                                                                       |
 | `space m` `:md`                    | live markdown preview beside the buffer                                                                                                                                                                                                     |
@@ -259,6 +319,7 @@ document.rs      rope buffer, cursor, undo history, swap and file I/O
 keymap.rs        keys, and the trie mapping sequences to commands
 commands.rs      every action, as a named static value
 textobj.rs       the ranges mi/ma select
+editorconfig.rs  .editorconfig lookup and glob matching
 vcs.rs           ivaldi's sealed text, and the diff behind the gutter marks
 editor.rs        state, key dispatch, ex commands, scrolling
 editor/          one file per area of that state:
@@ -275,6 +336,7 @@ editor/          one file per area of that state:
   picker_keys.rs   the popup picker's keys
   terminal_split.rs  the shell window
   tools.rs         background installs and dependency versions
+  refactor.rs      grep hits as an editable buffer, written back on :w
 markdown.rs      markdown -> styled rows, for the preview pane
 vt.rs            terminal emulator: pty bytes -> a grid of styled cells
 terminal.rs      the shell process on its pty, and the keys sent to it
@@ -320,14 +382,13 @@ command needed rewriting to become multi-cursor aware.
 
 Roughly in the order worth doing them:
 
-1. **Whole-project search and replace** — `space g` finds the matches; taking
-   an edit across every file they are in needs the picker to hand its results
-   to the multi-cursor machinery rather than to a jump.
-2. **A diff view** — the gutter says a line changed; it can't yet show what it
-   changed from. The sealed text is already in memory for the markers.
-3. **Inlay hints and semantic tokens** — the two LSP features left. Both are
-   virtual text, which the diagnostics already prove out.
-4. **More grammars and themes** — a grammar is one dependency and one arm in
+1. **Inline inlay hints** — they show at the end of their line, because a
+   hint inside it would move every column after it away from where
+   `position.rs` puts the cursor. Inline needs that module to learn about
+   virtual text.
+2. **Snippets at every cursor** — a snippet completion expands at the primary
+   cursor only, and `.` replays its text without the tab stops.
+3. **More grammars and themes** — a grammar is one dependency and one arm in
    `syntax::config_for`; a theme is one entry in `theme::THEMES`. The config
    parser is a deliberate TOML subset; swap in the `toml` crate if it ever
    needs arrays or nesting.
@@ -345,7 +406,11 @@ count parsing, the sticky goal column, soft-wrap break points and the row
 arithmetic that scrolling depends on, that markdown's markup is consumed rather
 than shown, what `.` decides to repeat, the text-object finders, the line diff
 behind the gutter marks, applying a workspace edit to a file that isn't open,
-and that a file changed on disk reloads without losing the cursor.
+that a file changed on disk reloads without losing the cursor, atomic and
+CRLF-preserving saves, snippet expansion, folds, the refactor buffer's
+write-back, `.editorconfig` globs, and the decoding of inlay hints and
+semantic tokens (`lsp::tests::decorations_arrive_from_rust_analyzer`, among
+the ignored tests, checks those against a real rust-analyzer).
 
 ```
 cargo test --release -- --ignored    # the benchmarks

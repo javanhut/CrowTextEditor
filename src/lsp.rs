@@ -116,12 +116,20 @@ pub enum Event {
     /// TextEdits formatting the document the request was made for.
     Formatting(Vec<Value>),
     Diagnostics(PathBuf, Vec<Diagnostic>),
-    /// Completion candidates as (label, insert text, docs), and whether they
-    /// answer the ambient request made while an identifier was being typed
-    /// rather than one the user asked for.
-    Completions(Vec<(String, String, String)>, bool),
+    /// Completion candidates as (label, insert text, docs, whether the text
+    /// is snippet syntax), and whether they answer the ambient request made
+    /// while an identifier was being typed rather than one the user asked for.
+    Completions(Vec<(String, String, String, bool)>, bool),
     /// `completionItem/resolve` came back: (label, signature + docs).
     CompletionResolved(String, String),
+    /// Inlay hints for the requested document, as (line, UTF-16 column,
+    /// label), parameter-name hints left out.
+    InlayHints(Vec<(usize, usize, String)>),
+    /// Semantic tokens for the requested document, as (line, UTF-16 start,
+    /// UTF-16 length, highlight group); tokens with no group are left out.
+    SemanticTokens(Vec<(usize, usize, usize, u8)>),
+    /// The server's hints or tokens are out of date: ask again.
+    RefreshDecorations,
     Status(String),
 }
 
@@ -154,6 +162,11 @@ pub struct Client {
     sync_kind: u64,
     /// The server can format documents itself.
     formatting: bool,
+    /// The server answers `textDocument/inlayHint`.
+    inlay_hints: bool,
+    /// The highlight group of each semantic token type the server named in
+    /// its legend; empty when it has no full-document semantic tokens.
+    token_groups: Vec<u8>,
     dead: bool,
 }
 
@@ -207,6 +220,8 @@ impl Client {
             signature_triggers: Vec::new(),
             sync_kind: 1,
             formatting: false,
+            inlay_hints: false,
+            token_groups: Vec::new(),
             dead: false,
         };
         client.send_request(
@@ -226,10 +241,18 @@ impl Client {
                         "publishDiagnostics": {},
                         "hover": { "contentFormat": ["plaintext", "markdown"] },
                         "completion": { "completionItem": {
+                            "snippetSupport": true,
                             "documentationFormat": ["plaintext", "markdown"],
                             "resolveSupport": { "properties": ["documentation", "detail"] }
                         }},
                         "references": {},
+                        "inlayHint": {},
+                        "semanticTokens": {
+                            "requests": { "full": true },
+                            "tokenTypes": SEMANTIC_TYPES,
+                            "tokenModifiers": [],
+                            "formats": ["relative"]
+                        },
                         "rename": {},
                         "formatting": {},
                         "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
@@ -382,6 +405,34 @@ impl Client {
         self.formatting
     }
 
+    /// The server can send inlay hints, or semantic tokens. Only known once
+    /// the handshake is done.
+    pub fn can_decorate(&self) -> bool {
+        self.ready && (self.inlay_hints || !self.token_groups.is_empty())
+    }
+
+    /// Ask for the inlay hints and semantic tokens of a whole document, as
+    /// far as the server offers each; they arrive as events.
+    pub fn request_decorations(&mut self, path: &Path, lines: usize) {
+        let doc = json!({"uri": uri_from_path(path)});
+        if self.inlay_hints {
+            let range = json!({"start": {"line": 0, "character": 0},
+                               "end": {"line": lines, "character": 0}});
+            self.send_request(
+                "textDocument/inlayHint",
+                json!({"textDocument": doc, "range": range}),
+                "inlay_hints",
+            );
+        }
+        if !self.token_groups.is_empty() {
+            self.send_request(
+                "textDocument/semanticTokens/full",
+                json!({"textDocument": doc}),
+                "semantic_tokens",
+            );
+        }
+    }
+
     /// A request at a cursor position; `tag` is "definition" or "hover".
     pub fn request_position(
         &mut self,
@@ -470,6 +521,12 @@ impl Client {
             // A request from the server: answer with an empty default so the
             // server never stalls waiting on us.
             (Some(m), Some(id)) => {
+                if matches!(
+                    m,
+                    "workspace/inlayHint/refresh" | "workspace/semanticTokens/refresh"
+                ) {
+                    events.push(Event::RefreshDecorations);
+                }
                 if m == "workspace/applyEdit" {
                     events.push(Event::ApplyEdit(msg["params"]["edit"].clone()));
                     self.write(&json!({"jsonrpc": "2.0", "id": id, "result": {"applied": true}}));
@@ -507,7 +564,12 @@ impl Client {
                     // Ambient requests fail quietly; ones the user asked for say why.
                     if !matches!(
                         tag,
-                        "completion_typed" | "resolve" | "signature" | "shutdown"
+                        "completion_typed"
+                            | "resolve"
+                            | "signature"
+                            | "shutdown"
+                            | "inlay_hints"
+                            | "semantic_tokens"
                     ) {
                         let text = err["message"].as_str().unwrap_or("request failed");
                         events.push(Event::Status(format!("{tag}: {text}")));
@@ -537,11 +599,25 @@ impl Client {
                             Value::Number(n) => n.as_u64().unwrap_or(1),
                             v => v["change"].as_u64().unwrap_or(1),
                         };
-                        self.formatting = match &caps["documentFormattingProvider"] {
+                        let offered = |v: &Value| match v {
                             Value::Bool(b) => *b,
                             Value::Object(_) => true,
                             _ => false,
                         };
+                        self.formatting = offered(&caps["documentFormattingProvider"]);
+                        self.inlay_hints = offered(&caps["inlayHintProvider"]);
+                        let tokens = &caps["semanticTokensProvider"];
+                        if offered(&tokens["full"]) {
+                            self.token_groups = tokens["legend"]["tokenTypes"]
+                                .as_array()
+                                .map(|types| {
+                                    types
+                                        .iter()
+                                        .map(|t| semantic_group(t.as_str().unwrap_or("")))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                        }
                         self.write(
                             &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
                         );
@@ -593,12 +669,110 @@ impl Client {
                     "formatting" => events.push(Event::Formatting(
                         result.as_array().cloned().unwrap_or_default(),
                     )),
+                    "inlay_hints" => events.push(Event::InlayHints(parse_inlay_hints(result))),
+                    "semantic_tokens" => events.push(Event::SemanticTokens(decode_tokens(
+                        result["data"]
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        &self.token_groups,
+                    ))),
                     _ => {}
                 }
             }
             (None, None) => {}
         }
     }
+}
+
+/// The semantic token types crow asks for: the standard set.
+const SEMANTIC_TYPES: &[&str] = &[
+    "namespace",
+    "type",
+    "class",
+    "enum",
+    "interface",
+    "struct",
+    "typeParameter",
+    "parameter",
+    "variable",
+    "property",
+    "enumMember",
+    "event",
+    "function",
+    "method",
+    "macro",
+    "keyword",
+    "modifier",
+    "comment",
+    "string",
+    "number",
+    "regexp",
+    "operator",
+    "decorator",
+];
+
+/// The highlight group (see `syntax::group_of`) a semantic token type
+/// paints, or 0 to leave tree-sitter's color alone. Only names that tell
+/// more than the grammar can are mapped — what a capitalised word is, that
+/// an identifier is a macro or a constant; keywords, strings, comments and
+/// plain variables stay tree-sitter's.
+fn semantic_group(token_type: &str) -> u8 {
+    match token_type {
+        "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" | "typeAlias"
+        | "builtinType" | "property" => 5,
+        "function" | "method" => 4,
+        "macro" | "decorator" | "attribute" | "derive" => 7,
+        "enumMember" | "constant" => 6,
+        _ => 0,
+    }
+}
+
+/// `semanticTokens/full`'s data — five numbers per token, its line and start
+/// relative to the token before — as absolute (line, start, length, group).
+fn decode_tokens(data: &[Value], groups: &[u8]) -> Vec<(usize, usize, usize, u8)> {
+    let nums: Vec<usize> = data
+        .iter()
+        .map(|v| v.as_u64().unwrap_or(0) as usize)
+        .collect();
+    let (mut line, mut start) = (0, 0);
+    let mut out = Vec::new();
+    for t in nums.as_chunks::<5>().0 {
+        if t[0] > 0 {
+            line += t[0];
+            start = t[1];
+        } else {
+            start += t[1];
+        }
+        let group = groups.get(t[3]).copied().unwrap_or(0);
+        if group != 0 {
+            out.push((line, start, t[2], group));
+        }
+    }
+    out
+}
+
+/// InlayHint[] as (line, UTF-16 column, label). Parameter-name hints (kind
+/// 2) are dropped: shown at the end of the line they would only list names.
+fn parse_inlay_hints(result: &Value) -> Vec<(usize, usize, String)> {
+    result
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|h| h["kind"].as_u64() != Some(2))
+        .filter_map(|h| {
+            let label = match &h["label"] {
+                Value::String(s) => s.clone(),
+                Value::Array(parts) => parts.iter().filter_map(|p| p["value"].as_str()).collect(),
+                _ => return None,
+            };
+            Some((
+                h["position"]["line"].as_u64()? as usize,
+                h["position"]["character"].as_u64()? as usize,
+                label.trim().to_string(),
+            ))
+        })
+        .collect()
 }
 
 fn parse_diagnostic(v: &Value) -> Option<Diagnostic> {
@@ -782,8 +956,9 @@ fn parse_location(result: &Value) -> Option<(PathBuf, usize, usize)> {
 }
 
 /// CompletionItem[] or CompletionList; text preference is
-/// textEdit.newText > insertText > label, with snippet placeholders stripped.
-fn parse_completions(result: &Value) -> Vec<(String, String, String)> {
+/// textEdit.newText > insertText > label. Snippet text (insertTextFormat 2)
+/// is passed through as such and flagged; `parse_snippet` expands it.
+fn parse_completions(result: &Value) -> Vec<(String, String, String, bool)> {
     let items = result
         .get("items")
         .and_then(Value::as_array)
@@ -798,10 +973,10 @@ fn parse_completions(result: &Value) -> Vec<(String, String, String)> {
             let label = item["label"].as_str()?.trim().to_string();
             let text = item["textEdit"]["newText"]
                 .as_str()
-                .or_else(|| item["insertText"].as_str())
-                .map(strip_snippet)
-                .unwrap_or_else(|| label.clone());
-            Some((label, text, item_info(item)))
+                .or_else(|| item["insertText"].as_str());
+            let snippet = text.is_some() && item["insertTextFormat"].as_u64() == Some(2);
+            let text = text.map_or_else(|| label.clone(), str::to_string);
+            Some((label, text, item_info(item), snippet))
         })
         .collect()
 }
@@ -836,38 +1011,103 @@ fn item_info(item: &Value) -> String {
     }
 }
 
-/// Drop `$0` / `${1:placeholder}` snippet syntax from an insert text.
-fn strip_snippet(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '$' {
-            out.push(c);
-            continue;
+/// An LSP snippet's text with the syntax gone, and its tab stops as
+/// (number, start, end) char ranges of that text. `${1:x}` leaves `x` and a
+/// stop over it, `${1|a,b|}` its first choice, `$1` an empty stop; variables
+/// (`$TM_FILENAME`, `${NAME:default}`) resolve to their default or nothing.
+pub fn parse_snippet(text: &str) -> (String, Vec<(u32, usize, usize)>) {
+    let chars: Vec<char> = text.chars().collect();
+    let (mut out, mut stops, mut i) = (Vec::new(), Vec::new(), 0);
+    snippet_body(&chars, &mut i, false, &mut out, &mut stops);
+    (out.into_iter().collect(), stops)
+}
+
+/// Expand snippet text from `c[*i]` into `out`, up to the `}` closing it
+/// when `nested`.
+fn snippet_body(
+    c: &[char],
+    i: &mut usize,
+    nested: bool,
+    out: &mut Vec<char>,
+    stops: &mut Vec<(u32, usize, usize)>,
+) {
+    let number = |i: &mut usize| {
+        let from = *i;
+        while c.get(*i).is_some_and(char::is_ascii_digit) {
+            *i += 1;
         }
-        match chars.peek() {
-            Some('{') => {
-                // ${n:placeholder} — keep the placeholder text, drop the rest.
-                let mut inner = String::new();
-                for c in chars.by_ref() {
-                    if c == '}' {
-                        break;
+        c[from..*i].iter().collect::<String>().parse::<u32>().ok()
+    };
+    let name = |i: &mut usize| {
+        let from = *i;
+        while c
+            .get(*i)
+            .is_some_and(|ch| ch.is_alphanumeric() || *ch == '_')
+        {
+            *i += 1;
+        }
+        *i > from
+    };
+    while let Some(&ch) = c.get(*i) {
+        *i += 1;
+        match ch {
+            '}' if nested => return,
+            '\\' if matches!(c.get(*i), Some('$' | '}' | '\\')) => {
+                out.push(c[*i]);
+                *i += 1;
+            }
+            '$' if c.get(*i) == Some(&'{') => {
+                *i += 1;
+                let start = out.len();
+                let n = number(i);
+                if n.is_none() {
+                    name(i);
+                }
+                match c.get(*i) {
+                    Some(':') => {
+                        *i += 1;
+                        snippet_body(c, i, true, out, stops);
                     }
-                    inner.push(c);
+                    Some('|') => {
+                        // A choice: the first option stands.
+                        *i += 1;
+                        let mut first = true;
+                        while let Some(&ch) = c.get(*i) {
+                            *i += 1;
+                            match ch {
+                                '|' => break,
+                                ',' => first = false,
+                                '\\' if first && *i < c.len() => {
+                                    out.push(c[*i]);
+                                    *i += 1;
+                                }
+                                _ if first => out.push(ch),
+                                _ => {}
+                            }
+                        }
+                        *i += 1; // the `}`
+                    }
+                    _ => {
+                        while c.get(*i).is_some_and(|&ch| ch != '}') {
+                            *i += 1;
+                        }
+                        *i += 1;
+                    }
                 }
-                if let Some((_, placeholder)) = inner.split_once(':') {
-                    out.push_str(placeholder);
+                if let Some(n) = n {
+                    stops.push((n, start, out.len()));
                 }
             }
-            Some(c) if c.is_ascii_digit() => {
-                while chars.peek().is_some_and(char::is_ascii_digit) {
-                    chars.next();
+            '$' => {
+                if let Some(n) = number(i) {
+                    stops.push((n, out.len(), out.len()));
+                } else if !name(i) {
+                    out.push('$');
                 }
             }
-            _ => out.push('$'),
+            _ => out.push(ch),
         }
     }
-    out
 }
 
 /// The full hover text out of the various shapes hover contents can take:
@@ -989,6 +1229,53 @@ pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn semantic_tokens_decode_relative_positions() {
+        // Legend: 0 = variable (left alone), 1 = function, 2 = struct.
+        let groups = [0, 4, 5];
+        let data: Vec<Value> = [0, 3, 4, 1, 0, 0, 5, 1, 0, 0, 2, 4, 6, 2, 0]
+            .iter()
+            .map(|&n| json!(n))
+            .collect();
+        assert_eq!(
+            decode_tokens(&data, &groups),
+            vec![(0, 3, 4, 4), (2, 4, 6, 5)],
+            "same-line starts add up, a new line resets; ungrouped tokens drop"
+        );
+    }
+
+    #[test]
+    fn inlay_hints_keep_types_and_drop_parameter_names() {
+        let result = json!([
+            {"position": {"line": 1, "character": 5}, "label": ": i32", "kind": 1},
+            {"position": {"line": 2, "character": 9}, "label": "count:", "kind": 2},
+            {"position": {"line": 3, "character": 0},
+             "label": [{"value": ": Vec<"}, {"value": "u8"}, {"value": ">"}]}
+        ]);
+        assert_eq!(
+            parse_inlay_hints(&result),
+            vec![(1, 5, ": i32".into()), (3, 0, ": Vec<u8>".into())]
+        );
+    }
+
+    #[test]
+    fn snippets_expand_to_text_and_stops() {
+        assert_eq!(parse_snippet("plain"), ("plain".into(), vec![]));
+        assert_eq!(
+            parse_snippet("f(${1:a}, $2)$0"),
+            ("f(a, )".into(), vec![(1, 2, 3), (2, 5, 5), (0, 6, 6)])
+        );
+        assert_eq!(
+            parse_snippet("${1:outer ${2:in}}"),
+            ("outer in".into(), vec![(2, 6, 8), (1, 0, 8)])
+        );
+        assert_eq!(parse_snippet("${1|one,two|}").0, "one");
+        assert_eq!(
+            parse_snippet("\\$x $TM_FILENAME ${NAME:dflt} $ ").0,
+            "$x  dflt $ "
+        );
+    }
+
     /// What rust-analyzer really sends for rustc's E0106: the suggestions
     /// ride in `relatedInformation`, the compiler's rendering in `data`.
     #[test]
@@ -1073,6 +1360,62 @@ mod tests {
         client.shutdown();
     }
 
+    /// rust-analyzer answers both decoration requests in the shapes the
+    /// parsers expect. It may need a refresh once indexing is done, so the
+    /// request is repeated until both answers have content.
+    #[test]
+    #[ignore] // needs rust-analyzer and cargo on PATH; run with `cargo test -- --ignored`
+    fn decorations_arrive_from_rust_analyzer() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("crow-decor-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let file = dir.join("src/main.rs");
+        let src = "struct Point;\nfn main() {\n    let n = 1 + 2;\n    let p = Point;\n}\n";
+        std::fs::write(&file, src).unwrap();
+        let Some(mut client) = Client::spawn(&dir, "rust-analyzer") else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline && !client.ready {
+            let _ = client.poll();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            client.can_decorate(),
+            "rust-analyzer offers hints or tokens"
+        );
+        client.did_open(&file, src.to_string(), 0);
+        let (mut hints, mut tokens) = (Vec::new(), Vec::new());
+        let mut asked = Instant::now() - Duration::from_secs(10);
+        while Instant::now() < deadline && (hints.is_empty() || tokens.is_empty()) {
+            if asked.elapsed() > Duration::from_secs(2) {
+                client.request_decorations(&file, 5);
+                asked = Instant::now();
+            }
+            for event in client.poll() {
+                match event {
+                    Event::InlayHints(h) if !h.is_empty() => hints = h,
+                    Event::SemanticTokens(t) if !t.is_empty() => tokens = t,
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        client.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            hints.iter().any(|h| h.0 == 2 && h.2.contains("i32")),
+            "{hints:?}"
+        );
+        // `Point` on line 3 is a struct: group 5.
+        assert!(tokens.iter().any(|t| t.0 == 3 && t.3 == 5), "{tokens:?}");
+    }
+
     /// The Oxigen round trip: handshake, the `<` trigger the type list hangs
     /// off, and completions parsed back out of the response.
     #[test]
@@ -1114,7 +1457,7 @@ mod tests {
         client.shutdown();
         let items = items.expect("no completions arrived");
         assert!(
-            items.iter().any(|(label, _, _)| label == "int"),
+            items.iter().any(|(label, ..)| label == "int"),
             "the type list should be offered after `<`: {items:?}"
         );
     }

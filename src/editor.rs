@@ -18,6 +18,7 @@ mod lsp_glue;
 mod mouse;
 mod objects;
 mod picker_keys;
+pub(crate) mod refactor;
 mod repeat;
 pub(crate) mod selections;
 mod terminal_split;
@@ -98,6 +99,8 @@ pub struct Completion {
     pub navigated: bool,
     /// Signature + docs per label, for the side panel (LSP menus only).
     pub docs: std::collections::HashMap<String, String>,
+    /// Labels whose insert text is LSP snippet syntax.
+    pub snippets: std::collections::HashSet<String>,
 }
 
 /// The live markdown preview: the window showing it and the rows currently
@@ -395,6 +398,7 @@ impl Default for Keymaps {
         normal.bind_str("[d", "prev_diagnostic");
         normal.bind_str("]g", "next_change");
         normal.bind_str("[g", "prev_change");
+        normal.bind_str("<space> h", "show_change");
 
         // windows, buffers, files, lifecycle
         normal.bind_str("C-w v", "split_vertical");
@@ -439,6 +443,10 @@ impl Default for Keymaps {
         normal.bind_str("<space> T", "theme_picker");
         normal.bind_str("<space> m", "markdown_preview");
         normal.bind_str("gc", "toggle_comment");
+        normal.bind_str("C-a", "increment");
+        normal.bind_str("C-x", "decrement");
+        normal.bind_str("za", "toggle_fold");
+        normal.bind_str("zR", "unfold_all");
         normal.bind_str("ms", "surround");
         normal.bind_str("<space> s v", "split_vertical");
         normal.bind_str("<space> s h", "split_horizontal");
@@ -590,6 +598,12 @@ pub struct Editor {
     pub help_scroll: Option<usize>,
     /// Highlighted row of the `:` suggestion dropdown; None until Tab/arrows.
     pub command_suggest: Option<usize>,
+    /// Up/Down at a prompt is walking its history: the entry shown, and what
+    /// had been typed before the walk began (entries must start with it).
+    history_browse: Option<(usize, String)>,
+    /// The buffer and revision inlay hints and semantic tokens were last
+    /// requested for (see `lsp_glue::request_decorations`).
+    decorations_for: Option<(PathBuf, u64)>,
     /// Started with no files: the empty buffer shows the splash screen.
     pub splash: bool,
     /// The file tree sidebar, when visible.
@@ -756,6 +770,8 @@ impl Editor {
             completion: None,
             help_scroll: None,
             command_suggest: None,
+            history_browse: None,
+            decorations_for: None,
             splash,
             tree: None,
             tree_focused: false,
@@ -833,11 +849,12 @@ impl Editor {
     #[allow(clippy::type_complexity)]
     pub fn window_rects(&self) -> (Vec<(usize, Rect)>, Vec<(Rect, bool)>) {
         let tree_w = self.tree_width();
+        let top = u16::from(self.show_bufferline());
         let area = (
             tree_w,
-            0,
+            top,
             self.size.0.saturating_sub(tree_w),
-            self.size.1.saturating_sub(2),
+            self.size.1.saturating_sub(2 + top),
         );
         let mut wins = Vec::new();
         let mut seps = Vec::new();
@@ -866,10 +883,60 @@ impl Editor {
 
     pub fn focused_rect(&self) -> Rect {
         let (wins, _) = self.window_rects();
+        let top = u16::from(self.show_bufferline());
         wins.iter()
             .find(|(id, _)| *id == self.focused)
             .map(|&(_, r)| r)
-            .unwrap_or((0, 0, self.size.0, self.size.1.saturating_sub(2)))
+            .unwrap_or((0, top, self.size.0, self.size.1.saturating_sub(2 + top)))
+    }
+
+    /// The buffer line takes the top row once there is more than one buffer.
+    pub fn show_bufferline(&self) -> bool {
+        crate::config::bufferline() && self.documents.len() > 1
+    }
+
+    /// The buffer line's tabs: (buffer index, first column, label), as many
+    /// as fit, starting far enough along that the current buffer's is shown.
+    /// Names two buffers share get their directory in front.
+    pub fn bufferline_tabs(&self) -> Vec<(usize, u16, String)> {
+        let names: Vec<String> = self.documents.iter().map(Document::name).collect();
+        let labels: Vec<String> = self
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(i, doc)| {
+                let name = &names[i];
+                let shared = names.iter().filter(|n| *n == name).count() > 1;
+                let dir = doc
+                    .path
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .and_then(Path::file_name)
+                    .filter(|_| shared)
+                    .map(|d| format!("{}/", d.to_string_lossy()))
+                    .unwrap_or_default();
+                let dirty = if doc.modified { " ●" } else { "" };
+                format!(" {dir}{name}{dirty} ")
+            })
+            .collect();
+        let width = |l: &String| unicode_width::UnicodeWidthStr::width(l.as_str());
+        let avail = self.size.0.saturating_sub(self.tree_width()) as usize;
+        let mut first = self.current.min(labels.len().saturating_sub(1));
+        let mut used = labels.get(first).map_or(0, width);
+        while first > 0 && used + width(&labels[first - 1]) <= avail {
+            first -= 1;
+            used += width(&labels[first]);
+        }
+        let mut x = self.tree_width() as usize;
+        let mut tabs = Vec::new();
+        for (i, label) in labels.into_iter().enumerate().skip(first) {
+            if x + width(&label) > self.tree_width() as usize + avail && i != self.current {
+                break;
+            }
+            tabs.push((i, x as u16, label.clone()));
+            x += width(&label);
+        }
+        tabs
     }
 
     /// Stash the live view state into the focused window before focus moves.
@@ -1120,6 +1187,8 @@ impl Editor {
         if self.mode == Mode::Insert && mode != Mode::Insert {
             self.signature = None;
             let doc = self.doc_mut();
+            doc.snippet.clear();
+            doc.placeholder = false;
             // A typing burst becomes one undo step.
             doc.commit_undo_group();
             // vi convention: the cursor steps back off the insertion point.
@@ -1146,7 +1215,14 @@ impl Editor {
 
     /// One keypress: handled, and recorded for `.` and any macro being
     /// recorded — unless it is itself part of a replay.
+    /// Point the tab width at the current buffer's own (see
+    /// `config::set_buffer_tab_width`).
+    pub fn use_buffer_settings(&self) {
+        crate::config::set_buffer_tab_width(self.doc().editorconfig.width());
+    }
+
     pub fn handle_key(&mut self, key: Key) {
+        self.use_buffer_settings();
         let recording = !self.replaying;
         if recording {
             self.record(Input::Key(key));
@@ -1345,7 +1421,8 @@ impl Editor {
                 // A motion in block mode moves the rectangle's corner, alone;
                 // anything else is what the block was built for, and runs on
                 // its selections like on any others.
-                let stretching = self.block.is_some() && commands::BLOCK_MOTIONS.contains(&command.name);
+                let stretching =
+                    self.block.is_some() && commands::BLOCK_MOTIONS.contains(&command.name);
                 if stretching {
                     self.block_to_corner();
                 } else if command.name != "block_mode" && self.block.take().is_some() {
@@ -1483,7 +1560,17 @@ impl Editor {
     }
 
     fn handle_command_key(&mut self, key: Key) {
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.history_browse = None;
+        }
+        // Up/Down move through the suggestions while there are some to move
+        // through; on an empty line, or once a walk has begun, through history.
+        let browsing = self.history_browse.is_some() || self.command_suggestions().is_empty();
         match key.code {
+            KeyCode::Up | KeyCode::Down if browsing => {
+                self.command_suggest = None;
+                self.browse_history(key.code == KeyCode::Up);
+            }
             KeyCode::Esc => {
                 self.command_line.clear();
                 self.command_suggest = None;
@@ -1496,6 +1583,7 @@ impl Editor {
                 self.command_suggest = None;
                 let line = std::mem::take(&mut self.command_line);
                 self.mode = Mode::Normal;
+                crate::config::record_history("command", line.trim());
                 self.execute_command(&line);
             }
             // First Tab highlights the top suggestion, a second Tab puts it
@@ -1591,8 +1679,45 @@ impl Editor {
 
     // ---- search ------------------------------------------------------------
 
+    /// Recall the previous (`back`) or next prompt line from history that
+    /// starts with what was typed before the walk began. Walking forward off
+    /// the newest brings back the typed text.
+    fn browse_history(&mut self, back: bool) {
+        let kind = if self.mode == Mode::Search {
+            "search"
+        } else {
+            "command"
+        };
+        let hist = crate::config::history(kind);
+        let (pos, prefix) = self
+            .history_browse
+            .take()
+            .unwrap_or_else(|| (hist.len(), self.command_line.clone()));
+        let fits = |i: &usize| hist[*i].starts_with(&prefix);
+        let next = if back {
+            (0..pos.min(hist.len())).rev().find(fits)
+        } else {
+            (pos + 1..hist.len()).find(fits)
+        };
+        match next {
+            Some(i) => {
+                self.command_line = hist[i].clone();
+                self.history_browse = Some((i, prefix));
+            }
+            None if back => self.history_browse = Some((pos, prefix)),
+            None => self.command_line = prefix,
+        }
+        if self.mode == Mode::Search {
+            self.update_search_preview();
+        }
+    }
+
     fn handle_search_key(&mut self, key: Key) {
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.history_browse = None;
+        }
         match key.code {
+            KeyCode::Up | KeyCode::Down => self.browse_history(key.code == KeyCode::Up),
             KeyCode::Esc => {
                 self.command_line.clear();
                 self.select_prompt = None;
@@ -1602,6 +1727,7 @@ impl Editor {
             KeyCode::Enter => {
                 let query = std::mem::take(&mut self.command_line);
                 self.mode = Mode::Normal;
+                crate::config::record_history("search", &query);
                 if let Some(kind) = self.select_prompt.take() {
                     self.restore_search_origin();
                     self.apply_select_prompt(kind, &query);
@@ -2092,9 +2218,21 @@ impl Editor {
         let wrap = self.wrap_width();
 
         let doc = self.doc_mut();
+        // Whatever put the cursor inside a closed fold — a search, a jump,
+        // an edit — wants to see it there, so the fold opens.
+        let cursor_line = doc.cursor_line();
+        doc.open_folds_at(cursor_line);
         let (line, row, col) = doc.cursor_visual(wrap);
 
-        let Some(_) = wrap else {
+        if wrap.is_none() {
+            if col < doc.view_col {
+                doc.view_col = col;
+            }
+            if col >= doc.view_col + width {
+                doc.view_col = col - width + 1;
+            }
+        }
+        if wrap.is_none() && doc.folds.is_empty() {
             doc.view_row = 0;
             if line < doc.view_line + scrolloff {
                 doc.view_line = line.saturating_sub(scrolloff);
@@ -2103,19 +2241,17 @@ impl Editor {
                 doc.view_line = (line + scrolloff + 1).saturating_sub(height);
             }
             doc.view_line = doc.view_line.min(doc.line_count().saturating_sub(1));
-            if col < doc.view_col {
-                doc.view_col = col;
-            }
-            if col >= doc.view_col + width {
-                doc.view_col = col - width + 1;
-            }
             return;
-        };
+        }
 
         // Wrapping makes "rows" and "lines" different units, so the viewport
-        // is a (line, row) pair and scrolling counts rows.
-        doc.view_col = 0; // nothing scrolls sideways while it wraps
+        // is a (line, row) pair and scrolling counts rows. Folds do the same
+        // without wrapping: a closed one is many lines in one row.
+        if wrap.is_some() {
+            doc.view_col = 0; // nothing scrolls sideways while it wraps
+        }
         doc.view_line = doc.view_line.min(doc.line_count().saturating_sub(1));
+        doc.view_line = doc.visible_line(doc.view_line);
         // A resize changes the wrap width under the viewport: the row it is
         // parked on may no longer exist.
         let rows = doc.visual_rows(doc.view_line, wrap);
@@ -2718,6 +2854,95 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn editorconfig_sets_indent_tab_width_and_the_final_newline() {
+        let dir = std::env::temp_dir().join(format!("crow-ec-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".editorconfig"),
+            "root = true\n[*.go]\nindent_style = tab\ntab_width = 8\ninsert_final_newline = true\n",
+        )
+        .unwrap();
+        let file = dir.join("main.go");
+        std::fs::write(&file, "x").unwrap();
+        let mut editor = Editor::new(
+            vec![file.clone()],
+            (80, 24),
+            &crate::config::Config::default(),
+        )
+        .unwrap();
+        press(&mut editor, "i <tab> <esc>");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "\tx",
+            "a tab, though the line had none"
+        );
+        assert_eq!(crate::config::tab_width(), 8);
+        press(&mut editor, ": w <enter>");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "\tx\n");
+
+        crate::config::set_buffer_tab_width(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn za_folds_by_indent_and_j_steps_over_the_fold() {
+        let mut editor = editor_with("a:\n  b\n\n  c\nd\n");
+        press(&mut editor, "j za"); // from inside the block: folds under its header
+        assert_eq!(editor.doc().cursor_line(), 0, "cursor moves to the header");
+        assert!((1..=3).all(|l| editor.doc().hidden(l)));
+        assert!(!editor.doc().hidden(4));
+        let mut screen = Vec::new();
+        crate::ui::render(&editor, &mut screen).unwrap();
+        let screen = String::from_utf8_lossy(&screen);
+        assert!(screen.contains("⋯ 3 lines"), "the fold says what it hides");
+        assert!(!screen.contains("  b"), "hidden lines are not drawn");
+        press(&mut editor, "j");
+        assert_eq!(editor.doc().cursor_line(), 4);
+        press(&mut editor, "k");
+        assert_eq!(editor.doc().cursor_line(), 0);
+
+        // Edits above the fold carry it along.
+        press(&mut editor, "O x <esc>");
+        assert!(editor.doc().hidden(2) && !editor.doc().hidden(1));
+
+        // A search into the fold opens it.
+        press(&mut editor, "/ c <enter>");
+        editor.ensure_cursor_visible();
+        assert!(editor.doc().folds.is_empty());
+    }
+
+    #[test]
+    fn inlay_hints_draw_after_their_line_and_follow_edits() {
+        let mut editor = editor_with("let x = 1;\n");
+        editor.doc_mut().inlay_hints = vec![(5, ": i32".into())];
+        editor.doc_mut().semantic = vec![(4, 5, 5)];
+        let render = |editor: &Editor| {
+            let mut screen = Vec::new();
+            crate::ui::render(editor, &mut screen).unwrap();
+            String::from_utf8_lossy(&screen).into_owned()
+        };
+        assert!(render(&editor).contains("x: i32"));
+        press(&mut editor, "i // <esc>");
+        assert_eq!(editor.doc().inlay_hints[0].0, 7, "the hint rides the edit");
+        assert_eq!(editor.doc().semantic[0].0, 6, "and so does the token");
+        assert!(render(&editor).contains("x: i32"));
+    }
+
+    #[test]
+    fn za_folds_the_syntax_node_and_toggles() {
+        let mut editor = editor_with("fn main() {\n    let x = 1;\n}\nfn b() {}\n");
+        editor.doc_mut().path = Some("test.rs".into());
+        editor.doc_mut().refresh_syntax();
+        press(&mut editor, "za");
+        assert!(editor.doc().hidden(1) && editor.doc().hidden(2));
+        assert!(!editor.doc().hidden(3));
+        press(&mut editor, "za");
+        assert!(editor.doc().folds.is_empty());
+        press(&mut editor, "3j za");
+        assert_eq!(editor.status, "nothing to fold here");
+    }
+
+    #[test]
     fn expand_selection_climbs_the_syntax_tree() {
         let mut editor = editor_with("fn main() { let x = 1; }");
         editor.doc_mut().path = Some("test.rs".into());
@@ -3038,8 +3263,8 @@ pub(crate) mod tests {
         press(&mut editor, "pri");
         editor.show_completions(
             vec![
-                ("println!".into(), "println!".into(), String::new()),
-                ("print!".into(), "print!".into(), String::new()),
+                ("println!".into(), "println!".into(), String::new(), false),
+                ("print!".into(), "print!".into(), String::new(), false),
             ],
             false,
         );
@@ -3050,12 +3275,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn snippet_completions_walk_their_stops_with_tab() {
+        let mut editor = editor_with("");
+        press(&mut editor, "i");
+        press(&mut editor, "ma");
+        editor.show_completions(
+            vec![(
+                "max".into(),
+                "max(${1:a}, ${2:b}, $1)$0".into(),
+                String::new(),
+                true,
+            )],
+            false,
+        );
+        press(&mut editor, "<tab> <enter>"); // step into the menu, accept
+        assert_eq!(editor.doc().text.to_string(), "max(a, b, )");
+        // Stop 1 is selected, with a cursor on its mirror too; typing replaces.
+        press(&mut editor, "x");
+        assert_eq!(editor.doc().text.to_string(), "max(x, b, x)");
+        press(&mut editor, "<tab> y");
+        assert_eq!(editor.doc().text.to_string(), "max(x, y, x)");
+        press(&mut editor, "<tab> ;");
+        assert_eq!(editor.doc().text.to_string(), "max(x, y, x);");
+        press(&mut editor, "<tab>"); // no stops left: an ordinary indent
+        assert_eq!(editor.doc().text.to_string(), "max(x, y, x);    ");
+    }
+
+    #[test]
     fn esc_closes_completion_and_leaves_insert_mode_in_one_press() {
         let mut editor = editor_with("");
         press(&mut editor, "i");
         press(&mut editor, "pri");
         editor.show_completions(
-            vec![("println!".into(), "println!".into(), String::new())],
+            vec![("println!".into(), "println!".into(), String::new(), false)],
             false,
         );
         press(&mut editor, "<esc>");
@@ -3234,8 +3486,13 @@ pub(crate) mod tests {
         press(&mut editor, "p");
         editor.show_completions(
             vec![
-                ("print!".into(), "print!".into(), String::new()),
-                ("push".into(), "push".into(), "Appends an element.".into()),
+                ("print!".into(), "print!".into(), String::new(), false),
+                (
+                    "push".into(),
+                    "push".into(),
+                    "Appends an element.".into(),
+                    false,
+                ),
             ],
             false,
         );
@@ -3255,8 +3512,8 @@ pub(crate) mod tests {
         press(&mut editor, "p");
         editor.show_completions(
             vec![
-                ("print!".into(), "print!".into(), String::new()),
-                ("push".into(), "push".into(), String::new()),
+                ("print!".into(), "print!".into(), String::new(), false),
+                ("push".into(), "push".into(), String::new(), false),
             ],
             false,
         );
@@ -3275,7 +3532,7 @@ pub(crate) mod tests {
         press(&mut editor, "i");
         press(&mut editor, "pri");
         editor.show_completions(
-            vec![("println".into(), "println".into(), String::new())],
+            vec![("println".into(), "println".into(), String::new(), false)],
             true,
         );
         assert_eq!(editor.completion.as_ref().unwrap().items.len(), 1);
@@ -3287,10 +3544,13 @@ pub(crate) mod tests {
         // since leaves the popup that is up alone instead of closing it.
         press(&mut editor, "pri");
         editor.show_completions(
-            vec![("println".into(), "println".into(), String::new())],
+            vec![("println".into(), "println".into(), String::new(), false)],
             true,
         );
-        editor.show_completions(vec![("zzz".into(), "zzz".into(), String::new())], true);
+        editor.show_completions(
+            vec![("zzz".into(), "zzz".into(), String::new(), false)],
+            true,
+        );
         assert!(
             editor.completion.is_some(),
             "a stale typed list closed the popup"
@@ -3401,6 +3661,28 @@ pub(crate) mod tests {
         assert_eq!(editor.command_suggest, None);
         press(&mut editor, "<enter>");
         assert!(editor.should_quit, "Enter submits what's in the bar");
+    }
+
+    #[test]
+    fn up_and_down_walk_the_prompt_history_by_prefix() {
+        let mut editor = editor_with("hello");
+        press(
+            &mut editor,
+            "/ histaaq <enter> / histbbq <enter> / other <enter>",
+        );
+        press(&mut editor, "/ hist <up>");
+        assert_eq!(editor.command_line, "histbbq");
+        press(&mut editor, "<up>");
+        assert_eq!(editor.command_line, "histaaq");
+        press(&mut editor, "<down>");
+        assert_eq!(editor.command_line, "histbbq");
+        press(&mut editor, "<down>");
+        assert_eq!(editor.command_line, "hist", "off the end: what was typed");
+        press(&mut editor, "<esc>");
+
+        // `:` keeps Up/Down for its suggestions while there are any.
+        press(&mut editor, ": 1 <enter> : <up>");
+        assert_eq!(editor.command_line, "1");
     }
 
     #[test]

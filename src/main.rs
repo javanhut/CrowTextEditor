@@ -3,6 +3,7 @@ mod config;
 mod deps;
 mod document;
 mod editor;
+mod editorconfig;
 mod filetree;
 mod keymap;
 mod lsp;
@@ -203,6 +204,7 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
         }
 
         if dirty {
+            editor.use_buffer_settings();
             editor.ensure_cursor_visible();
             // Spans are collected for the lines about to be drawn, not for the
             // whole file: the reparse above maintains the tree, this turns the
@@ -233,6 +235,7 @@ fn run(editor: &mut Editor) -> std::io::Result<()> {
 
 /// Feed one wake-up to the editor.
 fn apply(editor: &mut Editor, wake: Wake) {
+    editor.use_buffer_settings();
     match wake {
         Wake::Input(Event::Key(ev)) => {
             if let Some(key) = Key::from_crossterm(ev) {

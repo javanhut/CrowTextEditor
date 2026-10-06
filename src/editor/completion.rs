@@ -164,10 +164,27 @@ impl Editor {
         let Some(completion) = self.completion.take() else {
             return;
         };
-        let Some((_, text)) = completion.items.get(completion.selected) else {
+        let Some((label, text)) = completion.items.get(completion.selected) else {
             return;
         };
         let prefix_chars = completion.prefix.chars().count();
+        // ponytail: snippets expand at the primary cursor only, and `.` or a
+        // macro replays the plain text without the tab stops.
+        if completion.snippets.contains(label) && self.doc().extra.is_empty() {
+            let doc = self.doc_mut();
+            let from = doc.cursor.saturating_sub(prefix_chars);
+            doc.delete_range(from, doc.cursor);
+            self.doc_mut().insert_snippet(text);
+            let plain = crate::lsp::parse_snippet(text).0;
+            self.completion_effect = Some(Input::Complete(prefix_chars, plain));
+            self.keep_selection = true;
+            return;
+        }
+        let text = &if completion.snippets.contains(label) {
+            crate::lsp::parse_snippet(text).0
+        } else {
+            text.clone()
+        };
         let entered_dir = text.ends_with('/');
         if text
             .to_lowercase()

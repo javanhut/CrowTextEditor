@@ -158,7 +158,7 @@ impl Picker {
 
     pub fn grep(root: &Path, wake: Option<Sender<crate::terminal::Wake>>) -> Picker {
         Picker::new(
-            "grep",
+            "grep · C-e edits every hit",
             Kind::Grep {
                 root: root.to_path_buf(),
                 search: None,
@@ -303,17 +303,60 @@ fn score_lowered(query: &str, target: &str) -> Option<i64> {
     matched.then(|| score - (len as i64) / 8)
 }
 
-/// Every file under `root`, relative paths, skipping hidden entries and
-/// build/vendor directories. ponytail: capped and synchronous — a background
-/// walker with .gitignore support when big repos itch.
 /// Directories no search wants to see: build output and vendored code.
 const SKIP: &[&str] = &["target", "node_modules", "dist", "build"];
 
+/// The file finder stops listing here.
+const FILE_LIMIT: usize = 20_000;
+
+/// `rg` set up the way every search here wants it: the `SKIP` directories
+/// left out, `.gitignore` honoured even outside a git repo (this one is
+/// ivaldi's), `.ivaldiignore` too, and dotfiles following the hidden toggle.
+fn rg(root: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("rg");
+    cmd.arg("--no-require-git");
+    for dir in SKIP {
+        cmd.arg("--glob").arg(format!("!{dir}"));
+    }
+    if crate::config::show_hidden() {
+        cmd.arg("--hidden")
+            .arg("--glob")
+            .arg("!.ivaldi")
+            .arg("--glob")
+            .arg("!.git");
+    }
+    if root.join(".ivaldiignore").is_file() {
+        cmd.arg("--ignore-file").arg(root.join(".ivaldiignore"));
+    }
+    cmd.current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Every file under `root`, relative paths, sorted. By ripgrep when it is
+/// installed, so ignore files count; else a walk skipping hidden entries and
+/// the `SKIP` directories.
 fn list_files(root: &Path) -> Vec<String> {
+    if crate::config::on_path("rg") {
+        if let Ok(out) = rg(root).arg("--files").output() {
+            let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .take(FILE_LIMIT)
+                .map(|l| l.strip_prefix("./").unwrap_or(l).to_string())
+                .collect();
+            files.sort();
+            return files;
+        }
+    }
+    walk_files(root)
+}
+
+fn walk_files(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if out.len() >= 5000 {
+        if out.len() >= FILE_LIMIT {
             break;
         }
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -376,12 +419,10 @@ fn start_grep(
 /// Batches of this many hits go over the channel at a time.
 const GREP_BATCH: usize = 64;
 
-/// The search, by ripgrep: fast, and it knows `.gitignore`. The same
-/// directories the file finder skips are skipped here, `.ivaldiignore` counts
-/// too, and dotfiles follow the hidden toggle.
+/// The search, by ripgrep: fast, and it knows the ignore files (see `rg`).
 fn ripgrep(root: &Path, query: &str, stop: &AtomicBool, mut send: impl FnMut(Vec<Item>) -> bool) {
     use std::io::BufRead;
-    let mut cmd = std::process::Command::new("rg");
+    let mut cmd = rg(root);
     cmd.args([
         "--line-number",
         "--no-heading",
@@ -391,23 +432,8 @@ fn ripgrep(root: &Path, query: &str, stop: &AtomicBool, mut send: impl FnMut(Vec
         "--ignore-case",
         "--max-columns=300",
     ]);
-    for dir in SKIP {
-        cmd.arg("--glob").arg(format!("!{dir}"));
-    }
-    if crate::config::show_hidden() {
-        cmd.arg("--hidden");
-    }
-    if root.join(".ivaldiignore").is_file() {
-        cmd.arg("--ignore-file").arg(root.join(".ivaldiignore"));
-    }
     cmd.arg("--").arg(query).arg(".");
-    let Ok(mut child) = cmd
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
+    let Ok(mut child) = cmd.stdout(std::process::Stdio::piped()).spawn() else {
         return;
     };
     let Some(out) = child.stdout.take() else {
@@ -542,6 +568,20 @@ mod tests {
         crate::config::toggle_hidden();
         assert!(list_files(&dir).iter().any(|f| f == ".env"));
         crate::config::toggle_hidden(); // restore for other tests
+    }
+
+    #[test]
+    fn file_finder_honours_gitignore_without_a_git_repo() {
+        if !crate::config::on_path("rg") {
+            return; // the walker has no ignore support; nothing to check
+        }
+        let dir = std::env::temp_dir().join(format!("crow-ignore-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("gen")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "gen/\n").unwrap();
+        std::fs::write(dir.join("gen/out.rs"), "").unwrap();
+        std::fs::write(dir.join("keep.rs"), "").unwrap();
+        assert_eq!(list_files(&dir), vec!["keep.rs".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

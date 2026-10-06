@@ -128,6 +128,15 @@ impl Editor {
     /// the one in front of you.
     fn swap_notice(&mut self) -> bool {
         let doc = self.doc_mut();
+        // A large file never has a swap file; its notice is that it is plain.
+        if doc.large && !doc.swap_notified {
+            doc.swap_notified = true;
+            let name = doc.name();
+            self.set_status(format!(
+                "{name} is large: no syntax, LSP, change markers or swap file (large_file_mb)"
+            ));
+            return true;
+        }
         if !doc.swap_found || doc.swap_notified {
             return false;
         }
@@ -208,6 +217,10 @@ impl Editor {
         let Some(path) = self.documents[i].path.clone() else {
             return;
         };
+        if self.documents[i].large {
+            self.documents[i].vcs.base = crate::vcs::Base::NoRepo;
+            return;
+        }
         let Ok(canon) = path.canonicalize() else {
             // Not on disk yet; saving it asks again.
             self.documents[i].vcs.base = crate::vcs::Base::NoRepo;
@@ -267,7 +280,8 @@ impl Editor {
         if self.idle_for(VCS_DIFF_GAP) {
             for i in visible {
                 let doc = &mut self.documents[i];
-                if doc.vcs.base == crate::vcs::Base::Unknown
+                if doc.large
+                    || doc.vcs.base == crate::vcs::Base::Unknown
                     || doc.vcs.marks_revision == Some(doc.revision)
                 {
                     continue;

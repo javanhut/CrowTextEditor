@@ -8,6 +8,9 @@ impl Editor {
 
     /// The configured server command for the current buffer, if any.
     pub(crate) fn current_server_command(&self) -> Option<String> {
+        if self.doc().large {
+            return None;
+        }
         let path = self.doc().path.as_deref()?;
         server_for(&self.lsp_table, path).map(str::to_string)
     }
@@ -22,6 +25,38 @@ impl Editor {
     pub fn current_client(&mut self) -> Option<&mut lsp::Client> {
         let command = self.current_server_command()?;
         self.lsps.iter_mut().find(|c| c.command() == command)
+    }
+
+    /// Once typing has paused and the edit is synced, ask the server for the
+    /// current buffer's inlay hints and semantic tokens — once per revision.
+    fn request_decorations(&mut self) {
+        if self.last_key_at.elapsed() < std::time::Duration::from_millis(120) {
+            return;
+        }
+        let doc = self.doc();
+        let (Some(path), revision) = (doc.path.clone(), doc.revision) else {
+            return;
+        };
+        if doc.decorated == Some(revision) {
+            return;
+        }
+        let lines = doc.text.len_lines();
+        let Some(lsp) = self.current_client().filter(|c| c.can_decorate()) else {
+            return;
+        };
+        lsp.request_decorations(&path, lines);
+        self.doc_mut().decorated = Some(revision);
+        self.decorations_for = Some((path, revision));
+    }
+
+    /// The buffer a hints or tokens answer is for: the one last asked about,
+    /// if it hasn't changed since — an answer about older text would land
+    /// in the wrong places.
+    fn decorating(&mut self) -> Option<&mut Document> {
+        let (path, revision) = self.decorations_for.clone()?;
+        let idx = self.open_buffer(&path)?;
+        let doc = &mut self.documents[idx];
+        (doc.revision == revision).then_some(doc)
     }
 
     /// Shut every language server down (quit path).
@@ -49,6 +84,7 @@ impl Editor {
         if std::mem::take(&mut self.lsp_signature_pending) {
             self.request_signature();
         }
+        self.request_decorations();
         if let Some(tag) = self.lsp_completion_pending.take() {
             if self.mode == Mode::Insert {
                 if let Some(path) = self.doc().path.clone() {
@@ -115,6 +151,40 @@ impl Editor {
                 }
                 lsp::Event::Symbols(syms, workspace) => self.show_symbols(syms, workspace),
                 lsp::Event::Formatting(edits) => self.finish_lsp_format(edits),
+                lsp::Event::InlayHints(hints) => {
+                    if let Some(doc) = self.decorating() {
+                        doc.inlay_hints = hints
+                            .into_iter()
+                            .filter(|(line, ..)| *line < doc.text.len_lines())
+                            .map(|(line, col, label)| {
+                                let at = crate::position::utf16_to_char(doc.line(line), col);
+                                (doc.line_start(line) + at, label)
+                            })
+                            .collect();
+                        doc.inlay_hints.sort_by_key(|h| h.0);
+                    }
+                }
+                lsp::Event::SemanticTokens(tokens) => {
+                    if let Some(doc) = self.decorating() {
+                        doc.semantic = tokens
+                            .into_iter()
+                            .filter(|(line, ..)| *line < doc.text.len_lines())
+                            .map(|(line, start, len, group)| {
+                                let slice = doc.line(line);
+                                let from = crate::position::utf16_to_char(slice, start);
+                                let to = crate::position::utf16_to_char(slice, start + len);
+                                let base = doc.line_start(line);
+                                (base + from, base + to, group)
+                            })
+                            .filter(|(from, to, _)| from < to)
+                            .collect();
+                    }
+                }
+                lsp::Event::RefreshDecorations => {
+                    for doc in &mut self.documents {
+                        doc.decorated = None;
+                    }
+                }
             }
         }
         changed
@@ -132,19 +202,27 @@ impl Editor {
 
     /// `typed` marks the list crow asked for on its own while an identifier
     /// was being typed, rather than one the user asked for.
-    pub(crate) fn show_completions(&mut self, items: Vec<(String, String, String)>, typed: bool) {
+    pub(crate) fn show_completions(
+        &mut self,
+        items: Vec<(String, String, String, bool)>,
+        typed: bool,
+    ) {
         if self.mode != Mode::Insert {
             return; // the answer arrived after insert mode ended
         }
         let prefix = self.word_prefix();
         let lower = prefix.to_lowercase();
         let mut docs = std::collections::HashMap::new();
+        let mut snippets = std::collections::HashSet::new();
         let mut items: Vec<(String, String)> = items
             .into_iter()
-            .filter(|(label, _, _)| label.to_lowercase().starts_with(&lower))
-            .map(|(label, text, info)| {
+            .filter(|(label, ..)| label.to_lowercase().starts_with(&lower))
+            .map(|(label, text, info, snippet)| {
                 if !info.is_empty() {
                     docs.insert(label.clone(), info);
+                }
+                if snippet {
+                    snippets.insert(label.clone());
                 }
                 (label, text)
             })
@@ -168,6 +246,7 @@ impl Editor {
             // Enter and Tab accepts, like the buffer-word popup it replaced.
             navigated: !typed,
             docs,
+            snippets,
         });
         // Docs for the item highlighted on open, if the server defers them.
         self.maybe_resolve_completion();
@@ -177,6 +256,7 @@ impl Editor {
     /// themselves, retyping a closer steps over it, and identifier chars
     /// feed the intellisense popup.
     pub(crate) fn insert_typed(&mut self, c: char) {
+        self.doc_mut().take_placeholder();
         // Signature help: `(` and `,` (or whatever the server says) ask for
         // it; the call's closing `)` puts it away. Decided up front, since
         // autoclose below returns early for exactly these characters. The
@@ -325,6 +405,7 @@ impl Editor {
                 prefix,
                 navigated: false,
                 docs: std::collections::HashMap::new(),
+                snippets: std::collections::HashSet::new(),
             });
         }
     }
@@ -417,6 +498,7 @@ impl Editor {
             prefix: prefix.to_string(),
             navigated: false,
             docs: std::collections::HashMap::new(),
+            snippets: std::collections::HashSet::new(),
         })
     }
 
@@ -425,6 +507,7 @@ impl Editor {
         let needed: Vec<String> = self
             .documents
             .iter()
+            .filter(|d| !d.large)
             .filter_map(|d| d.path.as_deref())
             .filter_map(|p| server_for(&self.lsp_table, p))
             .map(str::to_string)
@@ -450,7 +533,7 @@ impl Editor {
         // Sync every document to its own language's server — never another's
         // (taplo getting a .rs file marks it "excluded", and worse).
         for doc in &mut self.documents {
-            let Some(path) = doc.path.clone() else {
+            let Some(path) = doc.path.clone().filter(|_| !doc.large) else {
                 continue;
             };
             let Some(command) = server_for(&self.lsp_table, &path) else {

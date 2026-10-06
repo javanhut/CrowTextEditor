@@ -483,7 +483,11 @@ mod tests {
 
         let mut editor = editor_with("a\n\nb\n");
         press(&mut editor, "C-v j j d");
-        assert_eq!(editor.doc().text.to_string(), "\n\n\n", "the empty line survives");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "\n\n\n",
+            "the empty line survives"
+        );
         let mut editor = editor_with("a\n\nb\n");
         press(&mut editor, "C-v j j i # <esc>");
         assert_eq!(editor.doc().text.to_string(), "#a\n#\n#b\n");

@@ -28,8 +28,19 @@ pub enum Base {
     NoRepo,
     /// In a repository but never sealed: every line is new.
     Untracked,
-    /// The sealed lines, hashed.
-    Tracked(Vec<u64>),
+    /// The sealed lines, hashed for the diff, and as text for showing what
+    /// a change replaced.
+    Tracked(Vec<u64>, Vec<String>),
+}
+
+/// One changed stretch: `added` buffer lines from `line` stand where the
+/// sealed lines `base` stood. A pure deletion has `added == 0`, and `line`
+/// is the buffer line just below where the sealed lines were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub line: usize,
+    pub added: usize,
+    pub base: std::ops::Range<usize>,
 }
 
 #[derive(Default)]
@@ -42,12 +53,34 @@ pub struct DocState {
     pub marks_revision: Option<u64>,
     /// (added, modified, deleted) line counts, for the status line.
     pub stats: (usize, usize, usize),
+    /// The changed stretches behind `marks`.
+    pub hunks: Vec<Hunk>,
 }
 
 impl DocState {
     /// The mark for `line`, `Mark::None` when there is nothing to show.
     pub fn mark(&self, line: usize) -> Mark {
         self.marks.get(line).copied().unwrap_or(Mark::None)
+    }
+
+    /// The change at `line`, as the sealed lines it replaced (`- `) over the
+    /// lines now there (`+ `). `None` when the line is unchanged.
+    pub fn diff_at(&self, line: usize, current: impl Fn(usize) -> String) -> Option<Vec<String>> {
+        let hunk = self.hunks.iter().find(|h| {
+            (h.line..h.line + h.added).contains(&line) || (h.added == 0 && h.line == line)
+        })?;
+        let sealed: &[String] = match &self.base {
+            Base::Tracked(_, lines) => lines,
+            _ => &[],
+        };
+        let mut out: Vec<String> = sealed
+            .get(hunk.base.clone())
+            .unwrap_or_default()
+            .iter()
+            .map(|l| format!("- {l}"))
+            .collect();
+        out.extend((hunk.line..hunk.line + hunk.added).map(|l| format!("+ {}", current(l))));
+        Some(out)
     }
 
     /// First line of every changed stretch, top to bottom.
@@ -60,10 +93,19 @@ impl DocState {
     /// Recompute the marks from the buffer's current line hashes (see
     /// `hash_line`), which the caller reads straight off the rope.
     pub fn recompute(&mut self, current: Vec<u64>, revision: u64) {
-        self.marks = match &self.base {
+        self.hunks = match &self.base {
             Base::Unknown | Base::NoRepo => Vec::new(),
-            Base::Untracked => vec![Mark::Added; current.len()],
-            Base::Tracked(base) => marks(base, &current),
+            Base::Untracked => vec![Hunk {
+                line: 0,
+                added: current.len(),
+                base: 0..0,
+            }],
+            Base::Tracked(base, _) => hunks(base, &current),
+        };
+        self.marks = if matches!(self.base, Base::Unknown | Base::NoRepo) {
+            Vec::new()
+        } else {
+            marks_of(&self.hunks, current.len())
         };
         self.stats = self
             .marks
@@ -118,12 +160,13 @@ pub fn fetch_base(path: &Path) -> Base {
         };
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    Base::Tracked(
-        parse_whodidit(&text)
-            .iter()
-            .map(|l| hash(l.as_bytes()))
-            .collect(),
-    )
+    // The buffer never holds `\r`, so a CRLF file's sealed lines must not
+    // either, or every line reads as changed.
+    let lines: Vec<String> = parse_whodidit(&text)
+        .into_iter()
+        .map(|l| l.strip_suffix('\r').map(str::to_string).unwrap_or(l))
+        .collect();
+    Base::Tracked(lines.iter().map(|l| hash(l.as_bytes())).collect(), lines)
 }
 
 /// The file's lines out of `whodidit` output. Every line carries its line
@@ -208,8 +251,37 @@ enum Edit {
 const MAX_EDITS: usize = 400;
 
 /// One mark per line of `current`.
+#[cfg(test)]
 fn marks(base: &[u64], current: &[u64]) -> Vec<Mark> {
-    let mut out = vec![Mark::None; current.len()];
+    marks_of(&hunks(base, current), current.len())
+}
+
+/// The gutter marks for `hunks` over a buffer of `len` lines: paired lines
+/// are modified, extra inserts added, and a deletion leaves a marker on the
+/// line below it.
+fn marks_of(hunks: &[Hunk], len: usize) -> Vec<Mark> {
+    let mut out = vec![Mark::None; len];
+    for h in hunks {
+        for k in 0..h.added {
+            out[h.line + k] = if k < h.base.len() {
+                Mark::Modified
+            } else {
+                Mark::Added
+            };
+        }
+        if h.added == 0 && !out.is_empty() {
+            let at = h.line.min(out.len() - 1);
+            if out[at] == Mark::None {
+                out[at] = Mark::DeletedAbove;
+            }
+        }
+    }
+    out
+}
+
+/// The changed stretches turning `base` into `current`.
+fn hunks(base: &[u64], current: &[u64]) -> Vec<Hunk> {
+    let mut out = Vec::new();
     // Trim what both ends share: most edits touch a few lines of a big file.
     let mut pre = 0;
     while pre < base.len() && pre < current.len() && base[pre] == current[pre] {
@@ -232,13 +304,14 @@ fn marks(base: &[u64], current: &[u64]) -> Vec<Mark> {
     });
 
     // Walk the script in hunks: a run of deletes and inserts between equal
-    // lines. Paired lines are modified, extra inserts added, and extra
-    // deletes leave a marker on the line below them.
+    // lines.
     let mut line = pre; // index into `current`
+    let mut sealed = pre; // index into `base`
     let mut i = 0;
     while i < script.len() {
         if script[i] == Edit::Equal {
             line += 1;
+            sealed += 1;
             i += 1;
             continue;
         }
@@ -250,20 +323,13 @@ fn marks(base: &[u64], current: &[u64]) -> Vec<Mark> {
             }
             i += 1;
         }
-        for k in 0..ins {
-            out[line + k] = if k < dels {
-                Mark::Modified
-            } else {
-                Mark::Added
-            };
-        }
-        if ins == 0 && !out.is_empty() {
-            let at = line.min(out.len() - 1);
-            if out[at] == Mark::None {
-                out[at] = Mark::DeletedAbove;
-            }
-        }
+        out.push(Hunk {
+            line,
+            added: ins,
+            base: sealed..sealed + dels,
+        });
         line += ins;
+        sealed += dels;
     }
     out
 }
@@ -394,10 +460,21 @@ mod tests {
         assert_eq!(state.stats, (2, 0, 0));
         assert_eq!(state.hunk_starts(), vec![0]);
 
-        state.base = Base::Tracked(h(&["a", "b", "c", "d"]));
-        state.recompute(h(&["a", "B", "c", "d", "e"]), 4);
+        let sealed = ["a", "b", "c", "d"];
+        state.base = Base::Tracked(h(&sealed), sealed.map(String::from).to_vec());
+        let now = ["a", "B", "c", "d", "e"];
+        state.recompute(h(&now), 4);
         assert_eq!(state.hunk_starts(), vec![1, 4]);
         assert_eq!(state.marks_revision, Some(4));
+
+        // What a change replaced, for the diff popup.
+        let current = |l: usize| now[l].to_string();
+        assert_eq!(
+            state.diff_at(1, current),
+            Some(vec!["- b".into(), "+ B".into()])
+        );
+        assert_eq!(state.diff_at(4, current), Some(vec!["+ e".into()]));
+        assert_eq!(state.diff_at(0, current), None);
     }
 
     #[test]

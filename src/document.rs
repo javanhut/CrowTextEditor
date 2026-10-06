@@ -52,6 +52,31 @@ pub struct Document {
     /// Non-primary selections, as (anchor, cursor) pairs. Every transaction
     /// remaps them in `apply`, so they survive edits made by any cursor.
     pub extra: Vec<(usize, usize)>,
+    /// Tab stops of an expanded snippet still to visit, in order; each holds
+    /// the ranges one stop covers (several when the stop is mirrored). They
+    /// ride through edits like `extra` does.
+    pub snippet: Vec<Vec<(usize, usize)>>,
+    /// The selections are a snippet placeholder, which typing replaces.
+    pub placeholder: bool,
+    /// The file was at least `config::large_file_bytes()` when opened: it
+    /// is edited as plain text, with every per-file extra that costs time
+    /// in proportion to its size left off.
+    pub large: bool,
+    /// What the project's `.editorconfig` says about this file.
+    pub editorconfig: crate::editorconfig::Settings,
+    /// Inlay hints from the language server: (char position, label).
+    pub inlay_hints: Vec<(usize, String)>,
+    /// Semantic tokens from the language server as (start, end, group) char
+    /// spans, painted over tree-sitter's colors.
+    pub semantic: Vec<(usize, usize, u8)>,
+    /// The revision inlay hints and semantic tokens were last asked for.
+    pub decorated: Option<u64>,
+    /// A refactor buffer's root and its lines' origins (`editor/refactor.rs`).
+    pub refactor: Option<(PathBuf, Vec<crate::editor::refactor::RefactorLine>)>,
+    /// Closed folds, as a char position in the header line and one in the
+    /// fold's last line; the lines after the header through the last are
+    /// hidden. Positions, not line numbers, so they ride through edits.
+    pub folds: Vec<(usize, usize)>,
     /// Tree-sitter state, when the file's language has a grammar.
     pub syntax: Option<crate::syntax::Syntax>,
     /// `syntax` is stale and must be rebuilt before anything reads it.
@@ -62,6 +87,10 @@ pub struct Document {
     /// short line and back out does not lose the original column.
     pub goal_col: Option<usize>,
     pub modified: bool,
+    /// The file on disk ends its lines with `\r\n`. The rope only ever holds
+    /// `\n` — every column, motion and LSP position assumes that — and the
+    /// `\r`s are put back on the way out, in `save`.
+    pub crlf: bool,
     /// The file's mtime as we last saw it — stamped when we read it and again
     /// after each of our own writes. `None` means there was no file, or the
     /// filesystem would not say. A write refuses when disk disagrees, which is
@@ -110,11 +139,21 @@ impl Document {
             cursor: 0,
             anchor: 0,
             extra: Vec::new(),
+            snippet: Vec::new(),
+            placeholder: false,
+            folds: Vec::new(),
+            refactor: None,
+            large: false,
+            editorconfig: crate::editorconfig::Settings::default(),
+            inlay_hints: Vec::new(),
+            semantic: Vec::new(),
+            decorated: None,
             syntax: None,
             syntax_dirty: false,
             revision: 0,
             goal_col: None,
             modified: false,
+            crlf: false,
             disk_mtime: None,
             disk_conflict: None,
             lsp_log: Vec::new(),
@@ -135,25 +174,39 @@ impl Document {
 
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let text = if path.exists() {
-            Rope::from_reader(BufReader::new(File::open(&path)?))?
+        let large =
+            std::fs::metadata(&path).is_ok_and(|m| m.len() >= crate::config::large_file_bytes());
+        let (text, crlf) = if path.exists() {
+            let raw = Rope::from_reader(BufReader::new(File::open(&path)?))?;
+            if is_crlf(&raw) {
+                (Rope::from_str(&raw.to_string().replace("\r\n", "\n")), true)
+            } else {
+                (raw, false)
+            }
         } else {
-            Rope::new()
+            (Rope::new(), false)
         };
         // Stamp after the read, never before: a write that lands in between
         // then looks like a mismatch and gets caught, rather than being read
         // over and silently blessed.
+        let editorconfig = crate::editorconfig::for_file(&path);
+        // A new file takes the project's line endings; an existing one
+        // keeps its own rather than being rewritten whole on the next save.
+        let crlf = crlf || (!path.exists() && editorconfig.crlf == Some(true));
         let mut doc = Document {
             text,
+            crlf,
+            large,
+            editorconfig,
             disk_mtime: disk_mtime(&path),
             path: Some(path),
             ..Document::empty()
         };
         doc.refresh_syntax();
-        if crate::config::persistent_undo() {
+        if crate::config::persistent_undo() && !large {
             doc.load_undo();
         }
-        if crate::config::swap_files() {
+        if crate::config::swap_files() && !large {
             match doc.read_swap() {
                 Some(swapped) if doc.text != swapped.as_str() => doc.swap_found = true,
                 Some(_) => doc.remove_swap(), // nothing it could restore
@@ -171,8 +224,12 @@ impl Document {
             .path
             .clone()
             .ok_or_else(|| std::io::Error::other("buffer has no filename"))?;
-        let new = std::fs::read_to_string(&path)?;
+        let mut new = std::fs::read_to_string(&path)?;
         let mtime = disk_mtime(&path);
+        self.crlf = is_crlf(&Rope::from_str(&new));
+        if self.crlf {
+            new = new.replace("\r\n", "\n");
+        }
         let changed = self.replace_all(&new);
         self.modified = false;
         self.disk_mtime = mtime;
@@ -244,6 +301,10 @@ impl Document {
             return;
         }
         self.syntax_dirty = false;
+        if self.large {
+            self.syntax = None;
+            return;
+        }
         let cached = self.syntax.as_ref().and_then(|s| s.config);
         self.syntax = crate::syntax::highlight(self.path.as_deref(), &self.text, cached);
     }
@@ -322,13 +383,10 @@ impl Document {
                 "file changed on disk since read — use :w! to overwrite",
             ));
         }
-        // `write_to` only `write_all`s its chunks, and a dropped BufWriter
-        // discards its flush error — so a truncated write would report success.
-        let mut out = BufWriter::new(File::create(&path)?);
-        let wrote = self.text.write_to(&mut out).and_then(|()| out.flush());
-        // Re-stamp either way. `File::create` truncated the file, so even a
-        // failed write is *our* mark on disk; leaving the old stamp would make
-        // every later save blame an external process for our own damage.
+        let wrote = save_atomically(&path, &self.text, self.crlf);
+        // Re-stamp either way: the in-place fallback may have truncated the
+        // file, and a failed write there is *our* mark on disk; leaving the
+        // old stamp would make every later save blame an external process.
         self.disk_mtime = disk_mtime(&path);
         wrote?;
         self.modified = false;
@@ -339,7 +397,7 @@ impl Document {
         if !self.swap_found {
             self.remove_swap();
         }
-        if crate::config::persistent_undo() {
+        if crate::config::persistent_undo() && !self.large {
             self.save_undo();
         }
         Ok(())
@@ -359,6 +417,7 @@ impl Document {
         // The swap file belongs to the file we are leaving, not the one we
         // are about to write; `save` below would remove the new path's.
         self.remove_swap();
+        self.editorconfig = crate::editorconfig::for_file(&path);
         self.path = Some(path);
         self.disk_mtime = None;
         self.swap_revision = 0;
@@ -374,6 +433,9 @@ impl Document {
     }
 
     pub fn name(&self) -> String {
+        if self.refactor.is_some() {
+            return "[refactor]".to_string();
+        }
         self.path
             .as_ref()
             .and_then(|p| p.file_name())
@@ -425,6 +487,9 @@ impl Document {
     /// Screen rows a line takes. `wrap` is the soft-wrap width, or `None` when
     /// long lines scroll sideways instead — then every line is one row.
     pub fn visual_rows(&self, line: usize, wrap: Option<usize>) -> usize {
+        if !self.folds.is_empty() && self.hidden(line) {
+            return 0;
+        }
         match wrap {
             Some(w) => position::wrap_offsets(self.line(line), w, tab_width()).len(),
             None => 1,
@@ -460,6 +525,70 @@ impl Document {
         )
     }
 
+    // ---- folds --------------------------------------------------------------
+
+    /// The closed folds as (header line, last line).
+    fn fold_lines(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let len = self.text.len_chars();
+        self.folds.iter().map(move |&(h, e)| {
+            (
+                self.text.char_to_line(h.min(len)),
+                self.text.char_to_line(e.min(len)),
+            )
+        })
+    }
+
+    /// A closed fold hides `line`.
+    pub fn hidden(&self, line: usize) -> bool {
+        self.fold_lines().any(|(h, e)| h < line && line <= e)
+    }
+
+    /// The line drawn after `line`: the one past the closed fold it heads.
+    pub fn next_line(&self, line: usize) -> usize {
+        self.fold_lines()
+            .filter(|&(h, _)| h == line)
+            .map(|(_, e)| e)
+            .max()
+            .unwrap_or(line)
+            + 1
+    }
+
+    /// The line drawn in `line`'s place: the header of the outermost closed
+    /// fold hiding it, else itself.
+    pub fn visible_line(&self, line: usize) -> usize {
+        self.fold_lines()
+            .filter(|&(h, e)| h < line && line <= e)
+            .map(|(h, _)| h)
+            .min()
+            .unwrap_or(line)
+    }
+
+    /// The line drawn before `line`.
+    pub fn prev_line(&self, line: usize) -> usize {
+        self.visible_line(line.saturating_sub(1))
+    }
+
+    /// Open every fold hiding `line`. False when none did.
+    pub fn open_folds_at(&mut self, line: usize) -> bool {
+        let len = self.text.len_chars();
+        let before = self.folds.len();
+        let text = &self.text;
+        self.folds.retain(|&(h, e)| {
+            !(text.char_to_line(h.min(len)) < line && line <= text.char_to_line(e.min(len)))
+        });
+        self.folds.len() != before
+    }
+
+    /// Open the folds `line` heads. False when it heads none.
+    pub fn open_folds_headed(&mut self, line: usize) -> bool {
+        let len = self.text.len_chars();
+        let before = self.folds.len();
+        let text = &self.text;
+        self.folds
+            .retain(|&(h, _)| text.char_to_line(h.min(len)) != line);
+        self.folds.len() != before
+    }
+
     /// Visual rows from `(line, row)` `a` forward to `b`, where `a <= b`.
     pub fn rows_forward(&self, wrap: Option<usize>, a: (usize, usize), b: (usize, usize)) -> usize {
         let mut n = 0isize;
@@ -472,12 +601,14 @@ impl Document {
     /// Step the viewport `n` visual rows: down when positive, up when negative.
     pub fn scroll_view(&mut self, wrap: Option<usize>, n: isize) {
         let last = self.line_count().saturating_sub(1);
+        self.view_line = self.visible_line(self.view_line);
         for _ in 0..n.unsigned_abs() {
             if n > 0 {
+                let next = self.next_line(self.view_line);
                 if self.view_row + 1 < self.visual_rows(self.view_line, wrap) {
                     self.view_row += 1;
-                } else if self.view_line < last {
-                    self.view_line += 1;
+                } else if next <= last {
+                    self.view_line = next;
                     self.view_row = 0;
                 } else {
                     break;
@@ -485,8 +616,8 @@ impl Document {
             } else if self.view_row > 0 {
                 self.view_row -= 1;
             } else if self.view_line > 0 {
-                self.view_line -= 1;
-                self.view_row = self.visual_rows(self.view_line, wrap) - 1;
+                self.view_line = self.prev_line(self.view_line);
+                self.view_row = self.visual_rows(self.view_line, wrap).saturating_sub(1);
             } else {
                 break;
             }
@@ -554,6 +685,28 @@ impl Document {
         // Every other cursor rides through the edit via position mapping.
         for (a, c) in &mut self.extra {
             *a = tx.map_pos(*a, false);
+            *c = tx.map_pos(*c, false);
+        }
+        for (p, _) in &mut self.inlay_hints {
+            *p = tx.map_pos(*p, false);
+        }
+        for (start, end, _) in &mut self.semantic {
+            *start = tx.map_pos(*start, true);
+            *end = tx.map_pos(*end, false);
+        }
+        self.semantic.retain(|&(start, end, _)| start < end);
+        for (h, e) in &mut self.folds {
+            *h = tx.map_pos(*h, false);
+            *e = tx.map_pos(*e, false);
+        }
+        if !self.folds.is_empty() {
+            let text = &self.text;
+            self.folds
+                .retain(|&(h, e)| text.char_to_line(h) < text.char_to_line(e));
+        }
+        // Snippet stops grow with what is typed at their edges.
+        for (a, c) in self.snippet.iter_mut().flatten() {
+            *a = tx.map_pos(*a, true);
             *c = tx.map_pos(*c, false);
         }
         // Slide the existing highlight spans through the edit, exactly as the
@@ -813,6 +966,7 @@ impl Document {
         // that has not been recovered or discarded yet. Writing over it would
         // destroy exactly what it exists to keep.
         if !crate::config::swap_files()
+            || self.large
             || self.swap_found
             || !self.modified
             || self.revision == self.swap_revision
@@ -882,6 +1036,71 @@ impl Document {
         self.apply(tx, new_cursor);
     }
 
+    /// Insert snippet text at the cursor: the text without its syntax goes
+    /// in, and the cursor moves to the first tab stop with its placeholder
+    /// selected (and a cursor on each mirror of it). The other stops wait in
+    /// `snippet` for `next_snippet_stop`; the last is `$0`, or the end.
+    pub fn insert_snippet(&mut self, snippet: &str) {
+        let (text, stops) = crate::lsp::parse_snippet(snippet);
+        let base = self.cursor;
+        self.insert_at_cursor(&text);
+        let end = self.cursor;
+        let mut numbers: Vec<u32> = stops.iter().map(|s| s.0).filter(|&n| n > 0).collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        numbers.push(0);
+        self.snippet = numbers
+            .iter()
+            .map(|&n| {
+                let ranges: Vec<(usize, usize)> = stops
+                    .iter()
+                    .filter(|s| s.0 == n)
+                    .map(|&(_, a, c)| (base + a, base + c))
+                    .collect();
+                if ranges.is_empty() {
+                    vec![(end, end)]
+                } else {
+                    ranges
+                }
+            })
+            .collect();
+        self.next_snippet_stop();
+    }
+
+    /// Select the next snippet stop. False when there is none left.
+    pub fn next_snippet_stop(&mut self) -> bool {
+        if self.snippet.is_empty() {
+            return false;
+        }
+        let mut ranges = self.snippet.remove(0);
+        ranges.sort_unstable();
+        let len = self.text.len_chars();
+        (self.anchor, self.cursor) = (ranges[0].0.min(len), ranges[0].1.min(len));
+        self.extra = ranges[1..].to_vec();
+        self.placeholder = self.anchor != self.cursor;
+        true
+    }
+
+    /// If the selections are a snippet placeholder, delete them, so what is
+    /// typed next replaces it.
+    pub fn take_placeholder(&mut self) {
+        if !std::mem::take(&mut self.placeholder) || self.anchor == self.cursor {
+            return;
+        }
+        let mut ranges: Vec<(usize, usize)> = std::iter::once((self.anchor, self.cursor))
+            .chain(self.extra.iter().copied())
+            .map(|(a, c)| (a.min(c), a.max(c)))
+            .collect();
+        ranges.sort_unstable();
+        ranges.dedup();
+        let tx = Transaction::change(&self.text, ranges.iter().map(|&(a, c)| (a, c, None)));
+        let cursor = tx.map_pos(self.anchor.min(self.cursor), true);
+        self.apply(tx, cursor);
+        for (a, c) in &mut self.extra {
+            *a = *c;
+        }
+    }
+
     /// Drop extra selections that duplicate the primary or each other.
     pub fn dedupe_cursors(&mut self) {
         let primary = (self.anchor, self.cursor);
@@ -908,6 +1127,64 @@ impl Document {
 // invisible to this; add `metadata.len()` to the comparison if that ever bites.
 fn disk_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Whether a file's first line ending is `\r\n`. The first one decides, the
+/// way every other editor does it: a file mixing the two is rare, and
+/// whichever it started with is the convention it meant.
+fn is_crlf(text: &Rope) -> bool {
+    let mut prev = None;
+    for c in text.chars() {
+        if c == '\n' {
+            return prev == Some('\r');
+        }
+        prev = Some(c);
+    }
+    false
+}
+
+/// Write `text` to `path` through a temp file in the same directory, synced
+/// and then renamed over the original, so a full disk or a crash mid-write
+/// leaves the old file intact instead of a truncated one. A symlink is
+/// followed, so the link survives and its target gets the text, and the
+/// original's permissions carry over to the replacement.
+///
+/// When the directory refuses a new file (writable file, read-only dir) the
+/// write falls back to truncating in place — the only write possible there.
+// ponytail: rename gives the file a new inode, so hard links to it and its
+// owner (when someone else's file is being edited as root) don't carry over;
+// fall back to in-place for those if it ever matters.
+fn save_atomically(path: &Path, text: &Rope, crlf: bool) -> std::io::Result<()> {
+    let write = |file: File| -> std::io::Result<File> {
+        // `write_to` only `write_all`s its chunks, and a dropped BufWriter
+        // discards its flush error — so a truncated write would report success.
+        let mut out = BufWriter::new(file);
+        if crlf {
+            for chunk in text.chunks() {
+                out.write_all(chunk.replace('\n', "\r\n").as_bytes())?;
+            }
+        } else {
+            text.write_to(&mut out)?;
+        }
+        out.into_inner().map_err(|e| e.into_error())
+    };
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = target.with_file_name(format!(".{name}.crow{}~", std::process::id()));
+    let Ok(file) = File::create(&tmp) else {
+        return write(File::create(&target)?).map(drop);
+    };
+    let staged = (|| {
+        write(file)?.sync_all()?;
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged
 }
 
 /// The same file spelled two ways — `notes.txt` vs `./notes.txt` vs an absolute
@@ -1101,6 +1378,76 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&fresh);
+    }
+
+    #[test]
+    fn a_large_file_opens_plain() {
+        let dir = std::env::temp_dir().join(format!("crow-large-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.rs");
+        let line = "fn f() { let x = 1; }\n";
+        let copies = (crate::config::large_file_bytes() as usize).div_ceil(line.len());
+        std::fs::write(&path, line.repeat(copies)).unwrap();
+        let mut d = Document::open(&path).unwrap();
+        assert!(d.large);
+        d.settle_syntax();
+        assert!(d.syntax.is_none(), "no tree-sitter for it");
+        d.insert_at_cursor("x");
+        assert!(!d.write_swap(), "and no swap file");
+
+        std::fs::write(&path, line).unwrap();
+        let mut small = Document::open(&path).unwrap();
+        small.settle_syntax();
+        assert!(!small.large && small.syntax.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crlf_files_edit_as_lf_and_save_as_crlf() {
+        let dir = std::env::temp_dir().join(format!("crow-crlf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("win.txt");
+        std::fs::write(&path, "one\r\ntwo\r\n").unwrap();
+        let mut d = Document::open(&path).unwrap();
+        assert!(d.crlf);
+        assert_eq!(d.text, "one\ntwo\n");
+        assert_eq!(d.line_len(0), 3, "no \\r counted as a column");
+        d.insert_at_cursor("x");
+        d.save(false).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"xone\r\ntwo\r\n");
+
+        // A plain file stays plain.
+        std::fs::write(&path, "a\nb\r\n").unwrap();
+        assert!(!Document::open(&path).unwrap().crlf);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_the_file_whole_and_keeps_its_mode_and_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("crow-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.sh");
+        let link = dir.join("link.sh");
+        std::fs::write(&real, "old\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut d = Document::open(&link).unwrap();
+        d.insert_at_cursor("new ");
+        d.save(false).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new old\n");
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        let leftovers = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(leftovers, 2, "no temp file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
