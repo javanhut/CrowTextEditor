@@ -422,6 +422,7 @@ impl Default for Keymaps {
         normal.bind_str("<space> f", "find_files");
         normal.bind_str("<space> g", "grep_text");
         normal.bind_str("<space> r", "recent_files");
+        normal.bind_str("<space> b", "buffers");
         normal.bind_str("<space> e", "tree_toggle");
         normal.bind_str("C-t", "tree_toggle");
         normal.bind_str("C-h", "focus_left");
@@ -849,12 +850,11 @@ impl Editor {
     #[allow(clippy::type_complexity)]
     pub fn window_rects(&self) -> (Vec<(usize, Rect)>, Vec<(Rect, bool)>) {
         let tree_w = self.tree_width();
-        let top = u16::from(self.show_bufferline());
         let area = (
             tree_w,
-            top,
+            0,
             self.size.0.saturating_sub(tree_w),
-            self.size.1.saturating_sub(2 + top),
+            self.size.1.saturating_sub(2),
         );
         let mut wins = Vec::new();
         let mut seps = Vec::new();
@@ -883,24 +883,41 @@ impl Editor {
 
     pub fn focused_rect(&self) -> Rect {
         let (wins, _) = self.window_rects();
-        let top = u16::from(self.show_bufferline());
         wins.iter()
             .find(|(id, _)| *id == self.focused)
             .map(|&(_, r)| r)
-            .unwrap_or((0, top, self.size.0, self.size.1.saturating_sub(2 + top)))
+            .unwrap_or((0, 0, self.size.0, self.size.1.saturating_sub(2)))
     }
 
-    /// The buffer line takes the top row once there is more than one buffer.
-    pub fn show_bufferline(&self) -> bool {
-        crate::config::bufferline() && self.documents.len() > 1
+    /// Add a buffer and return its index. An untouched `[no name]` buffer —
+    /// the one crow starts with when given no file — is replaced rather than
+    /// kept beside it: it holds nothing, and would only sit in the buffer
+    /// list and in `gn`/`gp`. Replacing in place keeps every stored buffer
+    /// index (windows, jumps) valid.
+    pub(crate) fn add_document(&mut self, doc: Document) -> usize {
+        let blank = self.documents.iter().position(|d| {
+            d.path.is_none() && d.refactor.is_none() && !d.modified && d.text.len_chars() == 0
+        });
+        match blank {
+            Some(i) => {
+                self.documents[i] = doc;
+                if let Some(p) = &mut self.preview {
+                    p.doc = usize::MAX; // its cached render was of the blank
+                }
+                i
+            }
+            None => {
+                self.documents.push(doc);
+                self.documents.len() - 1
+            }
+        }
     }
 
-    /// The buffer line's tabs: (buffer index, first column, label), as many
-    /// as fit, starting far enough along that the current buffer's is shown.
-    /// Names two buffers share get their directory in front.
-    pub fn bufferline_tabs(&self) -> Vec<(usize, u16, String)> {
+    /// `space b`: the open buffers in a picker — the current one marked
+    /// `>`, unsaved ones `●`, and a name two buffers share given its folder.
+    pub fn buffer_picker(&mut self) {
         let names: Vec<String> = self.documents.iter().map(Document::name).collect();
-        let labels: Vec<String> = self
+        let items = self
             .documents
             .iter()
             .enumerate()
@@ -915,28 +932,23 @@ impl Editor {
                     .filter(|_| shared)
                     .map(|d| format!("{}/", d.to_string_lossy()))
                     .unwrap_or_default();
+                let mark = if i == self.current { ">" } else { " " };
                 let dirty = if doc.modified { " ●" } else { "" };
-                format!(" {dir}{name}{dirty} ")
+                crate::picker::Item {
+                    label: format!("{mark} {dir}{name}{dirty}"),
+                    detail: doc
+                        .path
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                }
             })
             .collect();
-        let width = |l: &String| unicode_width::UnicodeWidthStr::width(l.as_str());
-        let avail = self.size.0.saturating_sub(self.tree_width()) as usize;
-        let mut first = self.current.min(labels.len().saturating_sub(1));
-        let mut used = labels.get(first).map_or(0, width);
-        while first > 0 && used + width(&labels[first - 1]) <= avail {
-            first -= 1;
-            used += width(&labels[first]);
-        }
-        let mut x = self.tree_width() as usize;
-        let mut tabs = Vec::new();
-        for (i, label) in labels.into_iter().enumerate().skip(first) {
-            if x + width(&label) > self.tree_width() as usize + avail && i != self.current {
-                break;
-            }
-            tabs.push((i, x as u16, label.clone()));
-            x += width(&label);
-        }
-        tabs
+        self.open_picker(crate::picker::Picker::new(
+            "buffers",
+            crate::picker::Kind::Buffers,
+            items,
+        ));
     }
 
     /// Stash the live view state into the focused window before focus moves.
@@ -1884,8 +1896,7 @@ impl Editor {
                     Ok(doc) => {
                         self.leave_terminal_for_edit();
                         crate::config::record_recent(Path::new(path));
-                        self.documents.push(doc);
-                        self.current = self.documents.len() - 1;
+                        self.current = self.add_document(doc);
                         self.set_status(format!("\"{path}\""));
                     }
                     Err(e) => self.set_status(format!("Error: {e}")),
@@ -1939,8 +1950,7 @@ impl Editor {
             "config" => match Document::open(crate::config::path()) {
                 Ok(doc) => {
                     self.leave_terminal_for_edit();
-                    self.documents.push(doc);
-                    self.current = self.documents.len() - 1;
+                    self.current = self.add_document(doc);
                     self.set_status("editing crow.toml — :config! to reload it");
                 }
                 Err(e) => self.set_status(format!("Error: {e}")),

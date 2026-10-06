@@ -82,8 +82,7 @@ impl Editor {
         doc.text = ropey::Rope::from_str(&text);
         doc.refactor = Some((root, lines));
         self.leave_terminal_for_edit();
-        self.documents.push(doc);
-        self.current = self.documents.len() - 1;
+        self.current = self.add_document(doc);
         self.set_status("edit the lines, then :w writes them back to their files");
     }
 

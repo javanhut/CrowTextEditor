@@ -138,6 +138,7 @@ commands! {
     toggle_comment => "comment or uncomment the selected lines (gc)",
     surround => "wrap the selection in a bracket or quote — ms then the character",
     toggle_wrap => "turn soft wrapping of long lines on or off (:wrap)",
+    buffers => "pick an open buffer to switch to; unsaved ones are marked ●",
     show_change => "show what the change at the cursor replaced since the last ivaldi seal",
     increment => "add the count to the number or date at or after the cursor (C-a)",
     decrement => "subtract the count from the number or date at or after the cursor (C-x)",
@@ -1794,6 +1795,10 @@ fn insert_newline(editor: &mut Editor) {
     } else {
         doc.insert_at_cursor(&format!("\n{indent}"));
     }
+}
+
+fn buffers(editor: &mut Editor) {
+    editor.buffer_picker();
 }
 
 fn show_change(editor: &mut Editor) {

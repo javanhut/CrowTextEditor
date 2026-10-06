@@ -36,6 +36,8 @@ pub enum Kind {
     },
     /// Recently opened files; labels are absolute paths (`~`-shortened).
     Recent,
+    /// The open buffers, one item per buffer in buffer order.
+    Buffers,
     /// Places to jump to — references, symbols, diagnostics — one per item.
     Locations { locs: Vec<crate::lsp::Location> },
     /// Code actions from the language server, one per item.

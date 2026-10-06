@@ -105,10 +105,9 @@ drained in a burst before drawing, so holding a key or pasting costs one
 frame instead of one per keystroke, and the frame leaves as a single
 buffered write.
 
-Indent guides mark each level of indentation, and when the line that opens
-the function, `if` or loop you are scrolled inside has gone off the top, it
-stays pinned there. With more than one buffer open, they are listed along
-the top — the current one lit, unsaved ones marked `●`, a click switches.
+Indent guides mark each level of indentation. `space b` lists the open buffers — the current one
+marked `>`, unsaved ones `●` — and Enter switches; nothing about them takes
+room from the text.
 
 Long lines soft-wrap by default, at word boundaries, with the gutter left
 blank on continuation rows — a paragraph-per-line markdown file reads as
@@ -214,8 +213,6 @@ strip_trailing_whitespace = true
 smartcase = true             # lowercase searches ignore case
 inlay_hints = true           # type hints after the line
 indent_guides = true
-sticky_header = true         # pin the scope you are scrolled inside to the top
-bufferline = true            # list the buffers along the top when there are several
 large_file_mb = 10           # bigger files open as plain text
 shell = "zsh"                # what space t runs; default $SHELL
 
@@ -301,6 +298,7 @@ an emoji ZWJ sequence or a combining stack.
 | `C-space` (insert)                 | LSP completion menu — Tab/Enter accepts, type to narrow                                                                                                                                                                                     |
 | `space e`                          | file tree sidebar — same key focuses and closes; `j`/`k` move, Enter/`l` expand or open, `h` collapse, `a` add (trailing `/` = dir), `r` rename, `d` delete (y/n), `x`/`c`/`p` cut/copy/paste, `R` refresh, `Esc` back to editor, `q` close |
 | `space c`                          | command palette: fuzzy-run any command                                                                                                                                                                                                      |
+| `space b`                          | open buffers: current marked `>`, unsaved `●`; Enter switches |
 | `space f`                          | fuzzy file finder                                                                                                                                                                                                                           |
 | `space d`                          | directory browser picker (Enter descends, Backspace goes up)                                                                                                                                                                                |
 | `space t` `:term`                  | shell in a split below; `C-\ C-n` or `C-w N` for normal mode there, `i` back in, `space t` again hides it                                                                                                                                  |

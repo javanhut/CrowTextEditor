@@ -92,10 +92,7 @@ impl Editor {
             return Some(i);
         }
         match Document::open(path) {
-            Ok(doc) => {
-                self.documents.push(doc);
-                Some(self.documents.len() - 1)
-            }
+            Ok(doc) => Some(self.add_document(doc)),
             Err(e) => {
                 self.set_status(format!("Error: {e}"));
                 None

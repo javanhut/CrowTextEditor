@@ -20,8 +20,6 @@ pub struct Config {
     pub smartcase: bool,
     pub inlay_hints: bool,
     pub indent_guides: bool,
-    pub sticky_header: bool,
-    pub bufferline: bool,
     pub large_file_mb: usize,
     pub icons: bool,
     pub format_on_save: bool,
@@ -65,8 +63,6 @@ impl Default for Config {
             smartcase: true,
             inlay_hints: true,
             indent_guides: true,
-            sticky_header: true,
-            bufferline: true,
             large_file_mb: 10,
             icons: true,
             format_on_save: true,
@@ -104,8 +100,6 @@ static AUTOCLOSE: AtomicBool = AtomicBool::new(true);
 static SMARTCASE: AtomicBool = AtomicBool::new(true);
 static INLAY_HINTS: AtomicBool = AtomicBool::new(true);
 static INDENT_GUIDES: AtomicBool = AtomicBool::new(true);
-static STICKY_HEADER: AtomicBool = AtomicBool::new(true);
-static BUFFERLINE: AtomicBool = AtomicBool::new(true);
 static LARGE_FILE_MB: AtomicUsize = AtomicUsize::new(10);
 static ICONS: AtomicBool = AtomicBool::new(true);
 static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false);
@@ -154,14 +148,6 @@ pub fn inlay_hints() -> bool {
 
 pub fn indent_guides() -> bool {
     INDENT_GUIDES.load(Ordering::Relaxed)
-}
-
-pub fn sticky_header() -> bool {
-    STICKY_HEADER.load(Ordering::Relaxed)
-}
-
-pub fn bufferline() -> bool {
-    BUFFERLINE.load(Ordering::Relaxed)
 }
 
 /// Files of this many bytes or more open without syntax, LSP, change
@@ -246,8 +232,6 @@ pub fn apply(config: &Config) -> bool {
     SMARTCASE.store(config.smartcase, Ordering::Relaxed);
     INLAY_HINTS.store(config.inlay_hints, Ordering::Relaxed);
     INDENT_GUIDES.store(config.indent_guides, Ordering::Relaxed);
-    STICKY_HEADER.store(config.sticky_header, Ordering::Relaxed);
-    BUFFERLINE.store(config.bufferline, Ordering::Relaxed);
     LARGE_FILE_MB.store(config.large_file_mb.max(1), Ordering::Relaxed);
     ICONS.store(config.icons, Ordering::Relaxed);
     SHOW_HIDDEN.store(config.show_hidden, Ordering::Relaxed);
@@ -877,8 +861,6 @@ autoclose = true         # type ( [ { " ' and the closer appears
 smartcase = true         # a search in lowercase ignores case; one capital makes it exact
 inlay_hints = true       # the language server's type hints, after the line they are about
 indent_guides = true     # a faint │ at each indent level
-sticky_header = true     # pin the function / if / loop you are scrolled inside to the top row
-bufferline = true        # list the open buffers along the top once there is more than one
 large_file_mb = 10       # bigger files open plain: no syntax, LSP, change markers or swap
 icons = true             # Nerd Font file icons in the tree (needs a Nerd Font)
 format_on_save = true    # pipe the buffer through its [fmt] formatter on :w
@@ -971,10 +953,6 @@ fn parse(text: &str) -> Config {
                 "indent_guides" => {
                     config.indent_guides = value.parse().unwrap_or(config.indent_guides)
                 }
-                "sticky_header" => {
-                    config.sticky_header = value.parse().unwrap_or(config.sticky_header)
-                }
-                "bufferline" => config.bufferline = value.parse().unwrap_or(config.bufferline),
                 "large_file_mb" => {
                     config.large_file_mb = value.parse().unwrap_or(config.large_file_mb)
                 }

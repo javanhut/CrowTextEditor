@@ -140,6 +140,12 @@ impl Editor {
                     self.run_code_action(action);
                 }
             }
+            Kind::Buffers => {
+                if index < self.documents.len() && index != self.current {
+                    self.push_jump();
+                    self.current = index;
+                }
+            }
             Kind::Command => {
                 if let Some(command) = commands::find(&label) {
                     self.register_fresh = true;

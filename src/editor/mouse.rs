@@ -72,18 +72,6 @@ impl Editor {
             self.tree_click(y);
             return;
         }
-        if y == 0 && self.show_bufferline() {
-            let hit = self
-                .bufferline_tabs()
-                .into_iter()
-                .rev()
-                .find(|&(_, x0, _)| x >= x0);
-            if let Some((i, ..)) = hit.filter(|&(i, ..)| i != self.current) {
-                self.push_jump();
-                self.current = i;
-            }
-            return;
-        }
         let Some((id, _)) = self.window_at(x, y) else {
             return;
         };
@@ -302,7 +290,7 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
-    use crate::editor::tests::editor_with;
+    use crate::editor::tests::{editor_with, press};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -315,28 +303,36 @@ mod tests {
     }
 
     #[test]
-    fn the_buffer_line_lists_buffers_and_clicks_switch_them() {
-        let mut editor = editor_with("one\n");
-        assert!(
-            !editor.show_bufferline(),
-            "one buffer: no line, no lost row"
+    fn opening_a_file_replaces_the_empty_startup_buffer() {
+        let dir = std::env::temp_dir().join(format!("crow-blank-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        let mut editor = editor_with("");
+        let a = editor.buffer_for(&dir.join("a.txt")).unwrap();
+        assert_eq!(
+            (a, editor.documents.len()),
+            (0, 1),
+            "the blank buffer is gone"
         );
-        assert_eq!(editor.focused_rect().1, 0);
-        for dir in ["a", "b"] {
-            let mut doc = crate::document::Document::empty();
-            doc.path = Some(format!("{dir}/mod.rs").into());
-            editor.documents.push(doc);
-        }
-        editor.documents[1].modified = true;
-        assert!(editor.show_bufferline());
-        assert_eq!(editor.focused_rect().1, 1, "text starts below the line");
-        let tabs = editor.bufferline_tabs();
-        let labels: Vec<&str> = tabs.iter().map(|t| t.2.as_str()).collect();
-        assert_eq!(labels, [" [no name] ", " a/mod.rs ● ", " b/mod.rs "]);
+        editor.buffer_for(&dir.join("b.txt")).unwrap();
+        assert_eq!(editor.documents.len(), 2, "a real buffer is never replaced");
 
-        let x = tabs[2].1 + 2;
-        editor.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, 0));
-        assert_eq!(editor.current, 2);
+        // `space b` lists them — current marked, unsaved dotted — and switches.
+        editor.documents[0].modified = true;
+        press(&mut editor, "<space> b");
+        let labels: Vec<String> = editor
+            .picker
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        assert_eq!(labels, ["> a.txt ●", "  b.txt"]);
+        press(&mut editor, "<down> <enter>");
+        assert_eq!(editor.current, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
