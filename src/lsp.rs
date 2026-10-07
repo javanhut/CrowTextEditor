@@ -176,6 +176,7 @@ impl Client {
         let mut parts = command.split_whitespace();
         let mut child = Command::new(parts.next()?)
             .args(parts)
+            .current_dir(root) // so `npx …` finds the project's own tools
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -239,10 +240,10 @@ impl Client {
                     "textDocument": {
                         "synchronization": { "didSave": true },
                         "publishDiagnostics": {},
-                        "hover": { "contentFormat": ["plaintext", "markdown"] },
+                        "hover": { "contentFormat": ["markdown", "plaintext"] },
                         "completion": { "completionItem": {
                             "snippetSupport": true,
-                            "documentationFormat": ["plaintext", "markdown"],
+                            "documentationFormat": ["markdown", "plaintext"],
                             "resolveSupport": { "properties": ["documentation", "detail"] }
                         }},
                         "references": {},
@@ -573,6 +574,11 @@ impl Client {
                     ) {
                         let text = err["message"].as_str().unwrap_or("request failed");
                         events.push(Event::Status(format!("{tag}: {text}")));
+                    }
+                    // A server that won't initialize never gets ready: drop
+                    // it, or every later request queues forever in silence.
+                    if tag == "initialize" {
+                        self.dead = true;
                     }
                     return;
                 }
