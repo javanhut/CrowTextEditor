@@ -504,21 +504,22 @@ impl Editor {
 
     pub(crate) fn lsp_sync(&mut self) {
         // One client per distinct server command among the open files.
-        let needed: Vec<String> = self
+        let needed: Vec<(String, PathBuf)> = self
             .documents
             .iter()
             .filter(|d| !d.large)
             .filter_map(|d| d.path.as_deref())
-            .filter_map(|p| server_for(&self.lsp_table, p))
-            .map(str::to_string)
+            .filter_map(|p| Some((server_for(&self.lsp_table, p)?.to_string(), p.to_path_buf())))
             .collect();
-        for command in needed {
+        for (command, path) in needed {
             if self.lsps.iter().any(|c| c.command() == command)
                 || self.lsp_failed.contains(&command)
             {
                 continue;
             }
-            let root = std::env::current_dir().unwrap_or_default();
+            // ponytail: one root per server, from the first file that needs
+            // it; files from a second project share it.
+            let root = project_root(&path);
             match lsp::Client::spawn(&root, &command) {
                 Some(client) => self.lsps.push(client),
                 None => {
@@ -598,5 +599,40 @@ impl Editor {
         for doc in &mut self.documents {
             doc.settle_syntax();
         }
+    }
+}
+
+/// The project a file belongs to: the nearest directory above it holding a
+/// project marker, else the launch directory. Servers index from here, so
+/// starting crow outside the project still finds its definitions.
+fn project_root(file: &Path) -> PathBuf {
+    const MARKERS: &[&str] = &[
+        "Cargo.toml",
+        "go.mod",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "compile_commands.json",
+        ".git",
+    ];
+    let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    file.ancestors()
+        .skip(1)
+        .find(|dir| MARKERS.iter().any(|m| dir.join(m).exists()))
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
+#[cfg(test)]
+mod root_tests {
+    #[test]
+    fn project_root_is_the_nearest_marked_ancestor() {
+        let top = std::env::temp_dir().join("crow-root-test");
+        let proj = top.join("a/proj");
+        std::fs::create_dir_all(proj.join("src/deep")).unwrap();
+        std::fs::write(proj.join("Cargo.toml"), "").unwrap();
+        let file = proj.join("src/deep/x.rs");
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(super::project_root(&file), proj.canonicalize().unwrap());
     }
 }
