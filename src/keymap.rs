@@ -59,11 +59,10 @@ impl Key {
 
     /// Translate a crossterm event, or `None` for events we ignore.
     ///
-    /// Filtering on `KeyEventKind::Press` matters: on Windows, and on terminals
-    /// with the kitty keyboard protocol enabled, release events also arrive and
-    /// every keystroke would otherwise register twice.
+    /// Release events must be ignored, but repeats are input too: terminals
+    /// that distinguish held keys from presses send `Repeat` events.
     pub fn from_crossterm(ev: KeyEvent) -> Option<Self> {
-        if ev.kind != KeyEventKind::Press {
+        if ev.kind == KeyEventKind::Release {
             return None;
         }
 
@@ -320,6 +319,18 @@ impl Default for KeyTrie {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_keys_are_input_but_releases_are_not() {
+        for code in [CtKeyCode::Char('j'), CtKeyCode::Backspace, CtKeyCode::Left] {
+            let press = KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press);
+            let repeat = KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Repeat);
+            let release = KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Release);
+            assert!(Key::from_crossterm(press).is_some());
+            assert_eq!(Key::from_crossterm(repeat), Key::from_crossterm(press));
+            assert_eq!(Key::from_crossterm(release), None);
+        }
+    }
 
     #[test]
     fn parses_plain_and_modified_keys() {

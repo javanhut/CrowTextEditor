@@ -361,7 +361,9 @@ impl Default for Keymaps {
         // d/x cut, c copies; doubled (dd, xx, cc) they act on the whole line.
         normal.bind_str("d", "delete_selection");
         normal.bind_str("x", "delete_selection");
+        normal.bind_str("<del>", "delete_selection");
         normal.bind_str("c", "copy");
+        normal.bind_str("y", "copy");
         normal.bind_str("S", "change_selection");
         normal.bind_str("p", "paste_after");
         normal.bind_str("P", "paste_before");
@@ -653,8 +655,8 @@ pub struct Editor {
     disk_checked: std::time::Instant,
     /// When swap files were last written.
     swap_written: std::time::Instant,
-    /// A mouse drag is extending the selection in the focused window.
-    mouse_drag: bool,
+    /// The fixed origin of a mouse drag in the focused window.
+    mouse_drag: Option<usize>,
     /// `:q!` — leave without keeping anything, swap files included.
     pub quit_discarding: bool,
     /// A "not installed — run `…`? (y/N)" offer; the next keypress answers it.
@@ -800,7 +802,7 @@ impl Editor {
             vcs_refreshed: std::time::Instant::now(),
             disk_checked: std::time::Instant::now(),
             swap_written: long_ago,
-            mouse_drag: false,
+            mouse_drag: None,
             quit_discarding: false,
             pending_install: None,
             install: None,
@@ -1435,7 +1437,11 @@ impl Editor {
                 // its selections like on any others.
                 let stretching =
                     self.block.is_some() && commands::BLOCK_MOTIONS.contains(&command.name);
-                if stretching {
+                let block_lines = self.block.is_some() && command.name == "visual_line";
+                let change_lines = self.linewise.is_some() && command.name == "change_selection";
+                if block_lines {
+                    self.block_into_lines();
+                } else if stretching {
                     self.block_to_corner();
                 } else if command.name != "block_mode" && self.block.take().is_some() {
                     self.block_finish(command.name);
@@ -1449,7 +1455,7 @@ impl Editor {
                     if motion
                         || matches!(
                             command.name,
-                            "normal_mode" | "extend_mode" | "collapse_selection"
+                            "normal_mode" | "extend_mode" | "block_mode" | "collapse_selection"
                         )
                     {
                         let doc = self.doc_mut();
@@ -1461,7 +1467,13 @@ impl Editor {
                 } else if motion {
                     self.motion_start();
                 }
-                if !self.doc().extra.is_empty() && commands::PER_CURSOR.contains(&command.name) {
+                if block_lines {
+                    // The rectangle has already become one line selection.
+                } else if change_lines {
+                    commands::change_lines(self);
+                } else if !self.doc().extra.is_empty()
+                    && commands::PER_CURSOR.contains(&command.name)
+                {
                     self.dispatch_per_cursor(command);
                 } else {
                     (command.func)(self);
@@ -2174,23 +2186,39 @@ impl Editor {
                 if self.tree_focused || self.help_scroll.is_some() {
                     return;
                 }
-                if self.mode == Mode::Normal && self.doc().anchor != self.doc().cursor {
-                    let from = crate::position::grapheme_floor(
-                        self.doc().text.slice(..),
-                        self.doc().anchor.min(self.doc().cursor),
-                    );
-                    let to = crate::position::grapheme_ceil(
-                        self.doc().text.slice(..),
-                        self.doc().anchor.max(self.doc().cursor),
-                    );
-                    let pasted_len = text.chars().count();
-                    let tx = crate::transaction::Transaction::change(
-                        &self.doc().text,
-                        std::iter::once((from, to, Some(text))),
-                    );
+                if self.mode == Mode::Normal {
                     self.extend = false;
-                    self.doc_mut().apply(tx, from + pasted_len);
+                    self.linewise = None;
+                    self.block = None;
+                    let doc = self.doc();
+                    let mut ranges: Vec<_> = std::iter::once((doc.anchor, doc.cursor))
+                        .chain(doc.extra.iter().copied())
+                        .map(|(a, c)| {
+                            (
+                                crate::position::grapheme_floor(doc.text.slice(..), a.min(c)),
+                                crate::position::grapheme_ceil(doc.text.slice(..), a.max(c)),
+                            )
+                        })
+                        .collect();
+                    ranges.sort_unstable();
+                    let mut merged: Vec<(usize, usize)> = Vec::new();
+                    for (a, c) in ranges {
+                        if let Some(last) = merged.last_mut() {
+                            if a < last.1 || (a == last.0 && c == last.1) {
+                                last.1 = last.1.max(c);
+                                continue;
+                            }
+                        }
+                        merged.push((a, c));
+                    }
+                    let tx = crate::transaction::Transaction::change(
+                        &doc.text,
+                        merged.iter().map(|&(a, c)| (a, c, Some(text.clone()))),
+                    );
+                    let cursor = tx.map_pos(doc.anchor.min(doc.cursor), false);
+                    self.doc_mut().apply(tx, cursor);
                 } else {
+                    self.doc_mut().take_placeholder();
                     self.doc_mut().insert_at_cursor(&text);
                 }
                 if self.mode == Mode::Normal {
@@ -2200,6 +2228,13 @@ impl Editor {
                             crate::position::prev_grapheme_boundary(doc.text.slice(..), doc.cursor);
                     }
                     doc.anchor = doc.cursor;
+                    for (a, c) in &mut doc.extra {
+                        if pasted_something {
+                            *c = crate::position::prev_grapheme_boundary(doc.text.slice(..), *c);
+                        }
+                        *a = *c;
+                    }
+                    doc.dedupe_cursors();
                     doc.commit_undo_group();
                 }
             }
@@ -2449,6 +2484,124 @@ pub(crate) mod tests {
             editor.doc().text.to_string(),
             "    indented\non:\n  push:\n    branches: [main]\n"
         );
+    }
+
+    #[test]
+    fn delete_key_cuts_visual_selections_and_undo_restores_them() {
+        for keys in ["Vj", "jVk", "vj$"] {
+            let mut editor = editor_with("alpha\nbeta\ngamma\n");
+            press(&mut editor, keys);
+            let (a, c) = (editor.doc().anchor, editor.doc().cursor);
+            let selected = editor.doc().text.slice(a.min(c)..a.max(c)).to_string();
+            press(&mut editor, "<del>");
+            assert_eq!(editor.register, selected, "{keys}");
+            assert!(!editor.extend);
+            assert!(editor.linewise.is_none());
+            press(&mut editor, "u");
+            assert_eq!(editor.doc().text.to_string(), "alpha\nbeta\ngamma\n");
+        }
+    }
+
+    #[test]
+    fn changing_visual_lines_keeps_indent_and_the_following_line_separate() {
+        for keys in ["jVjS", "jjVkS"] {
+            let mut editor =
+                editor_with("func main() {\n\talpha := 10\n\tbeta := 20\n\tfmt.Println(42)\n}\n");
+            press(&mut editor, keys);
+            assert_eq!(editor.mode, Mode::Insert);
+            assert!(editor.linewise.is_none());
+            press(&mut editor, "replacement <esc>");
+            assert_eq!(
+                editor.doc().text.to_string(),
+                "func main() {\n\treplacement\n\tfmt.Println(42)\n}\n"
+            );
+            press(&mut editor, "u");
+            assert_eq!(
+                editor.doc().text.to_string(),
+                "func main() {\n\talpha := 10\n\tbeta := 20\n\tfmt.Println(42)\n}\n"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_replaces_every_selected_match_as_one_undo_step() {
+        let mut editor = editor_with("alpha := 10\ngamma := alpha + beta\n");
+        press(&mut editor, "salpha <enter>");
+        editor.handle_paste("value");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "value := 10\ngamma := value + beta\n"
+        );
+        assert_eq!(editor.doc().anchor, editor.doc().cursor);
+        assert!(editor.doc().extra.iter().all(|(a, c)| a == c));
+        press(&mut editor, "u");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "alpha := 10\ngamma := alpha + beta\n"
+        );
+        press(&mut editor, "C-r");
+        assert_eq!(
+            editor.doc().text.to_string(),
+            "value := 10\ngamma := value + beta\n"
+        );
+    }
+
+    #[test]
+    fn paste_exits_visual_line_and_block_modes() {
+        for keys in ["Vj", "jjVgg", "C-v j l"] {
+            let mut editor = editor_with("alpha\nbeta\ngamma\n");
+            press(&mut editor, keys);
+            editor.handle_paste("X");
+            assert!(editor.linewise.is_none(), "{keys}");
+            assert!(editor.block.is_none(), "{keys}");
+            assert!(!editor.extend, "{keys}");
+            let caret = editor.caret();
+            assert_eq!(caret, editor.doc().cursor, "{keys}");
+            press(&mut editor, "l");
+            assert_eq!(editor.doc().anchor, editor.doc().cursor, "{keys}");
+        }
+    }
+
+    #[test]
+    fn converting_a_block_to_lines_moves_and_deletes_whole_lines() {
+        for keys in ["C-v j V j d", "jj C-v k V k d"] {
+            let mut editor = editor_with("alpha\nbeta\ngamma\ndelta\n");
+            press(&mut editor, keys);
+            assert_eq!(editor.doc().text.to_string(), "delta\n", "{keys}");
+            assert!(editor.doc().extra.is_empty());
+            assert!(editor.linewise.is_none());
+        }
+    }
+
+    #[test]
+    fn switching_to_block_mode_starts_at_the_drawn_caret() {
+        let mut editor = editor_with("abc\ndef\n");
+        press(&mut editor, "lv C-v j d");
+        assert_eq!(editor.doc().text.to_string(), "ac\ndf\n");
+
+        let mut editor = editor_with("abc\ndef\nghi\n");
+        press(&mut editor, "lVj C-v k d");
+        assert_eq!(editor.doc().text.to_string(), "ac\ndf\nghi\n");
+        assert!(editor.linewise.is_none());
+    }
+
+    #[test]
+    fn y_copies_a_selection_without_changing_it() {
+        let mut editor = editor_with("alpha\nbeta\ngamma\n");
+        press(&mut editor, "Vjy");
+        assert_eq!(editor.register, "alpha\nbeta\n");
+        assert_eq!(editor.doc().text.to_string(), "alpha\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn selection_filters_evaluate_anchors_against_each_selection() {
+        for (filter, expected) in [("A-k", "foo  foo  foo"), ("A-K", " bar  baz ")] {
+            let mut editor = editor_with("foo bar foo baz foo");
+            press(&mut editor, r"s\w+ <enter>");
+            press(&mut editor, filter);
+            press(&mut editor, "^b <enter> d");
+            assert_eq!(editor.doc().text.to_string(), expected, "{filter}");
+        }
     }
 
     #[test]

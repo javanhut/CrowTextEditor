@@ -121,9 +121,12 @@ impl Editor {
         if self.block.take().is_some() {
             return;
         }
+        let caret = self.caret();
         self.extend = false;
+        self.linewise = None;
         let doc = self.doc_mut();
         doc.extra.clear();
+        (doc.anchor, doc.cursor) = (caret, caret);
         let (line, col) = doc.cursor_line_col();
         let col = position::char_to_display_col(doc.line(line), col, tab_width());
         self.block = Some(Block {
@@ -131,6 +134,21 @@ impl Editor {
             corner: (line, col),
         });
         self.block_select();
+    }
+
+    /// Switch a rectangle to one whole-line selection, keeping its origin
+    /// and moving end so subsequent j/k extend lines rather than extra cursors.
+    pub(crate) fn block_into_lines(&mut self) {
+        let Some(Block { origin, corner }) = self.block.take() else {
+            return;
+        };
+        let doc = self.doc_mut();
+        let caret = doc.line_start(corner.0)
+            + position::display_col_to_char(doc.line(corner.0), corner.1, tab_width());
+        doc.extra.clear();
+        self.linewise = Some((origin.0, caret));
+        self.line_reselect(caret);
+        self.keep_selection = true;
     }
 
     /// Before a motion in block mode: one bare cursor, on the corner, holding
@@ -314,9 +332,26 @@ impl Editor {
                 .collect(),
             SelectPrompt::Keep | SelectPrompt::Remove => {
                 let keep = kind == SelectPrompt::Keep;
+                let re = regex::RegexBuilder::new(pattern)
+                    .case_insensitive(
+                        crate::config::smartcase() && !crate::search::has_capital(pattern),
+                    )
+                    .build();
                 sels.iter()
                     .copied()
-                    .filter(|&sel| inside(sel).next().is_some() == keep)
+                    .filter(|&(from, to)| {
+                        // Anchors and word boundaries belong to each
+                        // selection, not to its position in the buffer.
+                        let text = self.doc().text.slice(from..to).to_string();
+                        let matched = match &re {
+                            Ok(re) => re.is_match(&text),
+                            Err(_) => {
+                                !crate::search::matches(&ropey::Rope::from_str(&text), pattern)
+                                    .is_empty()
+                            }
+                        };
+                        matched == keep
+                    })
                     .collect()
             }
         };

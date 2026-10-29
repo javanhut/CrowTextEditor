@@ -151,6 +151,9 @@ fn render_window(
     }
 
     let focused = id == editor.focused;
+    // NO_COLOR suppresses background colors too. Selection still needs a
+    // visible non-color attribute so the next delete is reviewable.
+    let monochrome = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
     let win = editor.layout.find(id).expect("window exists");
     let own_doc = if focused {
         editor.doc()
@@ -374,6 +377,7 @@ fn render_window(
                 queue!(out, SetAttribute(Attribute::Italic))?;
             }
             match overlay {
+                ST_SEL if monochrome => queue!(out, SetAttribute(Attribute::Reverse))?,
                 ST_SEL => queue!(out, SetBackgroundColor(theme.selection))?,
                 ST_TRAIL => queue!(out, SetBackgroundColor(Color::DarkRed))?,
                 ST_CURSOR => queue!(out, SetAttribute(Attribute::Reverse))?,
@@ -381,6 +385,7 @@ fn render_window(
             }
             queue!(out, Print(s))?;
             match overlay {
+                ST_SEL if monochrome => queue!(out, SetAttribute(Attribute::NoReverse))?,
                 ST_SEL | ST_TRAIL => queue!(out, SetBackgroundColor(base_bg))?,
                 ST_CURSOR => queue!(out, SetAttribute(Attribute::NoReverse))?,
                 _ => {}
@@ -1071,7 +1076,7 @@ fn render_status_line(editor: &Editor, out: &mut impl Write) -> std::io::Result<
             (format!(" {}:{} ", row + 1, col + 1), back)
         }
         None => {
-            let (line, _) = doc.cursor_line_col();
+            let line = doc.text.char_to_line(editor.caret());
             (
                 format!(
                     " {}  {}/{} ",

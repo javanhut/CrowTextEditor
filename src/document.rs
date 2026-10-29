@@ -389,6 +389,11 @@ impl Document {
         // old stamp would make every later save blame an external process.
         self.disk_mtime = disk_mtime(&path);
         wrote?;
+        self.mark_saved();
+        Ok(())
+    }
+
+    fn mark_saved(&mut self) {
         self.modified = false;
         self.disk_conflict = None;
         // Our own text is on disk now, so our swap file has done its job —
@@ -400,7 +405,6 @@ impl Document {
         if crate::config::persistent_undo() && !self.large {
             self.save_undo();
         }
-        Ok(())
     }
 
     /// `:w <path>`. Refusing has to happen *before* the buffer is retargeted:
@@ -414,15 +418,19 @@ impl Document {
         if !force && path.exists() {
             return Err(std::io::Error::other("file exists — use :w! to overwrite"));
         }
+        // Keep the original filename, settings, and recovery file until the
+        // destination is safely written. I/O can fail even after preflight.
+        save_atomically(&path, &self.text, self.crlf)?;
         // The swap file belongs to the file we are leaving, not the one we
-        // are about to write; `save` below would remove the new path's.
+        // just wrote; `mark_saved` below removes the new path's.
         self.remove_swap();
         self.editorconfig = crate::editorconfig::for_file(&path);
+        self.disk_mtime = disk_mtime(&path);
         self.path = Some(path);
-        self.disk_mtime = None;
         self.swap_revision = 0;
         self.refresh_syntax();
-        self.save(force)
+        self.mark_saved();
+        Ok(())
     }
 
     /// Re-read the mtime after something we ran rewrote the file in place — an
@@ -1476,6 +1484,53 @@ mod tests {
         assert!(d.save_as(dir.join(".").join("mine.txt"), false).is_ok());
         assert_eq!(d.path.as_deref(), Some(mine.as_path()));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_as_preserves_the_original_buffer_and_recovery() {
+        let dir = std::env::temp_dir().join(format!("crow-saveas-io-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = dir.join("mine.txt");
+        std::fs::write(&mine, "mine\n").unwrap();
+        let mut d = Document::open(&mine).unwrap();
+        d.insert_at_cursor("edited ");
+        // Seed a recovery file directly so this test is independent of the
+        // user's swap-files option.
+        let swap = state_file("swap", ".swp")(&mine).unwrap();
+        let recovery = format!("crow-swap\n{}\nedited mine\n", mine.display());
+        write_atomically(&swap, recovery.as_bytes());
+        let stamp = d.disk_mtime;
+        d.swap_revision = d.revision;
+
+        // A missing parent fails while creating the destination; a directory
+        // fails when renaming the staged file. Neither may retarget the buffer.
+        for (target, force) in [
+            (dir.join("missing").join("new.rs"), false),
+            (dir.clone(), true),
+        ] {
+            assert!(d.save_as(target, force).is_err());
+            assert_eq!(d.path.as_deref(), Some(mine.as_path()));
+            assert_eq!(d.disk_mtime, stamp);
+            assert_eq!(d.swap_revision, d.revision);
+            assert!(d.modified);
+            assert_eq!(std::fs::read_to_string(&swap).unwrap(), recovery);
+        }
+        d.save(false).unwrap();
+        assert_eq!(std::fs::read_to_string(&mine).unwrap(), "edited mine\n");
+        assert!(!swap.exists());
+
+        // A successful save-as adopts the new file and permits later saves.
+        let target = dir.join("new.rs");
+        d.save_as(&target, false).unwrap();
+        assert_eq!(d.path.as_deref(), Some(target.as_path()));
+        assert!(!d.modified);
+        d.insert_at_cursor("more ");
+        d.save(false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "edited more mine\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

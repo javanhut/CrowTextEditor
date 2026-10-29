@@ -40,7 +40,7 @@ impl Editor {
                 self.mouse_click(x, y, extend);
             }
             MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag_to(x, y),
-            MouseEventKind::Up(MouseButton::Left) => self.mouse_drag = false,
+            MouseEventKind::Up(MouseButton::Left) => self.mouse_drag = None,
             _ => {
                 if let Some(n) = wheel {
                     self.mouse_scroll(x, y, n);
@@ -88,6 +88,11 @@ impl Editor {
         self.completion = None;
         let insert = self.mode == Mode::Insert;
         let doc = self.doc_mut();
+        let origin = if doc.anchor > doc.cursor {
+            crate::position::prev_grapheme_boundary(doc.text.slice(..), doc.anchor)
+        } else {
+            doc.anchor
+        };
         doc.extra.clear();
         doc.cursor = pos;
         doc.clamp_cursor(insert);
@@ -95,13 +100,18 @@ impl Editor {
             doc.anchor = doc.cursor;
         }
         doc.goal_col = None;
+        let origin = if extend { origin } else { doc.cursor };
         self.extend = false;
         self.linewise = None;
-        self.mouse_drag = true;
+        self.block = None;
+        self.mouse_drag = Some(origin);
     }
 
     fn mouse_drag_to(&mut self, x: u16, y: u16) {
-        if !self.mouse_drag || self.terminal_focused() {
+        let Some(origin) = self.mouse_drag else {
+            return;
+        };
+        if self.terminal_focused() {
             return;
         }
         let (rx, ry, rw, rh) = self.focused_rect();
@@ -112,12 +122,18 @@ impl Editor {
             return;
         };
         let doc = self.doc_mut();
-        // Selections are half-open: dragging forward has to take in the
-        // character under the pointer.
-        doc.cursor = if pos >= doc.anchor {
-            crate::position::next_grapheme_boundary(doc.text.slice(..), pos)
+        // Both the click's character and the pointer's character belong to
+        // the selection, including when the drag reverses direction.
+        (doc.anchor, doc.cursor) = if pos >= origin {
+            (
+                origin,
+                crate::position::next_grapheme_boundary(doc.text.slice(..), pos),
+            )
         } else {
-            pos
+            (
+                crate::position::next_grapheme_boundary(doc.text.slice(..), origin),
+                pos,
+            )
         };
         doc.goal_col = None;
     }
@@ -356,6 +372,33 @@ mod tests {
             doc.text.slice(doc.anchor..doc.cursor).to_string(),
             "world\nsecond"
         );
+    }
+
+    #[test]
+    fn dragging_backwards_includes_the_clicked_character_and_can_reverse() {
+        let mut editor = editor_with("abcdef\n");
+        let gutter = editor.gutter_width() as u16;
+        editor.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            gutter + 3,
+            0,
+        ));
+        for (column, expected) in [(1, "bcd"), (5, "def"), (0, "abcd")] {
+            editor.handle_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                gutter + column,
+                0,
+            ));
+            let doc = editor.doc();
+            assert_eq!(
+                doc.text
+                    .slice(doc.anchor.min(doc.cursor)..doc.anchor.max(doc.cursor))
+                    .to_string(),
+                expected
+            );
+        }
+        press(&mut editor, "d");
+        assert_eq!(editor.doc().text.to_string(), "ef\n");
     }
 
     #[test]

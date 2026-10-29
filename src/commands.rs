@@ -1185,6 +1185,22 @@ fn change_selection(editor: &mut Editor) {
     editor.set_mode(Mode::Insert);
 }
 
+/// Changing whole lines leaves an indented replacement line, keeping the
+/// next statement separate while the user types.
+pub(crate) fn change_lines(editor: &mut Editor) {
+    let (from, to) = selection_range(editor.doc());
+    let doc = editor.doc();
+    let indent = indent_of(doc, doc.text.char_to_line(from));
+    let newline = to < doc.text.len_chars() || (to > from && doc.text.char(to - 1) == '\n');
+    let replacement = format!("{indent}{}", if newline { "\n" } else { "" });
+    let selected = doc.text.slice(from..to).to_string();
+    let tx = Transaction::change(&doc.text, [(from, to, Some(replacement))]);
+    push_register(editor, &selected);
+    editor.extend = false;
+    editor.doc_mut().apply(tx, from + indent.chars().count());
+    editor.set_mode(Mode::Insert);
+}
+
 fn copy(editor: &mut Editor) {
     editor.extend = false;
     let (from, to) = selection_range(editor.doc());

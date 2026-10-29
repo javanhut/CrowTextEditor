@@ -47,9 +47,9 @@ USAGE:
 
 KEYS (normal mode):
     h j k l      move            i a I A o O   insert
-    w b e        select word     d c y p P     delete/change/yank/paste
+    w b e        select word     d/x cut, c/y copy, S change, p/P paste
     dd           delete line (into the register, so p pastes it)
-    x v ;        select line, extend mode,     collapse selection
+    V v ;        select lines, extend mode,   collapse selection
     C-v          block: motions stretch a rectangle, then i a I A d c gc hit every line
     C A-C  ,     add cursor below/above, drop  extra cursors
     A-o          expand selection to syntax node

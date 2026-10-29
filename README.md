@@ -12,7 +12,7 @@ crow src/main.rs      # or: cargo run --release -- src/main.rs
 ## What works
 
 Selection-first modal editing — the Helix/Kakoune model, not the vim model.
-Motions select the text they cross, `x` selects lines, and `d`/`c`/`y` act on
+Motions select the text they cross, `V` selects lines, and `d`/`c`/`y` act on
 the selection, so what an edit will touch is on screen before you commit to it.
 There is no operator-pending state.
 
@@ -42,7 +42,7 @@ Search and multi-cursor are the same feature. `/` searches incrementally by
 regex and the match _is_ a selection, so `d`, `c`, and `y` compose with it;
 `n`/`N` walk the matches. `s` puts a selection on **every** match — inside the
 current selection if there is one, else the whole buffer — so interactive
-replace-all is just `s foo ⏎ c bar ⎋`, with every edit site visible before you
+replace-all is just `s foo ⏎ S bar ⎋`, with every edit site visible before you
 type, and `s \d+ ⏎` puts a cursor on every number. A pattern that doesn't
 compile (yet) is searched literally, so the preview never breaks mid-keystroke.
 Case is smart: a pattern in lowercase ignores case, one capital makes it
